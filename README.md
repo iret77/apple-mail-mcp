@@ -35,6 +35,10 @@ Add to your MCP client:
 }
 ```
 
+**Claude Desktop / Cowork:** a double-click `.mcpb` bundle is available —
+see [`mcpb/README.md`](mcpb/README.md). Build it with
+`./scripts/build-mcpb.sh`.
+
 ### Build the Search Index (Recommended)
 
 ```bash

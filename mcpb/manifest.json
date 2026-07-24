@@ -1,0 +1,86 @@
+{
+  "manifest_version": "0.3",
+  "name": "apple-mail-mcp",
+  "display_name": "Apple Mail",
+  "version": "0.5.0",
+  "description": "Fast Apple Mail access for Claude — full-coverage FTS5 body search, disk-first reads, plus flag/color and read/unread write tools.",
+  "long_description": "Apple Mail MCP gives Claude fast, reliable access to your macOS Mail: full-coverage FTS5 body search (no recency cap), ~3ms disk-first single-email reads via .emlx parsing, and batch listing across accounts and mailboxes. This build also adds the first write tools — flag/unflag single emails or batches with Apple Mail's seven flag colors, and mark messages read (seen) or unread (unseen). Write tools return per-id result buckets so a batch never fails as a whole, and honor read-only mode and account-exclusion boundaries. The bundle is a thin launcher: it runs the Python server via `uvx` (uv required) and fetches the code from the public GitHub fork, so no Python is bundled. This is a fork of imdinu/apple-mail-mcp (GPL-3.0) tracking the write-ops branch; not affiliated with or endorsed by Apple Inc.",
+  "author": {
+    "name": "Christian Wendler",
+    "url": "https://github.com/iret77"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iret77/apple-mail-mcp"
+  },
+  "homepage": "https://github.com/iret77/apple-mail-mcp",
+  "documentation": "https://github.com/iret77/apple-mail-mcp/blob/main/mcpb/README.md",
+  "support": "https://github.com/iret77/apple-mail-mcp/issues",
+  "license": "GPL-3.0",
+  "keywords": [
+    "apple-mail",
+    "mail",
+    "email",
+    "mcp",
+    "macos",
+    "search",
+    "fts5"
+  ],
+  "tools": [
+    {
+      "name": "list_accounts",
+      "description": "List all configured email accounts in Apple Mail."
+    },
+    {
+      "name": "list_mailboxes",
+      "description": "List mailboxes for an account."
+    },
+    {
+      "name": "get_emails",
+      "description": "List emails from a mailbox, filtered by all/unread/flagged/today/last_7_days."
+    },
+    {
+      "name": "get_email",
+      "description": "Get a single email with full content and attachments by id."
+    },
+    {
+      "name": "search",
+      "description": "Full-text search across accounts — subject, sender, body, or attachment filenames."
+    },
+    {
+      "name": "get_email_links",
+      "description": "Extract hyperlinks from an email."
+    },
+    {
+      "name": "get_email_attachment",
+      "description": "Extract a file attachment from an email to disk."
+    },
+    {
+      "name": "get_attachment",
+      "description": "Deprecated alias — use get_email_attachment or get_email_links."
+    },
+    {
+      "name": "set_flag",
+      "description": "Write — flag or unflag one email or a batch, optionally by color (red, orange, yellow, green, blue, purple, gray)."
+    },
+    {
+      "name": "set_read_status",
+      "description": "Write — mark one email or a batch read (seen) or unread (unseen)."
+    }
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.js"]
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  }
+}
