@@ -68,6 +68,17 @@ for the full schema and precedence rules.
 | `get_email_links(message_id)` | Extract links from an email |
 | `get_email_attachment(message_id, filename)` | Extract attachment content |
 | `get_attachment(message_id, filename)` | *Deprecated* — use `get_email_attachment()` |
+| `set_flag(message_ids, color?)` | **Write** — flag/unflag one email or a batch, optionally by color (red, orange, yellow, green, blue, purple, gray) |
+| `set_read_status(message_ids, read?)` | **Write** — mark one email or a batch read (seen) or unread (unseen) |
+
+### Write operations
+
+`set_flag` and `set_read_status` take a single message id or a list, and
+return per-id outcome buckets (`updated`, `not_found`, `skipped_hidden`) so
+partial success is always visible. Both are refused when the server runs
+read-only (`APPLE_MAIL_READ_ONLY=true`, `[server] read_only = true`, or
+`apple-mail-mcp serve -r`). Message ids are located via the search index, so
+build it (or pass both `account` and `mailbox`) for reliable resolution.
 
 ## Performance
 

@@ -27,7 +27,7 @@ src/apple_mail_mcp/
     └── mail_core.js    # Shared JXA utilities (MailCore object)
 ```
 
-## MCP Tools (8 total)
+## MCP Tools (10 total)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -39,6 +39,30 @@ src/apple_mail_mcp/
 | `get_email_links(id)` | Extract links from an email | message_id |
 | `get_email_attachment(id, filename)` | Extract attachment content | message_id, filename |
 | `get_attachment(id, filename)` | *Deprecated* — use `get_email_attachment()` | message_id, filename |
+| `set_flag(ids, color?)` | *Write* — flag/unflag single or batch, optional color | message_ids, color, account?, mailbox? |
+| `set_read_status(ids, read?)` | *Write* — mark read (seen) / unread (unseen) | message_ids, read, account?, mailbox? |
+
+### Write tools (`set_flag`, `set_read_status`)
+
+First mutating tools. Both accept a single id or a list and return
+per-id buckets `{updated, not_found, skipped_hidden}` (+ optional
+`hint`) — a batch never fails whole. Design notes:
+
+- **Read-only gate:** `_ensure_writable()` first line (regression test
+  `TestWriteImplyingToolsHaveGuard` enforces this for every `set_`/
+  `flag_`/`mark_`/… tool name).
+- **ID resolution:** Mail.app ids are per-mailbox ROWIDs — not globally
+  addressable. `_resolve_write_targets()` reuses the index location
+  resolver (`find_email_location`), groups ids by `(account, mailbox)`,
+  and runs **one** `osascript` batch (`WriteBuilder`) per call. Ids the
+  index can't place fall back to an explicit `account` + `mailbox` hint.
+- **Excluded-account boundary (#90):** ids resolving into a hidden
+  account go to `skipped_hidden`, never to JXA; an explicitly-named
+  hidden `account` skips the whole batch.
+- **Flag colors** (`msg.flagIndex`): red 0, orange 1, yellow 2, green 3,
+  blue 4, purple 5, gray 6; `color="none"` unflags, `"default"` flags
+  without forcing a color. No index write needed — read/flag state is
+  served live from the Envelope Index / `.emlx` footer, not cached.
 
 ## MCP Resources (1 total)
 
@@ -553,4 +577,5 @@ Chart PNGs are committed (they ARE the results). JSON and HTML in `benchmarks/re
 | **Path Traversal** | Path validation in file watcher | watcher.py |
 | **Data Exposure** | Database and attachment cache files created with 0o600 permissions | schema.py, server.py |
 | **Unbounded Memory** | Pending changes limit in watcher | watcher.py |
-| **Excluded-Account Exposure** | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` boundary (#90). Every NEW tool/read path must gate: `_hidden_account()` at tool entry, `exclude_accounts` in SQL search, `_path_in_excluded_account()` before disk reads, `_resolve_visible_account()` before any JXA call that defaults to `Mail.accounts()[0]` | server.py, index/search.py |
+| **Excluded-Account Exposure** | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` boundary (#90). Every NEW tool/read path must gate: `_hidden_account()` at tool entry, `exclude_accounts` in SQL search, `_path_in_excluded_account()` before disk reads, `_resolve_visible_account()` before any JXA call that defaults to `Mail.accounts()[0]`. Write tools gate via `_resolve_write_targets()` (skips ids resolving into a hidden account, never dispatched to JXA) | server.py, index/search.py |
+| **Unauthorized Writes** | `_ensure_writable()` refuses every mutating tool under read-only mode (#80); regression test scans for write-implying tool names | server.py |

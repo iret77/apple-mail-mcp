@@ -6,7 +6,7 @@ Apple Mail MCP Server
 2. FTS5 search — full-text body search in ~2ms with BM25 ranking
 3. JXA fallback — batch property fetching for multi-email listing
 
-TOOLS (8 total):
+TOOLS (10 total):
 - list_accounts() - List email accounts
 - list_mailboxes(account?) - List mailboxes
 - get_emails(..., filter?) - Unified email listing with filters
@@ -15,6 +15,8 @@ TOOLS (8 total):
 - get_email_links(id) - Extract hyperlinks from an email
 - get_email_attachment(id, filename) - Extract a file attachment
 - get_attachment(id, filename?) - Deprecated alias
+- set_flag(ids, color?) - Flag/unflag emails, optionally by color (write)
+- set_read_status(ids, read?) - Mark emails read/unread (write)
 
 RESOURCES (1 total):
 - index://status - JSON snapshot of search-index health
@@ -44,7 +46,12 @@ else:
 
 from fastmcp import FastMCP
 
-from .builders import AccountsQueryBuilder, QueryBuilder
+from .builders import (
+    FLAG_COLOR_INDEX,
+    AccountsQueryBuilder,
+    QueryBuilder,
+    WriteBuilder,
+)
 from .config import (
     get_default_account,
     get_default_mailbox,
@@ -110,6 +117,13 @@ STRATEGY3_MAX_MAILBOXES = _clamped_env_int(
 # limits push entire result sets into the model's context; negative
 # LIMIT means "unlimited" in SQLite.
 MAX_RESULT_LIMIT = 200
+
+# Hard ceiling for the number of message ids a single write tool call
+# may target. Unlike read limits (which clamp), this RAISES: silently
+# dropping ids would leave some emails unmodified without the caller
+# knowing. One osascript invocation handles the whole batch, so this
+# also bounds a single script's work.
+MAX_WRITE_BATCH = 500
 
 
 def _validate_pagination(limit: int, offset: int = 0) -> tuple[int, int]:
@@ -202,6 +216,19 @@ class EmailFull(TypedDict, total=False):
     reply_to: str
     message_id: str
     attachments: list[AttachmentSummary]
+
+
+class WriteResult(TypedDict, total=False):
+    """Per-id outcome of a batch write (set_flag / set_read_status).
+
+    A batch never fails as a whole: every requested id lands in exactly
+    one bucket so partial success is visible to the caller.
+    """
+
+    updated: list[int]  # successfully modified
+    not_found: list[int]  # not located (unknown id, or moved/deleted)
+    skipped_hidden: list[int]  # resolved into an excluded account
+    hint: str  # present only when something is actionable (e.g. no index)
 
 
 # ========== Helper Functions ==========
@@ -321,7 +348,168 @@ def _detect_matched_columns(query: str, result) -> str:
     return detect_matched_columns(query, result)
 
 
-# ========== MCP Tools (8 total) ==========
+# ========== Write-Tool Helpers ==========
+
+
+def _normalize_message_ids(message_ids: int | list[int]) -> list[int]:
+    """Coerce a single id or list into a validated, de-duplicated list.
+
+    Rejects bools (``True``/``False`` are not message ids even though
+    ``bool`` is an ``int`` subclass) and non-ints. Raises on an empty
+    batch or one larger than :data:`MAX_WRITE_BATCH` — a write must never
+    silently drop targets. Order is preserved; duplicates collapse.
+    """
+    if isinstance(message_ids, bool):
+        raise ValueError(
+            "message_ids must be an int or list of ints, not bool."
+        )
+    if isinstance(message_ids, int):
+        raw: list = [message_ids]
+    elif isinstance(message_ids, (list, tuple)):
+        raw = list(message_ids)
+    else:
+        raise ValueError(
+            f"message_ids must be an int or list of ints, "
+            f"got {type(message_ids).__name__}."
+        )
+
+    ids: list[int] = []
+    seen: set[int] = set()
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError(
+                f"message id must be an int, got {item!r} "
+                f"({type(item).__name__})."
+            )
+        if item not in seen:
+            seen.add(item)
+            ids.append(item)
+
+    if not ids:
+        raise ValueError("message_ids is empty; provide at least one id.")
+    if len(ids) > MAX_WRITE_BATCH:
+        raise ValueError(
+            f"Too many ids ({len(ids)}); max {MAX_WRITE_BATCH} per call. "
+            f"Split into smaller batches."
+        )
+    return ids
+
+
+async def _resolve_write_targets(
+    ids: list[int],
+    account: str | None,
+    mailbox: str | None,
+) -> tuple[list[dict], list[int], list[int]]:
+    """Resolve message ids to JXA write groups, honoring the account gate.
+
+    Reuses the index's location resolver (the same machinery ``get_email``
+    leans on) to place each id in its ``(account, mailbox)``, since Mail.app
+    ids are per-mailbox ROWIDs and not globally addressable. An id that
+    resolves into an excluded account (#90) is dropped into
+    ``skipped_hidden`` and never dispatched to JXA. Ids the index can't
+    place fall back to an explicit ``account`` + ``mailbox`` hint (which
+    JXA then verifies) — matching ``get_email`` Strategy 1 — and are
+    otherwise reported ``not_found``.
+
+    Returns ``(groups, not_found, skipped_hidden)`` where ``groups`` is
+    ``[{"account": name, "mailbox": name, "ids": [...]}, ...]``.
+    """
+    # Explicit hidden account: refuse the whole batch up front, exactly
+    # as the read tools do at their entry gate.
+    if _hidden_account(account):
+        return [], [], list(ids)
+
+    manager = _get_index_manager()
+    has_index = manager.has_index()
+
+    acct_map = _get_account_map()
+    excluded_names = _excluded_account_names()
+    excluded_uuids: set[str] = set()
+    idx_acct_uuid: str | None = None
+
+    if has_index or excluded_names or account:
+        await acct_map.ensure_loaded()
+        excluded_uuids = acct_map.names_to_uuids(excluded_names)
+        if account:
+            idx_acct_uuid = acct_map.name_to_uuid(account)
+
+    # Fallback target for ids the index can't place: only usable when the
+    # caller pinned BOTH account and mailbox (the account is known
+    # non-hidden here — the explicit-hidden case returned above).
+    hint_location: tuple[str, str] | None = (
+        (account, mailbox) if account and mailbox else None
+    )
+
+    grouped: dict[tuple[str, str], list[int]] = {}
+    not_found: list[int] = []
+    skipped_hidden: list[int] = []
+
+    for mid in ids:
+        located: tuple[str, str] | None = None
+        if has_index:
+            loc = manager.find_email_location(
+                mid, account=idx_acct_uuid, mailbox=mailbox
+            )
+            if loc:
+                acct_uuid, mb_name = loc
+                if acct_uuid in excluded_uuids:
+                    skipped_hidden.append(mid)
+                    continue
+                located = (acct_map.uuid_to_name(acct_uuid), mb_name)
+        if located is None:
+            located = hint_location
+        if located is None:
+            not_found.append(mid)
+            continue
+        grouped.setdefault(located, []).append(mid)
+
+    groups = [
+        {"account": acct, "mailbox": mb, "ids": mids}
+        for (acct, mb), mids in grouped.items()
+    ]
+    return groups, not_found, skipped_hidden
+
+
+async def _apply_write(
+    message_ids: int | list[int],
+    account: str | None,
+    mailbox: str | None,
+    make_builder,
+) -> WriteResult:
+    """Shared orchestration for the batch write tools.
+
+    Normalizes ids, resolves targets (with the account gate), runs one
+    osascript invocation over the located groups, and merges JXA's
+    per-id outcome with the ids that were unresolvable up front.
+    ``make_builder`` maps ``groups -> WriteBuilder`` (the only per-tool
+    difference).
+    """
+    ids = _normalize_message_ids(message_ids)
+    groups, not_found, skipped_hidden = await _resolve_write_targets(
+        ids, account, mailbox
+    )
+
+    updated: list[int] = []
+    if groups:
+        builder = make_builder(groups)
+        res = await execute_with_core_async(builder.build())
+        updated = [int(x) for x in res.get("updated", [])]
+        not_found = not_found + [int(x) for x in res.get("not_found", [])]
+
+    result: WriteResult = {
+        "updated": updated,
+        "not_found": not_found,
+        "skipped_hidden": skipped_hidden,
+    }
+    if not_found and not _get_index_manager().has_index():
+        result["hint"] = (
+            "Some ids could not be located. Without a search index, pass "
+            "both account and mailbox, or run 'apple-mail-mcp index'."
+        )
+    return result
+
+
+# ========== MCP Tools (10 total) ==========
 
 
 @mcp.tool
@@ -1310,6 +1498,116 @@ async def search(
             }
             for e in emails
         ]
+    )
+
+
+@mcp.tool
+async def set_flag(
+    message_ids: int | list[int],
+    color: Literal[
+        "default",
+        "none",
+        "red",
+        "orange",
+        "yellow",
+        "green",
+        "blue",
+        "purple",
+        "gray",
+    ] = "default",
+    account: str | None = None,
+    mailbox: str | None = None,
+) -> WriteResult:
+    """
+    Flag or unflag one or more emails, optionally with a color.
+
+    Write operation — refused when the server runs read-only
+    (APPLE_MAIL_READ_ONLY / `serve -r`).
+
+    Args:
+        message_ids: A single email id or a list of ids (from search /
+            get_emails results). Max 500 per call.
+        color: What to set:
+            - "default": flag without forcing a color (default)
+            - "none": remove the flag
+            - "red" | "orange" | "yellow" | "green" | "blue" |
+              "purple" | "gray": flag with that color
+        account: Optional hint. Speeds id resolution; required (with
+            mailbox) to place ids when no search index is built.
+        mailbox: Optional hint (see account).
+
+    Returns:
+        A dict with per-id outcome buckets so partial success is visible:
+        - updated: ids successfully changed
+        - not_found: ids that couldn't be located (unknown, moved,
+          or deleted since indexing)
+        - skipped_hidden: ids resolving into an excluded account
+        - hint: guidance, present only when something is actionable
+
+    Examples:
+        >>> set_flag(12345, color="red")
+        >>> set_flag([111, 222, 333], color="orange")
+        >>> set_flag(12345, color="none")  # unflag
+    """
+    _ensure_writable()
+
+    if color == "none":
+        flagged, flag_index = False, None
+    elif color == "default":
+        flagged, flag_index = True, None
+    else:
+        flagged, flag_index = True, FLAG_COLOR_INDEX[color]
+
+    return await _apply_write(
+        message_ids,
+        account,
+        mailbox,
+        lambda groups: WriteBuilder.set_flag(
+            groups, flagged=flagged, flag_index=flag_index
+        ),
+    )
+
+
+@mcp.tool
+async def set_read_status(
+    message_ids: int | list[int],
+    read: bool = True,
+    account: str | None = None,
+    mailbox: str | None = None,
+) -> WriteResult:
+    """
+    Mark one or more emails read (seen) or unread (unseen).
+
+    Write operation — refused when the server runs read-only
+    (APPLE_MAIL_READ_ONLY / `serve -r`).
+
+    Args:
+        message_ids: A single email id or a list of ids (from search /
+            get_emails results). Max 500 per call.
+        read: True marks read/seen (default); False marks unread/unseen.
+        account: Optional hint. Speeds id resolution; required (with
+            mailbox) to place ids when no search index is built.
+        mailbox: Optional hint (see account).
+
+    Returns:
+        A dict with per-id outcome buckets so partial success is visible:
+        - updated: ids successfully changed
+        - not_found: ids that couldn't be located (unknown, moved,
+          or deleted since indexing)
+        - skipped_hidden: ids resolving into an excluded account
+        - hint: guidance, present only when something is actionable
+
+    Examples:
+        >>> set_read_status(12345)  # mark read
+        >>> set_read_status([111, 222], read=False)  # mark unread
+    """
+    _ensure_writable()
+
+    return await _apply_write(
+        message_ids,
+        account,
+        mailbox,
+        lambda groups: WriteBuilder.set_read(groups, read),
     )
 
 

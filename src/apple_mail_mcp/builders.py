@@ -243,6 +243,130 @@ JSON.stringify(MailCore.listMailboxes(account));
 """
 
 
+# Apple Mail flag-color name → `flag index` value. Setting `flagIndex`
+# to one of these also flags the message; `flaggedStatus = false`
+# clears it (resetting the index to -1). "default" (a plain flag with
+# no forced color) and "none" (unflag) are handled by the caller, not
+# by this map.
+FLAG_COLOR_INDEX = {
+    "red": 0,
+    "orange": 1,
+    "yellow": 2,
+    "green": 3,
+    "blue": 4,
+    "purple": 5,
+    "gray": 6,
+}
+
+
+@dataclass
+class WriteBuilder:
+    """Builder for batch property writes (read/flag) over located messages.
+
+    Applies a single property change to a batch of messages grouped by
+    ``(account, mailbox)`` in ONE osascript invocation. Each group opens
+    its mailbox once and batch-fetches the id array (``mb.messages.id()``)
+    rather than doing per-message IPC — the same 87x optimization the read
+    path uses.
+
+    The mutating JS statement (``apply_js``) is derived solely from the
+    operation and a validated int/bool — never from caller-supplied
+    strings. Account/mailbox names and message ids cross into JXA only
+    through ``json.dumps`` of ``groups``, so nothing untrusted is
+    interpolated into executable JS.
+
+    Construct via the :meth:`set_read` / :meth:`set_flag` factories.
+
+    Args:
+        groups: ``[{"account": str, "mailbox": str, "ids": [int, ...]}, ...]``
+        apply_js: JS run per located message, with ``msg`` in scope.
+    """
+
+    groups: list[dict]
+    apply_js: str
+
+    @classmethod
+    def set_read(cls, groups: list[dict], read: bool) -> "WriteBuilder":
+        """Build a read/unread (seen/unseen) writer."""
+        return cls(groups, f"msg.readStatus = {'true' if read else 'false'};")
+
+    @classmethod
+    def set_flag(
+        cls,
+        groups: list[dict],
+        flagged: bool,
+        flag_index: int | None = None,
+    ) -> "WriteBuilder":
+        """Build a flag/unflag writer.
+
+        Args:
+            flagged: ``False`` clears the flag (color reset to -1).
+            flag_index: When ``flagged`` and this is 0-6, force that flag
+                color; ``None`` flags without forcing a color.
+        """
+        if not flagged:
+            apply_js = "msg.flaggedStatus = false;"
+        elif flag_index is None:
+            apply_js = "msg.flaggedStatus = true;"
+        else:
+            apply_js = (
+                f"msg.flaggedStatus = true; msg.flagIndex = {int(flag_index)};"
+            )
+        return cls(groups, apply_js)
+
+    def build(self) -> str:
+        """Generate the JXA script string.
+
+        Returns a script that ends in ``JSON.stringify({updated, not_found})``
+        where both are arrays of message ids. Ids present in a group but
+        absent from the mailbox (moved/deleted since indexing) land in
+        ``not_found`` rather than failing the whole batch.
+        """
+        groups_json = json.dumps(self.groups)
+        return f"""
+const groups = {groups_json};
+const updated = [];
+const notFound = [];
+
+for (const g of groups) {{
+    let mailbox;
+    try {{
+        const account = MailCore.getAccount(g.account);
+        mailbox = MailCore.getMailbox(account, g.mailbox);
+    }} catch (e) {{
+        // Account/mailbox unreachable — every id in this group is lost.
+        for (const id of g.ids) notFound.push(id);
+        continue;
+    }}
+
+    let ids;
+    try {{
+        ids = mailbox.messages.id();
+    }} catch (e) {{
+        for (const id of g.ids) notFound.push(id);
+        continue;
+    }}
+
+    for (const targetId of g.ids) {{
+        const idx = ids.indexOf(targetId);
+        if (idx === -1) {{
+            notFound.push(targetId);
+            continue;
+        }}
+        try {{
+            const msg = mailbox.messages[idx];
+            {self.apply_js}
+            updated.push(targetId);
+        }} catch (e) {{
+            notFound.push(targetId);
+        }}
+    }}
+}}
+
+JSON.stringify({{ updated: updated, not_found: notFound }});
+"""
+
+
 @dataclass
 class GetEmailBuilder:
     """Builder for Strategy 3: find a single email by iterating mailboxes.
