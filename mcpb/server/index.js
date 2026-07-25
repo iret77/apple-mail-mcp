@@ -8,19 +8,43 @@
  * or platform wheels — and uv fetches the correct macOS wheels on first
  * run.
  *
- * The server source is pulled from the public fork by git ref, so the
- * bundle tracks a specific branch/tag without needing to be re-packed.
- * Override the ref with APPLE_MAIL_MCP_REF (a tag, or the plain PyPI
- * name "apple-mail-mcp" once the write tools are released).
+ * The server source is pulled from the public fork by git ref. Because
+ * that ref is a moving branch, the shim also self-updates: at most once
+ * per UPDATE_INTERVAL_H it re-resolves the ref in a short, best-effort
+ * pre-step before starting the server. A failed or slow update never
+ * blocks startup — the previously cached build is used instead.
+ *
+ * Every knob is surfaced through the bundle's Configure dialog
+ * (manifest `user_config`), which injects the env vars read below.
  */
 import { spawn } from "node:child_process";
-import { existsSync, accessSync, constants } from "node:fs";
+import {
+  existsSync,
+  accessSync,
+  constants,
+  statSync,
+  utimesSync,
+  writeFileSync,
+  mkdirSync,
+} from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
 const DEFAULT_REF =
   "git+https://github.com/iret77/apple-mail-mcp@feat/write-ops-flag-read";
-const ref = process.env.APPLE_MAIL_MCP_REF || DEFAULT_REF;
+const UPDATE_INTERVAL_H = 24;
+const UPDATE_TIMEOUT_MS = 45_000; // stay well under the MCP init timeout
+
+/** Env values arrive as strings — "false" must not read as truthy. */
+function envFlag(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  return /^(1|true|yes|on)$/i.test(raw.trim());
+}
+
+const ref = (process.env.APPLE_MAIL_MCP_REF || "").trim() || DEFAULT_REF;
+const autoUpdate = envFlag("APPLE_MAIL_MCP_AUTO_UPDATE", true);
+const forceRefresh = envFlag("APPLE_MAIL_MCP_REFRESH", false);
 
 const home = homedir();
 // The uv installer drops uvx in ~/.local/bin; Homebrew in
@@ -68,14 +92,67 @@ const env = {
   PATH: `${EXTRA_BIN_DIRS.join(":")}:${process.env.PATH || ""}`,
 };
 
-// Set APPLE_MAIL_MCP_REFRESH=1 to re-resolve a moving branch ref on
-// launch (picks up new commits). Off by default — a plain launch reuses
-// uv's cached build for a fast startup.
-const args = ["--from", ref];
-if (process.env.APPLE_MAIL_MCP_REFRESH) args.push("--refresh");
-args.push("apple-mail-mcp");
+const stampDir = join(home, ".apple-mail-mcp");
+const stampFile = join(stampDir, ".mcpb-update-stamp");
 
-const child = spawn(uvx, args, {
+function updateIsDue() {
+  if (forceRefresh) return true;
+  if (!autoUpdate) return false;
+  try {
+    const ageH = (Date.now() - statSync(stampFile).mtimeMs) / 3_600_000;
+    return ageH >= UPDATE_INTERVAL_H;
+  } catch {
+    return true; // no stamp yet → first run
+  }
+}
+
+function touchStamp() {
+  try {
+    mkdirSync(stampDir, { recursive: true });
+    if (existsSync(stampFile)) {
+      const now = new Date();
+      utimesSync(stampFile, now, now);
+    } else {
+      writeFileSync(stampFile, "");
+    }
+  } catch {
+    /* stamping is best-effort */
+  }
+}
+
+/**
+ * Best-effort pre-step: re-resolve the moving ref so the launch below
+ * picks up new commits. Bounded and non-fatal — on timeout or error we
+ * simply run whatever uv already has cached.
+ */
+async function refreshCache() {
+  process.stderr.write("[apple-mail-mcp] checking for updates...\n");
+  await new Promise((resolve) => {
+    const p = spawn(
+      uvx,
+      ["--refresh", "--from", ref, "apple-mail-mcp", "--version"],
+      { stdio: "ignore", env },
+    );
+    const timer = setTimeout(() => {
+      p.kill("SIGKILL");
+      process.stderr.write(
+        "[apple-mail-mcp] update timed out; using cached build\n",
+      );
+      resolve();
+    }, UPDATE_TIMEOUT_MS);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    p.on("error", done);
+    p.on("exit", done);
+  });
+  touchStamp();
+}
+
+if (updateIsDue()) await refreshCache();
+
+const child = spawn(uvx, ["--from", ref, "apple-mail-mcp"], {
   stdio: ["pipe", "pipe", "inherit"], // stderr passes through to Desktop logs
   env,
 });

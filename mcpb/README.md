@@ -33,39 +33,50 @@ platform-independent):
 
 1. Double-click `dist/apple-mail-mcp.mcpb`. Claude Desktop shows an
    install dialog → **Install**.
-2. Build the search index once (grant the automation prompt on first
-   run):
+2. Talk to Claude: *"flag mail 12345 red"*, *"mark these three as
+   unread"*. Grant the Mail automation prompt on the first tool call.
 
-   ```bash
-   uvx --from git+https://github.com/iret77/apple-mail-mcp@feat/write-ops-flag-read apple-mail-mcp index --verbose
-   ```
+That's it — no terminal step. The search index builds itself in the
+background on first run (needs Full Disk Access for Claude Desktop), and
+the write tools resolve message ids by scanning meanwhile, so they work
+right away. The write tools return per-id buckets
+(`updated` / `not_found` / `skipped_hidden`).
 
-3. Talk to Claude: *"flag mail 12345 red"*, *"mark these three as
-   unread"*. The write tools return per-id buckets
-   (`updated` / `not_found` / `skipped_hidden`).
+To build the index up front instead, run:
+
+```bash
+uvx --from git+https://github.com/iret77/apple-mail-mcp@feat/write-ops-flag-read apple-mail-mcp index --verbose
+```
 
 ## Configuration
 
-The launcher reads a few environment variables (set them in the bundle's
-config, or your shell for the `index` command):
+Open **Claude Desktop → the extension → Configure**. The bundle declares
+these fields, so they're editable in the UI — no environment variables
+and no terminal needed:
 
-| Variable | Purpose |
-|---|---|
-| `APPLE_MAIL_MCP_REF` | Which build to run. Default: `git+https://github.com/iret77/apple-mail-mcp@feat/write-ops-flag-read`. Point at a tag, or the plain `apple-mail-mcp` once the write tools ship to PyPI. |
-| `APPLE_MAIL_MCP_REFRESH` | Set to `1` to re-resolve a moving branch on launch (picks up new commits). Off by default for a fast startup. |
-| `UVX_BIN` | Absolute path to `uvx` if it's not in a standard location. |
-| `APPLE_MAIL_READ_ONLY` | `true` disables the write tools. |
+| Field | Default | Purpose |
+|---|---|---|
+| **Automatic updates** | on | Check once a day for a newer build at startup. |
+| **Read-only mode** | off | Disable the write tools (`set_flag`, `set_read_status`). |
+| **Default account** | — | Account used when a request doesn't name one. |
+| **Hidden accounts** | — | Comma-separated accounts to hide completely (never indexed, searched, read, or written). |
+| **Source (advanced)** | — | Which build to run; empty = the default branch build. Set to `apple-mail-mcp` once the write tools ship to PyPI. |
 
-All the usual `APPLE_MAIL_*` settings apply too — see the
+`UVX_BIN` remains an environment-only escape hatch for a non-standard
+`uvx` location. All the usual `APPLE_MAIL_*` settings apply too — see the
 [main README](../README.md).
 
-## Updating to the latest branch commit
+## Updating
 
-`uvx` caches the resolved build. To pull newer commits from the branch,
-refresh once (next Desktop launch uses it), or set `APPLE_MAIL_MCP_REFRESH=1`:
+Automatic: with **Automatic updates** on (the default), the launcher
+re-resolves the branch at most once every 24 h when Claude Desktop starts
+the extension. It's bounded (45 s) and best-effort — a slow or failed
+check never blocks startup; the last working build is used instead.
+
+To force an update now, restart the extension after:
 
 ```bash
-uvx --refresh --from git+https://github.com/iret77/apple-mail-mcp@feat/write-ops-flag-read apple-mail-mcp --help
+uvx --refresh --from git+https://github.com/iret77/apple-mail-mcp@feat/write-ops-flag-read apple-mail-mcp --version
 ```
 
 ## License / attribution
