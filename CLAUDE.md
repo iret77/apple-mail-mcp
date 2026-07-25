@@ -205,7 +205,7 @@ reply_to, message_id from MIME headers.
 | Pattern | Location | Purpose |
 |---------|----------|---------|
 | **Builder** | `QueryBuilder` | Safe JXA script construction, prevents injection |
-| **Singleton** | `IndexManager` | Single SQLite writer, one file watcher |
+| **Singleton** | `IndexManager` | One file watcher; per-thread SQLite connections |
 | **Facade** | `MailCore` JS | Clean API over verbose Apple Events |
 | **Factory** | `create_connection()` | Consistent DB configuration |
 | **State Reconciliation** | `sync_from_disk()` | Fast diff-based sync |

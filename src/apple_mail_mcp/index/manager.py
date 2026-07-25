@@ -97,7 +97,10 @@ class IndexManager:
             db_path: Custom database path (uses config default if None)
         """
         self._db_path = db_path or get_index_path()
-        self._conn: sqlite3.Connection | None = None
+        # One connection per thread (see _get_conn): a shared connection
+        # would make every query wait behind a running build or sync.
+        self._local = threading.local()
+        self._open_conns: list[sqlite3.Connection] = []
         self._conn_lock = threading.Lock()
         self._watcher: IndexWatcher | None = None
         self._watcher_callback: Callable[[int, int], None] | None = None
@@ -172,17 +175,45 @@ class IndexManager:
         return self._db_path
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Get or create the database connection (thread-safe)."""
-        with self._conn_lock:
-            if self._conn is None:
-                self._conn = init_database(self._db_path)
-            return self._conn
+        """Get this thread's database connection, opening it if needed.
+
+        Connections are **per thread**, not shared. A single shared
+        connection serializes every statement behind whatever long
+        operation currently holds it: a full rebuild or a disk sync runs
+        for minutes, and any status or search query issued meanwhile
+        would block for that entire time — the server looks hung. SQLite
+        in WAL mode is built for the opposite: one writer plus any
+        number of concurrent readers, each on its own connection, with
+        readers served from a consistent snapshot instead of waiting.
+
+        ``init_database`` is idempotent — after the first call it only
+        reads the schema version — so per-thread setup stays cheap.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            # Serialize first-time setup: concurrent threads must not
+            # race on creating the schema or running a migration.
+            with self._conn_lock:
+                conn = init_database(self._db_path)
+            self._local.conn = conn
+            with self._conn_lock:
+                self._open_conns.append(conn)
+        return conn
 
     def close(self) -> None:
-        """Close the database connection."""
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        """Close every connection this manager has opened.
+
+        Called by tests and on explicit teardown. Threads that later ask
+        for a connection get a fresh one.
+        """
+        with self._conn_lock:
+            for conn in self._open_conns:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self._open_conns.clear()
+        self._local = threading.local()
 
     def has_index(self) -> bool:
         """Check if an index database exists."""

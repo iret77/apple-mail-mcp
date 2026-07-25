@@ -235,15 +235,19 @@ class TestClose:
         IndexManager._instance = None
 
     def test_close_is_idempotent(self, temp_db_path):
-        """close() closes the connection and can be called repeatedly."""
+        """close() releases every connection and can be repeated."""
         manager = IndexManager(db_path=temp_db_path)
         manager._get_conn()
+        assert manager._open_conns
 
         manager.close()
-        assert manager._conn is None
+        assert manager._open_conns == []
 
         manager.close()  # Should not raise
-        assert manager._conn is None
+        assert manager._open_conns == []
+
+        # A later caller simply gets a fresh connection.
+        assert manager._get_conn() is not None
 
 
 class TestGetIndexedMessageIds:
@@ -906,3 +910,70 @@ class TestWatcher:
         assert manager.watcher_running is False
         manager.stop_watcher()  # Should not raise
         assert manager.watcher_running is False
+
+
+class TestPerThreadConnections:
+    """A long write must not block reads — the cause of a hung server."""
+
+    def test_each_thread_gets_its_own_connection(self, temp_db_path):
+        import threading
+
+        manager = IndexManager(db_path=temp_db_path)
+        main_conn = manager._get_conn()
+        other: list = []
+
+        def worker() -> None:
+            other.append(manager._get_conn())
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        assert other[0] is not main_conn
+        assert len(manager._open_conns) == 2
+
+    def test_same_thread_reuses_its_connection(self, temp_db_path):
+        manager = IndexManager(db_path=temp_db_path)
+        assert manager._get_conn() is manager._get_conn()
+
+    def test_read_is_not_blocked_by_an_open_write(self, temp_db_path):
+        """The regression: a reader must answer while a writer holds a
+        transaction open, instead of waiting for it to finish."""
+        import threading
+
+        manager = IndexManager(db_path=temp_db_path)
+        manager._get_conn()  # create schema first
+
+        writing = threading.Event()
+        release = threading.Event()
+        failed: list = []
+
+        def writer() -> None:
+            conn = manager._get_conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO emails (message_id, account, mailbox) "
+                    "VALUES (1, 'a', 'INBOX')"
+                )
+                writing.set()
+                release.wait(timeout=10)
+                conn.commit()
+            except Exception as e:  # pragma: no cover - diagnostic
+                failed.append(e)
+                writing.set()
+
+        t = threading.Thread(target=writer)
+        t.start()
+        assert writing.wait(timeout=10)
+
+        # Reader on another connection, while the write txn is open.
+        try:
+            count = manager.indexed_email_count()
+        finally:
+            release.set()
+            t.join()
+
+        assert failed == []
+        # Sees the pre-write snapshot rather than blocking on the writer.
+        assert count == 0
