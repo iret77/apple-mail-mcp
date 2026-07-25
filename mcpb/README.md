@@ -48,6 +48,41 @@ To build the index up front instead, run:
 uvx --from git+https://github.com/iret77/apple-mail-mcp@feat/write-ops-flag-read apple-mail-mcp index --verbose
 ```
 
+## Two setups — pick one
+
+Body search needs an index built from `~/Library/Mail`, which macOS
+protects. TCC grants that access to the *responsible app*, so a bundled
+server can only inherit it from Claude itself — there is no way to scope
+it to this extension alone. Both routes are supported:
+
+**A — Automatic (convenient).** Grant Claude **Full Disk Access**
+(System Settings → Privacy & Security → Full Disk Access), restart it,
+and leave *Build the search index automatically* on. The index builds
+itself on first run and stays current. Note this grants disk access to
+Claude as a whole, not just to this extension.
+
+**B — Manual (least privilege).** Don't grant Claude disk access; turn
+*Build the search index automatically* **off**, and build the index from
+a terminal that has Full Disk Access:
+
+```bash
+apple-mail-mcp index --verbose
+```
+
+The extension then reads that index from `~/.apple-mail-mcp/index.db`,
+which is not a protected path. Re-run the command (or schedule it via
+launchd) to pick up new mail.
+
+| | A — Automatic | B — Manual |
+|---|---|---|
+| Body search | ✅ always current | ✅ as of the last build |
+| Flag / read-unread | ✅ | ✅ (Apple Events, Mail-scoped only) |
+| Single-email read | ~3 ms (disk) | slower live path |
+| Claude's disk access | full | none |
+| Upkeep | none | re-run the index command |
+
+`get_index_status()` reports which mode is active and what to do next.
+
 ## Configuration
 
 Open **Claude Desktop → the extension → Configure**. The bundle declares
@@ -57,6 +92,7 @@ and no terminal needed:
 | Field | Default | Purpose |
 |---|---|---|
 | **Automatic updates** | on | Check once a day for a newer build at startup. |
+| **Build the search index automatically** | on | Off switches to the manual (no-disk-access) mode below. |
 | **Read-only mode** | off | Disable the write tools (`set_flag`, `set_read_status`). |
 | **Default account** | — | Account used when a request doesn't name one. |
 | **Hidden accounts** | — | Comma-separated accounts to hide completely (never indexed, searched, read, or written). |
