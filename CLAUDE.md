@@ -16,7 +16,7 @@ src/apple_mail_mcp/
 ├── executor.py         # run_jxa(), execute_with_core(), execute_query()
 ├── index/              # FTS5 search index module
 │   ├── __init__.py     # Exports IndexManager
-│   ├── schema.py       # SQLite schema v5 (DLQ + attachments)
+│   ├── schema.py       # SQLite schema v6 (stable ids, DLQ, attachments)
 │   ├── manager.py      # IndexManager class (disk-based sync)
 │   ├── disk.py         # .emlx reading + get_disk_inventory()
 │   ├── sync.py         # Disk-based state reconciliation
@@ -53,6 +53,16 @@ per-id buckets `{updated, not_found, skipped_hidden}` (+ optional
 - **Read-only gate:** `_ensure_writable()` first line (regression test
   `TestWriteImplyingToolsHaveGuard` enforces this for every `set_`/
   `flag_`/`mark_`/… tool name).
+- **Stable identity (v6):** Mail.app ids are per-mailbox ROWIDs that die
+  the moment *any* device files a message elsewhere — the normal case
+  with phones and tablets on one account. The index therefore also
+  stores the RFC822 `Message-ID` header (`rfc822_message_id`), which
+  survives moves. When a write reports `not_found`,
+  `_retry_by_stable_id()` looks the header up, re-finds the message by
+  scanning `messages.messageId()` (batch-fetched, one IPC per mailbox),
+  and writes there — reporting the move via `hint`. Rows indexed before
+  v6 have NULL and cannot be recovered; `get_index_status` surfaces the
+  count as `without_stable_id` and points at `refresh_index(full=True)`.
 - **ID resolution:** Mail.app ids are per-mailbox ROWIDs — not globally
   addressable. `_resolve_write_targets()` reuses the index location
   resolver (`find_email_location`), groups ids by `(account, mailbox)`,
@@ -202,7 +212,7 @@ reply_to, message_id from MIME headers.
 
 ## FTS5 Search Index
 
-### Database Schema (v5)
+### Database Schema (v6)
 
 ```sql
 -- Email content cache
@@ -216,6 +226,7 @@ CREATE TABLE emails (
     content TEXT,                    -- Body text
     date_received TEXT,
     emlx_path TEXT,                  -- Path for sync
+    rfc822_message_id TEXT,          -- Stable identity (v6), survives moves
     attachment_count INTEGER DEFAULT 0,
     indexed_at TEXT DEFAULT (datetime('now')),
     UNIQUE(account, mailbox, message_id)

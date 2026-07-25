@@ -266,6 +266,7 @@ def sync_from_disk(
                         "sender": parsed.sender,
                         "content": parsed.content,
                         "date_received": parsed.date_received,
+                        "message_id_header": parsed.message_id_header,
                     },
                     account,
                     mailbox,

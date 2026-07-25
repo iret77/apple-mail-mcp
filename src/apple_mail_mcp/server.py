@@ -676,7 +676,12 @@ async def _resolve_write_targets(
     # the same single-account limitation as get_email's Strategy 3.
     if scan_ids:
         scan_account = await _resolve_visible_account(account)
-        if scan_account is None or scan_account in excluded_names:
+        # A None account is legitimate: MailCore.getAccount(null) picks
+        # the first account, which is the documented default. Only bail
+        # when exclusions are active and nothing visible remains.
+        if excluded_names and (
+            scan_account is None or scan_account in excluded_names
+        ):
             not_found.extend(scan_ids)
         else:
             groups.append(
@@ -732,20 +737,119 @@ async def _apply_write(
             logger.debug("write scan fallback failed: %s", exc, exc_info=True)
             not_found += [i for g in scan for i in g["ids"]]
 
+    # Recovery: a ROWID stops resolving as soon as any device files the
+    # message elsewhere — the normal case with phones and tablets on the
+    # same account. Re-find those by their RFC822 Message-ID, which
+    # survives moves, and apply there.
+    if not_found:
+        recovered, still_missing, moved = await _retry_by_stable_id(
+            not_found, account, make_builder
+        )
+        updated += recovered["updated"]
+        unchanged += recovered["unchanged"]
+        not_found = still_missing
+    else:
+        moved = []
+
     result: WriteResult = {
         "updated": updated,
         "unchanged": unchanged,
         "not_found": not_found,
         "skipped_hidden": skipped_hidden,
     }
-    if not_found and not _get_index_manager().has_index():
+    if moved:
+        result["hint"] = (
+            f"{len(moved)} message(s) had been moved (another device, or a "
+            f"mail rule) and were re-found by their Message-ID header. "
+            f"Their ids have changed; call refresh_index() to update them."
+        )
+    elif not_found and not _get_index_manager().has_index():
         result["hint"] = (
             "Some ids weren't found by scanning the default account. Pass "
             "both account and mailbox for reliable resolution, or call "
             "get_index_status() — building the index makes id lookup "
             "exact, and it will explain how."
         )
+    elif not_found:
+        result["hint"] = (
+            "Some ids could not be located, and no stable Message-ID is "
+            "on record for them. They were probably deleted, or the index "
+            "predates stable ids — call refresh_index(full=True) to "
+            "re-record them."
+        )
     return result
+
+
+async def _retry_by_stable_id(
+    missing: list[int],
+    account: str | None,
+    make_builder,
+) -> tuple[dict[str, list[int]], list[int], list[int]]:
+    """Re-apply a failed write using the RFC822 Message-ID.
+
+    Mail.app ids are per-mailbox ROWIDs: the moment another device (or a
+    server-side rule) files a message elsewhere, the id we hold is dead
+    even though the message is perfectly fine. The header is stable, so
+    look it up in the index, scan for it, and write there.
+
+    Returns ``(results, still_missing, moved)`` where ``results`` has
+    ``updated`` / ``unchanged`` lists keyed back to the *original* ids,
+    ``still_missing`` are ids with no stable id or no match, and
+    ``moved`` are the ids that were recovered elsewhere.
+    """
+    empty: dict[str, list[int]] = {"updated": [], "unchanged": []}
+    manager = _get_index_manager()
+    if not manager.has_index():
+        return empty, missing, []
+
+    # Map each dead id to its stable header (skip ids indexed before
+    # schema v6, which have none on record).
+    header_by_id: dict[int, str] = {}
+    for mid in missing:
+        header = await asyncio.to_thread(manager.get_rfc822_id, mid)
+        if header:
+            header_by_id[mid] = header
+    if not header_by_id:
+        return empty, missing, []
+
+    target_account = await _resolve_visible_account(account)
+    excluded = _excluded_account_names()
+    # None means "first account" to MailCore.getAccount — only a problem
+    # when exclusions are active and no visible account is left.
+    if excluded and (target_account is None or target_account in excluded):
+        return empty, missing, []
+
+    builder = make_builder(
+        [
+            {
+                "account": target_account,
+                "headers": sorted(set(header_by_id.values())),
+                "by_header": True,
+            }
+        ]
+    )
+    builder.max_scan_mailboxes = STRATEGY3_MAX_MAILBOXES
+    try:
+        res = await execute_with_core_async(
+            builder.build(), timeout=STRATEGY3_TIMEOUT
+        )
+    except Exception as exc:
+        logger.debug("stable-id recovery failed: %s", exc, exc_info=True)
+        return empty, missing, []
+
+    # JXA answers in headers; map back to the ids the caller passed.
+    ids_for = {}
+    for mid, header in header_by_id.items():
+        ids_for.setdefault(header, []).append(mid)
+
+    results: dict[str, list[int]] = {"updated": [], "unchanged": []}
+    for bucket in ("updated", "unchanged"):
+        for header in res.get(bucket, []):
+            results[bucket].extend(ids_for.get(header, []))
+
+    recovered = set(results["updated"]) | set(results["unchanged"])
+    still_missing = [m for m in missing if m not in recovered]
+    return results, still_missing, sorted(recovered)
 
 
 # ========== MCP Tools (10 total) ==========
@@ -2048,6 +2152,15 @@ async def get_index_status() -> dict:
                     ),
                 }
             )
+            legacy = await asyncio.to_thread(manager.count_without_stable_id)
+            result["without_stable_id"] = legacy
+            if legacy:
+                result["note"] = (
+                    f"{legacy} indexed message(s) predate stable "
+                    f"Message-ID tracking. If another device moves one, "
+                    f"writes to it will fail with not_found. "
+                    f"refresh_index(full=True) backfills them."
+                )
             if stats.disk_email_count:
                 pct = 100.0 * indexed / stats.disk_email_count
                 result["progress_percent"] = round(min(pct, 100.0), 1)

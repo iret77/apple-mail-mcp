@@ -384,12 +384,70 @@ function applyToMessage(collection, idx, targetId) {{
     return "updated";
 }}
 
+// Same contract, but identity is the RFC822 Message-ID (used by the
+// recovery path, where the ROWID is no longer valid).
+function applyByHeader(collection, idx, targetHeader) {{
+    const msg = collection[idx];
+    try {{
+        if (msg.messageId() !== targetHeader) return "failed";
+    }} catch (e) {{
+        return "failed";
+    }}
+    try {{
+        if (!({self.needs_change_js})) return "unchanged";
+    }} catch (e) {{
+        // Current state unreadable — write rather than silently skip.
+    }}
+    {self.apply_js}
+    return "updated";
+}}
+
 for (const g of groups) {{
     let account;
     try {{
         account = MailCore.getAccount(g.account);
     }} catch (e) {{
         for (const id of g.ids) notFound.push(id);
+        continue;
+    }}
+
+    if (g.by_header) {{
+        // Recovery path: the ROWIDs are gone (another device filed the
+        // message elsewhere), so match on the RFC822 Message-ID, which
+        // survives moves. Batch-fetch headers per mailbox — one IPC
+        // call each, never per message.
+        let mailboxes;
+        try {{
+            mailboxes = account.mailboxes();
+        }} catch (e) {{
+            for (const h of g.headers) notFound.push(h);
+            continue;
+        }}
+        const remaining = new Set(g.headers);
+        const limit = Math.min(mailboxes.length, MAX_SCAN);
+        for (let m = 0; m < limit && remaining.size > 0; m++) {{
+            let headers;
+            try {{
+                headers = mailboxes[m].messages.messageId();
+            }} catch (e) {{
+                continue;  // skip inaccessible mailbox
+            }}
+            for (const target of Array.from(remaining)) {{
+                const idx = headers.indexOf(target);
+                if (idx === -1) continue;
+                remaining.delete(target);
+                try {{
+                    const r = applyByHeader(
+                        mailboxes[m].messages, idx, target);
+                    if (r === "updated") updated.push(target);
+                    else if (r === "unchanged") unchanged.push(target);
+                    else notFound.push(target);
+                }} catch (e) {{
+                    notFound.push(target);
+                }}
+            }}
+        }}
+        for (const h of remaining) notFound.push(h);
         continue;
     }}
 

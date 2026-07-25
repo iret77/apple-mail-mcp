@@ -374,6 +374,7 @@ class IndexWatcher:
                                 "sender": email.sender,
                                 "content": email.content,
                                 "date_received": email.date_received,
+                                "message_id_header": email.message_id_header,
                             },
                             account,
                             mailbox,

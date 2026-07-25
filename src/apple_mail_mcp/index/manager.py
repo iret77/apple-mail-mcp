@@ -404,6 +404,7 @@ class IndexManager:
                         email_data.get("content", ""),
                         email_data.get("date_received", ""),
                         email_data.get("emlx_path", ""),
+                        email_data.get("message_id_header") or None,
                         len(attachments),
                     )
                 )
@@ -751,6 +752,81 @@ class IndexManager:
         if row:
             return (row["account"], row["mailbox"])
         return None
+
+    def get_rfc822_id(
+        self,
+        message_id: int,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> str | None:
+        """Return the stable RFC822 Message-ID for a Mail.app ROWID.
+
+        The ROWID is per-mailbox and changes when a message is filed
+        elsewhere — routinely, since most accounts are open on several
+        devices. The header survives that, so it is the handle to fall
+        back on once a ROWID stops resolving.
+
+        Returns None when unknown (row absent, or indexed before schema
+        v6 and not yet re-indexed).
+        """
+        conn = self._get_conn()
+        where = ["message_id = ?"]
+        params: list = [message_id]
+        if account:
+            where.append("account = ?")
+            params.append(account)
+        if mailbox:
+            where.append("mailbox = ?")
+            params.append(mailbox)
+
+        sql = (
+            "SELECT rfc822_message_id FROM emails WHERE "
+            + " AND ".join(where)
+            + " AND rfc822_message_id IS NOT NULL LIMIT 1"
+        )
+        row = conn.execute(sql, params).fetchone()
+        return row["rfc822_message_id"] if row else None
+
+    def count_without_stable_id(self) -> int:
+        """Rows lacking an RFC822 Message-ID (indexed before schema v6).
+
+        Those messages cannot be recovered once another device moves
+        them, because there is no stable handle on record. A full
+        rebuild backfills them.
+        """
+        try:
+            row = (
+                self._get_conn()
+                .execute(
+                    "SELECT COUNT(*) AS n FROM emails "
+                    "WHERE rfc822_message_id IS NULL"
+                )
+                .fetchone()
+            )
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def find_by_rfc822(
+        self, rfc822_message_id: str
+    ) -> list[tuple[str, str, int]]:
+        """Locate every indexed copy of a message by its stable header.
+
+        A message can legitimately exist more than once (the same mail
+        in INBOX and in an archive, or across accounts), so this returns
+        all matches rather than guessing. Newest first, so the most
+        recently indexed location is tried first.
+
+        Returns:
+            List of ``(account, mailbox, message_id)``.
+        """
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT account, mailbox, message_id FROM emails "
+            "WHERE rfc822_message_id = ? ORDER BY indexed_at DESC",
+            (rfc822_message_id,),
+        ).fetchall()
+        return [(r["account"], r["mailbox"], r["message_id"]) for r in rows]
 
     def find_email_path(
         self,

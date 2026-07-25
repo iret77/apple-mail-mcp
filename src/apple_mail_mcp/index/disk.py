@@ -1171,6 +1171,7 @@ def scan_all_emails(
             "content": parsed.content,
             "date_received": meta.get("date_received") or parsed.date_received,
             "emlx_path": str(emlx_path),
+            "message_id_header": parsed.message_id_header,
             "attachments": parsed.attachments or [],
         }
 

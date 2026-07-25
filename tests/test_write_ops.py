@@ -397,8 +397,14 @@ class TestWriteBuckets:
         mgr.find_email_location.side_effect = locate
         amap = _mock_acct_map()
 
+        # id 99 has no index location, so it goes to the bounded scan;
+        # neither is found by JXA.
         async def fake_exec(script, **kw):
+            if '"scan": true' in script:
+                return {"updated": [], "not_found": [99]}
             return {"updated": [], "not_found": [1]}
+
+        mgr.get_rfc822_id.return_value = None  # nothing to recover with
 
         with (
             patch(
@@ -416,14 +422,23 @@ class TestWriteBuckets:
         assert result["updated"] == []
 
     @pytest.mark.asyncio
-    async def test_no_jxa_call_when_all_unresolvable(self):
-        """If nothing resolves, no osascript invocation happens."""
-        mgr = _mock_index(location=None)  # never resolves
+    async def test_unresolvable_ids_go_to_a_bounded_scan(self):
+        """Ids the index can't place are scanned for, not written off —
+        even with no account given (JXA then uses the first account)."""
+        mgr = _mock_index(location=None)  # index never resolves them
+        mgr.get_rfc822_id.return_value = None
         amap = _mock_acct_map()
-        exec_mock = AsyncMock()
+        scripts = []
+
+        async def fake_exec(script, **kw):
+            scripts.append(script)
+            return {"updated": [], "not_found": [1, 2]}
 
         with (
-            patch("apple_mail_mcp.server.execute_with_core_async", exec_mock),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
             patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
             patch("apple_mail_mcp.server._get_account_map", return_value=amap),
         ):
@@ -431,7 +446,8 @@ class TestWriteBuckets:
 
             result = await set_read_status([1, 2])
 
-        exec_mock.assert_not_called()
+        assert len(scripts) == 1
+        assert '"scan": true' in scripts[0]
         assert set(result["not_found"]) == {1, 2}
 
     @pytest.mark.asyncio
@@ -439,8 +455,14 @@ class TestWriteBuckets:
         mgr = _mock_index(location=None, has_index=False)
         amap = _mock_acct_map()
 
+        async def fake_exec(script, **kw):
+            return {"updated": [], "unchanged": [], "not_found": [1]}
+
         with (
-            patch("apple_mail_mcp.server.execute_with_core_async", AsyncMock()),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
             patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
             patch("apple_mail_mcp.server._get_account_map", return_value=amap),
         ):
@@ -1325,3 +1347,194 @@ class TestNoOpWritesAreSkipped:
         assert r["updated"] == [1]
         assert r["unchanged"] == [2]
         assert r["not_found"] == []
+
+
+class TestStableMessageIdentity:
+    """RFC822 Message-ID as the identity that survives moves."""
+
+    def test_schema_v6_column_and_index_exist(self, temp_db):
+        cols = {r[1] for r in temp_db.execute("PRAGMA table_info(emails)")}
+        assert "rfc822_message_id" in cols
+        idx = {
+            r[0]
+            for r in temp_db.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+        assert "idx_emails_rfc822" in idx
+
+    def test_email_to_row_carries_the_header(self):
+        from apple_mail_mcp.index.schema import email_to_row
+
+        row = email_to_row(
+            {"id": 1, "message_id_header": "<abc@example.com>"}, "acct", "INBOX"
+        )
+        assert "<abc@example.com>" in row
+
+    def test_missing_header_stored_as_null_not_empty(self):
+        from apple_mail_mcp.index.schema import email_to_row
+
+        row = email_to_row({"id": 1, "message_id_header": ""}, "a", "INBOX")
+        assert row[-2] is None  # NULL, so the index stays selective
+
+    def test_migration_from_v5_adds_column(self, tmp_path):
+        """A v5 database must migrate in place, not be discarded."""
+        import sqlite3
+
+        from apple_mail_mcp.index.schema import (
+            SCHEMA_VERSION,
+            init_database,
+        )
+
+        db = tmp_path / "old.db"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE emails (
+                rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                account TEXT NOT NULL,
+                mailbox TEXT NOT NULL,
+                subject TEXT, sender TEXT, content TEXT,
+                date_received TEXT, emlx_path TEXT,
+                attachment_count INTEGER DEFAULT 0,
+                indexed_at TEXT,
+                UNIQUE(account, mailbox, message_id)
+            );
+            CREATE TABLE schema_version (version INTEGER);
+            INSERT INTO schema_version (version) VALUES (5);
+            INSERT INTO emails (message_id, account, mailbox, subject)
+                VALUES (42, 'acct', 'INBOX', 'kept');
+        """)
+        conn.commit()
+        conn.close()
+
+        migrated = init_database(db)
+        try:
+            cols = {r[1] for r in migrated.execute("PRAGMA table_info(emails)")}
+            assert "rfc822_message_id" in cols
+            # Pre-existing data survives; the new column is simply NULL.
+            row = migrated.execute(
+                "SELECT subject, rfc822_message_id FROM emails "
+                "WHERE message_id = 42"
+            ).fetchone()
+            assert row[0] == "kept"
+            assert row[1] is None
+            version = migrated.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0]
+            assert version == SCHEMA_VERSION
+        finally:
+            migrated.close()
+
+    def test_lookup_roundtrip(self, temp_db_path):
+        from apple_mail_mcp.index import IndexManager
+        from apple_mail_mcp.index.schema import INSERT_EMAIL_SQL, email_to_row
+
+        m = IndexManager(db_path=temp_db_path)
+        conn = m._get_conn()
+        conn.execute(
+            INSERT_EMAIL_SQL,
+            email_to_row(
+                {"id": 7, "message_id_header": "<stable@x>"}, "acct", "INBOX"
+            ),
+        )
+        conn.commit()
+
+        assert m.get_rfc822_id(7) == "<stable@x>"
+        assert m.find_by_rfc822("<stable@x>") == [("acct", "INBOX", 7)]
+        assert m.get_rfc822_id(999) is None
+        assert m.find_by_rfc822("<nope@x>") == []
+
+    def test_find_by_rfc822_returns_every_copy(self, temp_db_path):
+        """The same mail can sit in several mailboxes — return all."""
+        from apple_mail_mcp.index import IndexManager
+        from apple_mail_mcp.index.schema import INSERT_EMAIL_SQL, email_to_row
+
+        m = IndexManager(db_path=temp_db_path)
+        conn = m._get_conn()
+        for mid, mbox in ((1, "INBOX"), (2, "Archive")):
+            conn.execute(
+                INSERT_EMAIL_SQL,
+                email_to_row(
+                    {"id": mid, "message_id_header": "<dup@x>"}, "acct", mbox
+                ),
+            )
+        conn.commit()
+
+        found = m.find_by_rfc822("<dup@x>")
+        assert len(found) == 2
+        assert {f[1] for f in found} == {"INBOX", "Archive"}
+
+
+class TestMovedMessageRecovery:
+    """A write must survive another device moving the message."""
+
+    @pytest.mark.asyncio
+    async def test_recovers_via_header_and_reports_move(self):
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.has_usable_index.return_value = True
+        # id 5 resolves in the index, but JXA no longer finds it there.
+        mgr.find_email_location.return_value = ("uuid-work", "INBOX")
+        mgr.get_rfc822_id.return_value = "<moved@x>"
+        amap = _mock_acct_map()
+
+        calls = []
+
+        async def fake_exec(script, **kw):
+            calls.append(script)
+            if '"by_header": true' in script:  # the group data, not the JS
+                return {
+                    "updated": ["<moved@x>"],
+                    "unchanged": [],
+                    "not_found": [],
+                }
+            return {"updated": [], "unchanged": [], "not_found": [5]}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            r = await set_flag(5, color="red")
+
+        assert r["updated"] == [5]  # mapped back to the caller's id
+        assert r["not_found"] == []
+        assert "moved" in r["hint"].lower()
+        assert len(calls) == 2  # normal write, then recovery
+
+    @pytest.mark.asyncio
+    async def test_no_stable_id_means_no_retry(self):
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.has_usable_index.return_value = True
+        mgr.find_email_location.return_value = ("uuid-work", "INBOX")
+        mgr.get_rfc822_id.return_value = None  # indexed before v6
+        amap = _mock_acct_map()
+
+        calls = []
+
+        async def fake_exec(script, **kw):
+            calls.append(script)
+            return {"updated": [], "unchanged": [], "not_found": [5]}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            r = await set_flag(5, color="red")
+
+        assert r["not_found"] == [5]
+        assert len(calls) == 1  # no pointless second scan
+        assert "refresh_index" in r["hint"]
