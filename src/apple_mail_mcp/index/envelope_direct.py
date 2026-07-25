@@ -128,6 +128,41 @@ def list_account_uuids(envelope_path: Path) -> list[str]:
         conn.close()
 
 
+def fetch_message_flags(
+    envelope_path: Path, message_id: int
+) -> tuple[bool, bool] | None:
+    """Read live read/flagged state for one message from Apple's index.
+
+    The `.emlx` plist footer carries the same two bits, but Mail does
+    not reliably rewrite that file when the user toggles a flag in the
+    UI — so a disk read can report state that is hours or days stale.
+    The Envelope Index is Mail's own source of truth and is updated
+    immediately, so prefer it wherever correctness matters.
+
+    Args:
+        envelope_path: Path to Apple's ``Envelope Index``
+        message_id: Mail.app message id (the ``messages`` ROWID)
+
+    Returns:
+        ``(read, flagged)``, or None if the message is unknown here.
+
+    Raises:
+        sqlite3.OperationalError: on a schema mismatch — callers should
+            fall back to whatever they had.
+    """
+    conn = sqlite3.connect(f"file:{envelope_path}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT read, flagged FROM messages WHERE ROWID = ?",
+            (int(message_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return bool(row[0]), bool(row[1])
+    finally:
+        conn.close()
+
+
 def _has_labels_table(conn: sqlite3.Connection) -> bool:
     """Whether this Envelope Index has the Gmail `labels` table."""
     row = conn.execute(
