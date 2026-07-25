@@ -90,6 +90,11 @@ if (!uvx) {
 const env = {
   ...process.env,
   PATH: `${EXTRA_BIN_DIRS.join(":")}:${process.env.PATH || ""}`,
+  // Tell the server it was started from the bundle. It has no
+  // `apple-mail-mcp` on the user's PATH, so any command it suggests
+  // must go through uvx — and it needs `ref` to name the right source.
+  APPLE_MAIL_MCP_LAUNCHER: "mcpb",
+  APPLE_MAIL_MCP_REF: ref,
 };
 
 const stampDir = join(home, ".apple-mail-mcp");
