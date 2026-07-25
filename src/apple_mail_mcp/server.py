@@ -6,7 +6,7 @@ Apple Mail MCP Server
 2. FTS5 search — full-text body search in ~2ms with BM25 ranking
 3. JXA fallback — batch property fetching for multi-email listing
 
-TOOLS (10 total):
+TOOLS (11 total):
 - list_accounts() - List email accounts
 - list_mailboxes(account?) - List mailboxes
 - get_emails(..., filter?) - Unified email listing with filters
@@ -17,6 +17,7 @@ TOOLS (10 total):
 - get_attachment(id, filename?) - Deprecated alias
 - set_flag(ids, color?) - Flag/unflag emails, optionally by color (write)
 - set_read_status(ids, read?) - Mark emails read/unread (write)
+- get_index_status() - Index health + setup diagnostics
 
 RESOURCES (1 total):
 - index://status - JSON snapshot of search-index health
@@ -1647,6 +1648,121 @@ async def set_read_status(
         mailbox,
         lambda groups: WriteBuilder.set_read(groups, read),
     )
+
+
+@mcp.tool
+async def get_index_status() -> dict:
+    """
+    Report search-index health and setup problems.
+
+    Use this to answer "is the index ready / how far along is it?" and
+    as the first step when email search returns nothing, or a write
+    reports ids as not_found. It reads state only — nothing is changed.
+
+    Returns:
+        Dict describing the current state:
+        - state: "building" | "ready" | "empty" | "absent"
+        - indexed_emails / disk_emails / progress_percent: build
+          progress (the index commits continuously, so counts rise
+          while a build runs)
+        - mail_dir_accessible: False means macOS Full Disk Access is
+          missing for this app — the most common cause of an empty
+          index. `problem` then carries a fix-it hint.
+        - last_error: most recent build/sync failure, if any
+        - read_only, excluded_accounts, failed_parse_jobs, last_sync,
+          staleness_hours, db_size_mb: configuration and health
+    """
+    manager = _get_index_manager()
+
+    # Probe Mail access directly: this is the single most common
+    # failure (no Full Disk Access) and it must be reported even when
+    # no index exists yet.
+    mail_dir_accessible = True
+    mail_dir: str | None = None
+    try:
+        from .index.disk import find_mail_directory
+
+        mail_dir = str(await asyncio.to_thread(find_mail_directory))
+    except Exception as exc:
+        mail_dir_accessible = False
+        mail_dir = None
+        logger.debug("Mail directory probe failed: %s", exc)
+
+    building = manager.is_building()
+    has_index = manager.has_index()
+    indexed = await asyncio.to_thread(manager.indexed_email_count)
+
+    if building:
+        state = "building"
+    elif not has_index:
+        state = "absent"
+    elif indexed == 0:
+        state = "empty"
+    else:
+        state = "ready"
+
+    result: dict = {
+        "state": state,
+        "indexed_emails": indexed,
+        "mail_dir_accessible": mail_dir_accessible,
+        "mail_directory": mail_dir,
+        "read_only": get_read_only_mode(),
+        "last_error": manager.last_error,
+    }
+
+    # Richer stats need a disk walk; skip them when Mail is
+    # unreachable (they'd only fail) or mid-build (the walk competes
+    # with the build for I/O).
+    if has_index and not building and mail_dir_accessible:
+        try:
+            stats = await asyncio.to_thread(manager.get_stats)
+            result.update(
+                {
+                    "disk_emails": stats.disk_email_count,
+                    "mailboxes": stats.mailbox_count,
+                    "attachments": stats.attachment_count,
+                    "db_size_mb": round(stats.db_size_mb, 2),
+                    "failed_parse_jobs": stats.failed_jobs_count,
+                    "excluded_accounts": stats.excluded_accounts,
+                    "last_sync": (
+                        stats.last_sync.isoformat() if stats.last_sync else None
+                    ),
+                    "staleness_hours": (
+                        round(stats.staleness_hours, 2)
+                        if stats.staleness_hours is not None
+                        else None
+                    ),
+                }
+            )
+            if stats.disk_email_count:
+                pct = 100.0 * indexed / stats.disk_email_count
+                result["progress_percent"] = round(min(pct, 100.0), 1)
+        except Exception as exc:
+            logger.debug("get_stats failed: %s", exc, exc_info=True)
+            result["stats_error"] = str(exc)
+
+    # A single actionable sentence beats making the model infer the
+    # fix from raw fields.
+    if not mail_dir_accessible:
+        result["problem"] = (
+            "Cannot read ~/Library/Mail. Grant Full Disk Access to this "
+            "app (System Settings > Privacy & Security > Full Disk "
+            "Access), then restart it. Body search stays unavailable "
+            "until then; flag/read tools still work."
+        )
+    elif state == "building":
+        result["problem"] = (
+            "Index build in progress. Body search is incomplete until "
+            "it finishes; flag/read tools work already."
+        )
+    elif state in ("absent", "empty"):
+        result["problem"] = (
+            "No usable index yet. It builds automatically on server "
+            "start (or run 'apple-mail-mcp index'). Body search is "
+            "unavailable until then."
+        )
+
+    return result
 
 
 # ========== MCP Resources ==========

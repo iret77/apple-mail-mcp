@@ -126,14 +126,27 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
         except Exception as e:
             print(f"Warning: File watcher failed: {e}", file=sys.stderr)
 
-    if manager.has_index():
+    # An index *file* can exist while holding nothing — an interrupted
+    # or permission-denied first build leaves an empty database behind.
+    # Syncing that forever would never populate it, so treat it as
+    # "needs building".
+    if manager.has_usable_index():
 
         def _background_sync() -> None:
             try:
                 start = time.time()
                 count = manager.sync_updates()
                 elapsed = time.time() - start
-                if count > 0:
+                if manager.last_error:
+                    # sync_updates returns 0 both for "no changes" and
+                    # for "couldn't read Mail" — don't claim success.
+                    print(
+                        f"Warning: index sync could not read Mail "
+                        f"({manager.last_error}). Grant Full Disk Access "
+                        f"to this app and restart it.",
+                        file=sys.stderr,
+                    )
+                elif count > 0:
                     print(
                         f"Background sync: {count} changes "
                         f"({_format_time(elapsed)})",

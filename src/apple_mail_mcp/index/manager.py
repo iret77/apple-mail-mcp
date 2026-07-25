@@ -107,6 +107,47 @@ class IndexManager:
         # (build/sync/watcher). Lets JXA-free paths like the disk
         # email count honor exclusions without their own JXA call.
         self._exclude_account_uuids: set[str] = set()
+        # Observability for the status tool: a build runs in a daemon
+        # thread, so "is it working or wedged?" is otherwise invisible
+        # to the caller. Both are process-local by design — they
+        # describe *this* server's activity.
+        self._building = False
+        self._last_error: str | None = None
+
+    def is_building(self) -> bool:
+        """True while a full index build is running in this process."""
+        return self._building
+
+    @property
+    def last_error(self) -> str | None:
+        """Most recent build/sync failure message, or None.
+
+        Cleared on the next successful build/sync so a transient
+        failure (e.g. Full Disk Access granted mid-session) doesn't
+        stick around misreporting a healthy index.
+        """
+        return self._last_error
+
+    def indexed_email_count(self) -> int:
+        """Cheap COUNT(*) over the emails table (no disk walk).
+
+        Distinguishes "DB file exists" from "DB has content" — an
+        interrupted or permission-denied first build leaves an empty
+        database behind, which must not be mistaken for a usable index.
+        """
+        try:
+            row = (
+                self._get_conn()
+                .execute("SELECT COUNT(*) AS n FROM emails")
+                .fetchone()
+            )
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def has_usable_index(self) -> bool:
+        """True when an index exists *and* holds at least one email."""
+        return self.has_index() and self.indexed_email_count() > 0
 
     def _resolve_exclusions(self) -> set[str]:
         """Resolve configured account exclusions to UUIDs and remember
@@ -299,8 +340,17 @@ class IndexManager:
         """
         from .disk import find_mail_directory, scan_all_emails
 
-        # Verify we can access the mail directory
-        mail_dir = find_mail_directory()
+        # Mark the build as running before the first thing that can
+        # fail, so the status tool can distinguish "never started",
+        # "running" and "failed with this error".
+        self._building = True
+        try:
+            # Verify we can access the mail directory
+            mail_dir = find_mail_directory()
+        except Exception as e:
+            self._building = False
+            self._last_error = f"{type(e).__name__}: {e}"
+            raise
 
         # Resolve excluded account names -> UUIDs (one JXA call, only
         # when exclusions are configured) so the JXA-free disk walk can
@@ -372,6 +422,11 @@ class IndexManager:
                     batch_attachments = []
 
         finally:
+            # The build is no longer running, however it ended. Set
+            # before the flush so a failure in cleanup can't leave the
+            # status tool reporting a phantom in-progress build.
+            self._building = False
+
             # Flush any remaining partial batch (crash-safe)
             if batch:
                 self._flush_batch(conn, batch, batch_attachments)
@@ -458,6 +513,7 @@ class IndexManager:
         # Disk inventory just changed — drop the cache so the next
         # status call reflects truth.
         self.invalidate_disk_count_cache()
+        self._last_error = None  # a completed build clears prior failures
         return total_indexed
 
     @staticmethod
@@ -516,6 +572,11 @@ class IndexManager:
             mail_dir = find_mail_directory()
         except (FileNotFoundError, PermissionError) as e:
             logger.warning("Cannot access mail directory for sync: %s", e)
+            # Record it, but keep returning 0 (callers rely on that).
+            # 0 alone is indistinguishable from "no changes", which is
+            # why the caller must consult `last_error` before claiming
+            # the index is up to date.
+            self._last_error = f"{type(e).__name__}: {e}"
             return 0
 
         exclude_account_uuids = self._resolve_exclusions()
@@ -529,6 +590,7 @@ class IndexManager:
         # Disk inventory just changed (or was just verified) — drop
         # the get_stats cache so the next status call reflects truth.
         self.invalidate_disk_count_cache()
+        self._last_error = None  # a successful sync clears prior failures
         return result.total_changes
 
     def search(

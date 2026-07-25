@@ -690,3 +690,135 @@ class TestReadOnlyRefusal:
                 await set_read_status(1)
 
         exec_mock.assert_not_called()
+
+
+class TestIndexStatusTool:
+    """get_index_status(): the agent-facing diagnostics tool."""
+
+    def _mgr(self, *, building=False, has_index=True, indexed=100, err=None):
+        m = MagicMock()
+        m.is_building.return_value = building
+        m.has_index.return_value = has_index
+        m.indexed_email_count.return_value = indexed
+        m.last_error = err
+        return m
+
+    @pytest.mark.asyncio
+    async def test_reports_missing_full_disk_access(self):
+        mgr = self._mgr(has_index=False, indexed=0)
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=PermissionError("denied"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["mail_dir_accessible"] is False
+        assert "Full Disk Access" in r["problem"]
+        assert r["state"] == "absent"
+
+    @pytest.mark.asyncio
+    async def test_state_building(self, tmp_path):
+        mgr = self._mgr(building=True, indexed=42)
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["state"] == "building"
+        assert r["indexed_emails"] == 42
+        assert "progress" in r["problem"].lower()
+
+    @pytest.mark.asyncio
+    async def test_state_empty_when_db_has_no_rows(self, tmp_path):
+        mgr = self._mgr(indexed=0)
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["state"] == "empty"
+
+    @pytest.mark.asyncio
+    async def test_ready_reports_progress_percent(self, tmp_path):
+        mgr = self._mgr(indexed=50)
+        stats = MagicMock()
+        stats.disk_email_count = 200
+        stats.mailbox_count = 3
+        stats.attachment_count = 7
+        stats.db_size_mb = 1.234
+        stats.failed_jobs_count = 0
+        stats.excluded_accounts = []
+        stats.last_sync = None
+        stats.staleness_hours = None
+        mgr.get_stats.return_value = stats
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["state"] == "ready"
+        assert r["progress_percent"] == 25.0
+        assert "problem" not in r
+
+    @pytest.mark.asyncio
+    async def test_surfaces_last_error(self, tmp_path):
+        mgr = self._mgr(indexed=0, err="PermissionError: nope")
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["last_error"] == "PermissionError: nope"
+
+
+class TestUsableIndexAndErrorTracking:
+    """has_usable_index() and last_error on the real IndexManager."""
+
+    def test_empty_db_is_not_usable(self, temp_db_path):
+        from apple_mail_mcp.index import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        m.indexed_email_count()  # creates the DB file
+        assert m.has_index() is True
+        assert m.has_usable_index() is False  # file exists, but no rows
+
+    def test_sync_failure_sets_last_error_and_returns_zero(self, temp_db_path):
+        from apple_mail_mcp.index import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        with patch(
+            "apple_mail_mcp.index.disk.find_mail_directory",
+            side_effect=PermissionError("Cannot access"),
+        ):
+            assert m.sync_updates() == 0  # contract preserved
+        assert "PermissionError" in (m.last_error or "")
