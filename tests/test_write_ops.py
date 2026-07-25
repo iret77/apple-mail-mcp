@@ -822,3 +822,94 @@ class TestUsableIndexAndErrorTracking:
         ):
             assert m.sync_updates() == 0  # contract preserved
         assert "PermissionError" in (m.last_error or "")
+
+
+class TestIndexModes:
+    """Both supported setups: automatic (FDA) and manual (no FDA)."""
+
+    def _mgr(self, *, indexed, building=False, has_index=True):
+        m = MagicMock()
+        m.is_building.return_value = building
+        m.has_index.return_value = has_index
+        m.indexed_email_count.return_value = indexed
+        m.last_error = None
+        return m
+
+    @pytest.mark.asyncio
+    async def test_manual_mode_with_prebuilt_index_is_not_a_problem(self):
+        """No FDA + index built elsewhere = working setup, not an error."""
+        mgr = self._mgr(indexed=500)
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=PermissionError("no FDA"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["state"] == "ready"
+        assert "problem" not in r  # not broken — just a different mode
+        assert "note" in r
+        assert "apple-mail-mcp index" in r["note"]
+
+    @pytest.mark.asyncio
+    async def test_no_fda_and_no_index_offers_both_paths(self):
+        mgr = self._mgr(indexed=0, has_index=False)
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=PermissionError("no FDA"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert "Full Disk Access" in r["problem"]
+        assert "apple-mail-mcp index" in r["problem"]  # both options named
+
+    @pytest.mark.asyncio
+    async def test_index_mode_reflects_auto_build_setting(
+        self, tmp_path, monkeypatch
+    ):
+        mgr = self._mgr(indexed=0, has_index=False)
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", "false")
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["index_mode"] == "manual"
+        # Manual mode must not promise an automatic build.
+        assert "automatically" not in r["problem"]
+        assert "apple-mail-mcp index" in r["problem"]
+
+    @pytest.mark.asyncio
+    async def test_automatic_mode_mentions_self_build(
+        self, tmp_path, monkeypatch
+    ):
+        mgr = self._mgr(indexed=0, has_index=False)
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", "true")
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["index_mode"] == "automatic"
+        assert "automatically" in r["problem"]

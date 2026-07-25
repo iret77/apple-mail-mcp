@@ -1701,11 +1701,16 @@ async def get_index_status() -> dict:
     else:
         state = "ready"
 
+    from .config import get_index_auto_build
+
+    auto_build = get_index_auto_build()
+
     result: dict = {
         "state": state,
         "indexed_emails": indexed,
         "mail_dir_accessible": mail_dir_accessible,
         "mail_directory": mail_dir,
+        "index_mode": "automatic" if auto_build else "manual",
         "read_only": get_read_only_mode(),
         "last_error": manager.last_error,
     }
@@ -1742,25 +1747,42 @@ async def get_index_status() -> dict:
             result["stats_error"] = str(exc)
 
     # A single actionable sentence beats making the model infer the
-    # fix from raw fields.
-    if not mail_dir_accessible:
-        result["problem"] = (
-            "Cannot read ~/Library/Mail. Grant Full Disk Access to this "
-            "app (System Settings > Privacy & Security > Full Disk "
-            "Access), then restart it. Body search stays unavailable "
-            "until then; flag/read tools still work."
-        )
-    elif state == "building":
+    # fix from raw fields. The advice depends on which of the two
+    # supported setups the user is in:
+    #   automatic — this app has Full Disk Access and self-builds
+    #   manual    — this app has no Full Disk Access; the index is
+    #               built out-of-band from a terminal that does
+    _MANUAL_CMD = "apple-mail-mcp index --verbose"
+    if state == "building":
         result["problem"] = (
             "Index build in progress. Body search is incomplete until "
             "it finishes; flag/read tools work already."
         )
+    elif not mail_dir_accessible and state == "ready":
+        # Manual mode working as designed: the index was built
+        # elsewhere and is readable; only live disk reads are blocked.
+        result["note"] = (
+            "Running without Full Disk Access. Search uses the existing "
+            "index and flag/read tools work; single-email reads use the "
+            f"slower live path. Refresh the index with '{_MANUAL_CMD}' "
+            "in a terminal that has Full Disk Access."
+        )
+    elif not mail_dir_accessible:
+        result["problem"] = (
+            "No index, and Mail is unreadable from here (no Full Disk "
+            "Access). Either grant this app Full Disk Access (System "
+            "Settings > Privacy & Security > Full Disk Access) and "
+            f"restart it, or run '{_MANUAL_CMD}' in a terminal that has "
+            "it — both work. Body search is unavailable until one of "
+            "them happens; flag/read tools work regardless."
+        )
     elif state in ("absent", "empty"):
         result["problem"] = (
-            "No usable index yet. It builds automatically on server "
-            "start (or run 'apple-mail-mcp index'). Body search is "
-            "unavailable until then."
-        )
+            f"No usable index yet. Run '{_MANUAL_CMD}' to build it."
+            if not auto_build
+            else "No usable index yet. It builds automatically when the "
+            f"server starts, or run '{_MANUAL_CMD}' now."
+        ) + " Body search is unavailable until then."
 
     return result
 

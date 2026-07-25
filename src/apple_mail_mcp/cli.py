@@ -207,6 +207,18 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
             flush=True,
         )
 
+    else:
+        # Manual mode: auto-build is off and there's no usable index.
+        # Say so — silence here looks like a broken search later.
+        print(
+            "No search index, and automatic building is disabled. "
+            "Run 'apple-mail-mcp index --verbose' in a terminal with "
+            "Full Disk Access to build it. Body search stays "
+            "unavailable until then; flag/read tools work regardless.",
+            file=sys.stderr,
+            flush=True,
+        )
+
     mcp.run()
 
 
