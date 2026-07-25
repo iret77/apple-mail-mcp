@@ -727,6 +727,7 @@ class TestIndexStatusTool:
         m.has_index.return_value = has_index
         m.indexed_email_count.return_value = indexed
         m.cached_disk_count.return_value = None
+        m.build_progress.return_value = None
         m.last_error = err
         return m
 
@@ -1551,6 +1552,7 @@ class TestBuildProgressVisibility:
         mgr.has_index.return_value = True
         mgr.indexed_email_count.return_value = 17_500
         mgr.cached_disk_count.return_value = 70_000
+        mgr.build_progress.return_value = (17_500, 2.0)  # actively working
         mgr.last_error = None
 
         with (
@@ -1577,6 +1579,7 @@ class TestBuildProgressVisibility:
         mgr.has_index.return_value = True
         mgr.indexed_email_count.return_value = 42
         mgr.cached_disk_count.return_value = None  # never walked yet
+        mgr.build_progress.return_value = (42, 1.0)
         mgr.last_error = None
 
         with (
@@ -1592,3 +1595,52 @@ class TestBuildProgressVisibility:
 
         assert r["indexed_emails"] == 42
         assert "progress_percent" not in r  # honest: no denominator
+
+
+class TestStallDetection:
+    """ "Working" and "wedged" must be distinguishable."""
+
+    def _building_mgr(self, seconds_ago):
+        m = MagicMock()
+        m.is_building.return_value = True
+        m.has_index.return_value = True
+        m.indexed_email_count.return_value = 0
+        m.cached_disk_count.return_value = 70_000
+        m.build_progress.return_value = (500, seconds_ago)
+        m.last_error = None
+        return m
+
+    async def _status(self, mgr, tmp_path):
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            return await get_index_status()
+
+    @pytest.mark.asyncio
+    async def test_recent_progress_is_not_a_problem(self, tmp_path):
+        r = await self._status(self._building_mgr(3.0), tmp_path)
+        assert r["build_appears_stalled"] is False
+        assert r["seconds_since_progress"] == 3.0
+        assert "problem" not in r
+
+    @pytest.mark.asyncio
+    async def test_long_silence_is_reported_as_stalled(self, tmp_path):
+        r = await self._status(self._building_mgr(600.0), tmp_path)
+        assert r["build_appears_stalled"] is True
+        assert "stuck" in r["problem"].lower()
+        assert any("Cmd-Q" in s for s in r["next_steps"])
+
+    @pytest.mark.asyncio
+    async def test_reports_rows_written_even_when_count_reads_zero(
+        self, tmp_path
+    ):
+        """The committed-batch counter proves work happened, even if the
+        table count is still catching up."""
+        r = await self._status(self._building_mgr(5.0), tmp_path)
+        assert r["build_emails_done"] == 500

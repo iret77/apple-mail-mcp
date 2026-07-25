@@ -116,10 +116,29 @@ class IndexManager:
         # describe *this* server's activity.
         self._building = False
         self._last_error: str | None = None
+        # Build heartbeat: (emails_done, monotonic_ts), updated on every
+        # committed batch. Without it, "no progress" and "wedged" look
+        # identical from the outside — the count alone cannot tell them
+        # apart while the parser is chewing through a slow mailbox.
+        self._build_progress: tuple[int, float] | None = None
 
     def is_building(self) -> bool:
         """True while a full index build is running in this process."""
         return self._building
+
+    def build_progress(self) -> tuple[int, float] | None:
+        """Heartbeat of the running build: (emails_done, seconds_ago).
+
+        ``seconds_ago`` is how long since the last committed batch. A
+        small value means the build is working even if the total looks
+        unchanged; a large one means it is stuck, and that distinction
+        is the whole point of reporting it.
+        """
+        progress = self._build_progress
+        if progress is None:
+            return None
+        done, ts = progress
+        return done, max(0.0, time.monotonic() - ts)
 
     @property
     def last_error(self) -> str | None:
@@ -386,6 +405,7 @@ class IndexManager:
         # fail, so the status tool can distinguish "never started",
         # "running" and "failed with this error".
         self._building = True
+        self._build_progress = (0, time.monotonic())
         try:
             # Verify we can access the mail directory
             mail_dir = find_mail_directory()
@@ -455,6 +475,10 @@ class IndexManager:
 
                 if len(batch) >= batch_size:
                     self._flush_batch(conn, batch, batch_attachments)
+                    self._build_progress = (
+                        total_indexed + len(batch),
+                        time.monotonic(),
+                    )
                     total_indexed += len(batch)
 
                     if progress_callback:
@@ -469,6 +493,7 @@ class IndexManager:
             # before the flush so a failure in cleanup can't leave the
             # status tool reporting a phantom in-progress build.
             self._building = False
+            self._build_progress = None
 
             # Flush any remaining partial batch (crash-safe)
             if batch:

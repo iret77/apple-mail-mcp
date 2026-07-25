@@ -436,6 +436,7 @@ def _index_guidance(
     state: str,
     mail_dir_accessible: bool,
     auto_build: bool,
+    stalled: bool = False,
 ) -> tuple[str | None, str | None, list[str], str]:
     """Turn raw index state into instructions a non-technical user can follow.
 
@@ -450,6 +451,19 @@ def _index_guidance(
     app = "Claude" if _install_mode() == "bundle" else "the app running this"
 
     if state == "building":
+        if stalled:
+            return (
+                "Index build is stuck — nothing written for over two minutes.",
+                None,
+                [
+                    "Quit the app completely (Cmd-Q) and reopen it — that "
+                    "ends the stuck build and starts a fresh one.",
+                    "If it stalls again, say so: the extension log records "
+                    "where the build stopped.",
+                ],
+                "The index build looks stuck — nothing has been written for "
+                "a while. Restarting the app should clear it.",
+            )
         return (
             None,
             "Index build in progress.",
@@ -2133,6 +2147,14 @@ async def get_index_status() -> dict:
     # user wants a percentage. A fresh disk walk would compete with the
     # build for I/O, so only the cached denominator is used here.
     if building:
+        # Heartbeat first: it answers "working or wedged?", which the
+        # raw count cannot when a slow mailbox is being parsed.
+        progress = manager.build_progress()
+        if progress is not None:
+            done, seconds_ago = progress
+            result["build_emails_done"] = done
+            result["seconds_since_progress"] = round(seconds_ago, 1)
+            result["build_appears_stalled"] = seconds_ago > 120
         cached_total = manager.cached_disk_count()
         if cached_total:
             result["disk_emails"] = cached_total
@@ -2186,6 +2208,7 @@ async def get_index_status() -> dict:
         state=state,
         mail_dir_accessible=mail_dir_accessible,
         auto_build=auto_build,
+        stalled=bool(result.get("build_appears_stalled")),
     )
     if problem:
         result["problem"] = problem
