@@ -100,8 +100,10 @@ for the full schema and precedence rules.
 ### Write operations
 
 `set_flag` and `set_read_status` take a single message id or a list, and
-return per-id outcome buckets (`updated`, `not_found`, `skipped_hidden`) so
-partial success is always visible. Both are refused when the server runs
+return per-id outcome buckets (`updated`, `unchanged`, `not_found`,
+`skipped_hidden`) so partial success is always visible. Messages that
+already hold the requested state are reported as `unchanged` and never
+re-written — each write is a server round-trip on IMAP/Exchange. Both are refused when the server runs
 read-only (`APPLE_MAIL_READ_ONLY=true`, `[server] read_only = true`, or
 `apple-mail-mcp serve -r`). Message ids are located via the search index;
 when it can't place an id, the tools fall back to an `account`+`mailbox`

@@ -296,16 +296,19 @@ class WriteBuilder:
     groups: list[dict]
     apply_js: str
     max_scan_mailboxes: int = 50
+    needs_change_js: str = "true"
 
     @classmethod
     def set_read(
         cls, groups: list[dict], read: bool, max_scan_mailboxes: int = 50
     ) -> "WriteBuilder":
         """Build a read/unread (seen/unseen) writer."""
+        want = "true" if read else "false"
         return cls(
             groups,
-            f"msg.readStatus = {'true' if read else 'false'};",
+            f"msg.readStatus = {want};",
             max_scan_mailboxes,
+            needs_change_js=f"msg.readStatus() !== {want}",
         )
 
     @classmethod
@@ -325,13 +328,15 @@ class WriteBuilder:
         """
         if not flagged:
             apply_js = "msg.flaggedStatus = false;"
+            needs = "msg.flaggedStatus() !== false"
         elif flag_index is None:
             apply_js = "msg.flaggedStatus = true;"
+            needs = "msg.flaggedStatus() !== true"
         else:
-            apply_js = (
-                f"msg.flaggedStatus = true; msg.flagIndex = {int(flag_index)};"
-            )
-        return cls(groups, apply_js, max_scan_mailboxes)
+            idx = int(flag_index)
+            apply_js = f"msg.flaggedStatus = true; msg.flagIndex = {idx};"
+            needs = f"msg.flaggedStatus() !== true || msg.flagIndex() !== {idx}"
+        return cls(groups, apply_js, max_scan_mailboxes, needs_change_js=needs)
 
     def build(self) -> str:
         """Generate the JXA script string.
@@ -347,6 +352,7 @@ class WriteBuilder:
 const groups = {groups_json};
 const MAX_SCAN = {max_scan};
 const updated = [];
+const unchanged = [];
 const notFound = [];
 
 // Apply the change to the message at `idx`, but only after confirming
@@ -360,13 +366,22 @@ function applyToMessage(collection, idx, targetId) {{
     try {{
         if (msg.id() !== targetId) {{
             msg = collection.byId(targetId);
-            if (msg.id() !== targetId) return false;
+            if (msg.id() !== targetId) return "failed";
         }}
     }} catch (e) {{
-        return false;
+        return "failed";
+    }}
+    // Skip messages that already hold the requested state. Read live
+    // from Mail — never from an index, which can be stale. Every write
+    // is a server round-trip for IMAP/Exchange accounts (and rotates
+    // the Exchange ItemId), so a no-op write is not free.
+    try {{
+        if (!({self.needs_change_js})) return "unchanged";
+    }} catch (e) {{
+        // Current state unreadable — write rather than silently skip.
     }}
     {self.apply_js}
-    return true;
+    return "updated";
 }}
 
 for (const g of groups) {{
@@ -401,11 +416,11 @@ for (const g of groups) {{
                 if (idx === -1) continue;
                 remaining.delete(targetId);
                 try {{
-                    if (applyToMessage(mailboxes[m].messages, idx, targetId)) {{
-                        updated.push(targetId);
-                    }} else {{
-                        notFound.push(targetId);
-                    }}
+                    const r = applyToMessage(
+                        mailboxes[m].messages, idx, targetId);
+                    if (r === "updated") updated.push(targetId);
+                    else if (r === "unchanged") unchanged.push(targetId);
+                    else notFound.push(targetId);
                 }} catch (e) {{
                     notFound.push(targetId);
                 }}
@@ -439,18 +454,21 @@ for (const g of groups) {{
             continue;
         }}
         try {{
-            if (applyToMessage(mailbox.messages, idx, targetId)) {{
-                updated.push(targetId);
-            }} else {{
-                notFound.push(targetId);
-            }}
+            const r = applyToMessage(mailbox.messages, idx, targetId);
+            if (r === "updated") updated.push(targetId);
+            else if (r === "unchanged") unchanged.push(targetId);
+            else notFound.push(targetId);
         }} catch (e) {{
             notFound.push(targetId);
         }}
     }}
 }}
 
-JSON.stringify({{ updated: updated, not_found: notFound }});
+JSON.stringify({{
+    updated: updated,
+    unchanged: unchanged,
+    not_found: notFound,
+}});
 """
 
 

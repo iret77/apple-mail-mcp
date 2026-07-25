@@ -228,7 +228,8 @@ class WriteResult(TypedDict, total=False):
     one bucket so partial success is visible to the caller.
     """
 
-    updated: list[int]  # successfully modified
+    updated: list[int]  # actually modified
+    unchanged: list[int]  # already in the requested state — no write sent
     not_found: list[int]  # not located (unknown id, or moved/deleted)
     skipped_hidden: list[int]  # resolved into an excluded account
     hint: str  # present only when something is actionable (e.g. no index)
@@ -707,10 +708,12 @@ async def _apply_write(
     located = [g for g in groups if not g.get("scan")]
     scan = [g for g in groups if g.get("scan")]
     updated: list[int] = []
+    unchanged: list[int] = []
 
     if located:
         res = await execute_with_core_async(make_builder(located).build())
         updated += [int(x) for x in res.get("updated", [])]
+        unchanged += [int(x) for x in res.get("unchanged", [])]
         not_found += [int(x) for x in res.get("not_found", [])]
 
     if scan:
@@ -721,6 +724,7 @@ async def _apply_write(
                 builder.build(), timeout=STRATEGY3_TIMEOUT
             )
             updated += [int(x) for x in res.get("updated", [])]
+            unchanged += [int(x) for x in res.get("unchanged", [])]
             not_found += [int(x) for x in res.get("not_found", [])]
         except Exception as exc:
             # Best-effort fallback: a timed-out or failed scan reports its
@@ -730,6 +734,7 @@ async def _apply_write(
 
     result: WriteResult = {
         "updated": updated,
+        "unchanged": unchanged,
         "not_found": not_found,
         "skipped_hidden": skipped_hidden,
     }
@@ -1776,7 +1781,9 @@ async def set_flag(
 
     Returns:
         A dict with per-id outcome buckets so partial success is visible:
-        - updated: ids successfully changed
+        - updated: ids actually changed
+        - unchanged: ids that already had the requested state, so no
+          write was sent (still a success — treat as done)
         - not_found: ids that couldn't be located (unknown, moved,
           or deleted since indexing)
         - skipped_hidden: ids resolving into an excluded account
@@ -1829,7 +1836,9 @@ async def set_read_status(
 
     Returns:
         A dict with per-id outcome buckets so partial success is visible:
-        - updated: ids successfully changed
+        - updated: ids actually changed
+        - unchanged: ids that already had the requested state, so no
+          write was sent (still a success — treat as done)
         - not_found: ids that couldn't be located (unknown, moved,
           or deleted since indexing)
         - skipped_hidden: ids resolving into an excluded account

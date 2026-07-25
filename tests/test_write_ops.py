@@ -80,9 +80,12 @@ class TestWriteBuilder:
         from apple_mail_mcp.builders import WriteBuilder
 
         script = WriteBuilder.set_read(self._groups(), True).build()
-        assert "JSON.stringify({ updated: updated, not_found: notFound })" in (
-            script
-        )
+        for bucket in (
+            "updated: updated",
+            "unchanged: unchanged",
+            "not_found: notFound",
+        ):
+            assert bucket in script
 
     def test_account_name_with_quotes_is_escaped(self):
         """A pathological account name can't break out of the JS literal."""
@@ -1252,3 +1255,73 @@ class TestLiveFlagOverlay:
 
         assert fetch_message_flags(env, rowid) == (True, False)
         assert fetch_message_flags(env, 9999) is None
+
+
+class TestNoOpWritesAreSkipped:
+    """Don't re-write state that already matches — each write is a
+    server round-trip for IMAP/Exchange and rotates the Exchange ItemId."""
+
+    def test_flag_color_checks_live_state(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_flag(
+            [{"account": "W", "mailbox": "INBOX", "ids": [1]}],
+            flagged=True,
+            flag_index=4,
+        ).build()
+        assert "msg.flaggedStatus() !== true" in script
+        assert "msg.flagIndex() !== 4" in script
+        assert 'return "unchanged"' in script
+
+    def test_read_checks_live_state(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_read(
+            [{"account": "W", "mailbox": "INBOX", "ids": [1]}], False
+        ).build()
+        assert "msg.readStatus() !== false" in script
+
+    def test_unflag_checks_live_state(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_flag(
+            [{"account": "W", "mailbox": "INBOX", "ids": [1]}], flagged=False
+        ).build()
+        assert "msg.flaggedStatus() !== false" in script
+
+    def test_state_is_read_from_mail_not_an_index(self):
+        """The check must be live JXA — a stale index caused the original
+        'it's already flagged' bug."""
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_flag(
+            [{"account": "W", "mailbox": "INBOX", "ids": [1]}],
+            flagged=True,
+            flag_index=0,
+        ).build()
+        # Predicate calls the live accessor on the resolved message.
+        assert "if (!(msg.flaggedStatus()" in script
+
+    @pytest.mark.asyncio
+    async def test_unchanged_ids_are_surfaced(self):
+        mgr = _mock_index(location=("uuid-work", "INBOX"))
+        amap = _mock_acct_map()
+
+        async def fake_exec(script, **kw):
+            return {"updated": [1], "unchanged": [2], "not_found": []}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            r = await set_flag([1, 2], color="red")
+
+        assert r["updated"] == [1]
+        assert r["unchanged"] == [2]
+        assert r["not_found"] == []
