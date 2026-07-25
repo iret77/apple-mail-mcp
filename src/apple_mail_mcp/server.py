@@ -2128,9 +2128,20 @@ async def get_index_status() -> dict:
         "last_error": manager.last_error,
     }
 
+    # While a build runs, report progress from the cached disk count:
+    # the counts rise as batches commit, and this is exactly when the
+    # user wants a percentage. A fresh disk walk would compete with the
+    # build for I/O, so only the cached denominator is used here.
+    if building:
+        cached_total = manager.cached_disk_count()
+        if cached_total:
+            result["disk_emails"] = cached_total
+            result["progress_percent"] = round(
+                min(100.0, 100.0 * indexed / cached_total), 1
+            )
+
     # Richer stats need a disk walk; skip them when Mail is
-    # unreachable (they'd only fail) or mid-build (the walk competes
-    # with the build for I/O).
+    # unreachable (they'd only fail) or mid-build (see above).
     if has_index and not building and mail_dir_accessible:
         try:
             stats = await asyncio.to_thread(manager.get_stats)

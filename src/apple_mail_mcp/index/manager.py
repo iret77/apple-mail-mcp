@@ -336,6 +336,17 @@ class IndexManager:
         self._disk_count_cache = (count, now + self._DISK_COUNT_TTL_SEC)
         return count
 
+    def cached_disk_count(self) -> int | None:
+        """Last known on-disk email count, without walking the disk.
+
+        Lets the status tool show build progress while a build is
+        running: the fresh walk would compete with the build for I/O,
+        but a value from before it started is a perfectly good
+        denominator.
+        """
+        cache = self._disk_count_cache
+        return cache[0] if cache is not None else None
+
     def invalidate_disk_count_cache(self) -> None:
         """Drop the cached disk email count. Call after a sync or
         rebuild that materially changes on-disk state.

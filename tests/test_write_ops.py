@@ -726,6 +726,7 @@ class TestIndexStatusTool:
         m.is_building.return_value = building
         m.has_index.return_value = has_index
         m.indexed_email_count.return_value = indexed
+        m.cached_disk_count.return_value = None
         m.last_error = err
         return m
 
@@ -1538,3 +1539,56 @@ class TestMovedMessageRecovery:
         assert r["not_found"] == [5]
         assert len(calls) == 1  # no pointless second scan
         assert "refresh_index" in r["hint"]
+
+
+class TestBuildProgressVisibility:
+    """During a build the user needs a percentage, not silence."""
+
+    @pytest.mark.asyncio
+    async def test_progress_reported_from_cached_disk_count(self, tmp_path):
+        mgr = MagicMock()
+        mgr.is_building.return_value = True
+        mgr.has_index.return_value = True
+        mgr.indexed_email_count.return_value = 17_500
+        mgr.cached_disk_count.return_value = 70_000
+        mgr.last_error = None
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["state"] == "building"
+        assert r["disk_emails"] == 70_000
+        assert r["progress_percent"] == 25.0
+        # The expensive fresh walk must not run during a build.
+        mgr.get_stats.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_cached_total_still_reports_count(self, tmp_path):
+        mgr = MagicMock()
+        mgr.is_building.return_value = True
+        mgr.has_index.return_value = True
+        mgr.indexed_email_count.return_value = 42
+        mgr.cached_disk_count.return_value = None  # never walked yet
+        mgr.last_error = None
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["indexed_emails"] == 42
+        assert "progress_percent" not in r  # honest: no denominator
