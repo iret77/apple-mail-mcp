@@ -737,7 +737,11 @@ class TestIndexStatusTool:
 
         assert r["state"] == "building"
         assert r["indexed_emails"] == 42
-        assert "progress" in r["problem"].lower()
+        # Building is a transient state, not a fault: reported as a
+        # note plus "wait and re-check" steps.
+        assert "problem" not in r
+        assert "progress" in r["note"].lower()
+        assert any("again" in s.lower() for s in r["next_steps"])
 
     @pytest.mark.asyncio
     async def test_state_empty_when_db_has_no_rows(self, tmp_path):
@@ -853,7 +857,7 @@ class TestIndexModes:
         assert r["state"] == "ready"
         assert "problem" not in r  # not broken — just a different mode
         assert "note" in r
-        assert "apple-mail-mcp index" in r["note"]
+        assert "apple-mail-mcp index" in " ".join(r["next_steps"])
 
     @pytest.mark.asyncio
     async def test_no_fda_and_no_index_offers_both_paths(self):
@@ -869,8 +873,9 @@ class TestIndexModes:
 
             r = await get_index_status()
 
-        assert "Full Disk Access" in r["problem"]
-        assert "apple-mail-mcp index" in r["problem"]  # both options named
+        steps = " ".join(r["next_steps"])
+        assert "Full Disk Access" in r["problem"] or "Full Disk Access" in steps
+        assert "apple-mail-mcp index" in steps  # both options named
 
     @pytest.mark.asyncio
     async def test_index_mode_reflects_auto_build_setting(
@@ -891,8 +896,8 @@ class TestIndexModes:
 
         assert r["index_mode"] == "manual"
         # Manual mode must not promise an automatic build.
-        assert "automatically" not in r["problem"]
-        assert "apple-mail-mcp index" in r["problem"]
+        assert "builds automatically" not in r["problem"]
+        assert "apple-mail-mcp index" in " ".join(r["next_steps"])
 
     @pytest.mark.asyncio
     async def test_automatic_mode_mentions_self_build(
@@ -913,3 +918,101 @@ class TestIndexModes:
 
         assert r["index_mode"] == "automatic"
         assert "automatically" in r["problem"]
+        assert any("Cmd-Q" in s for s in r["next_steps"])
+
+
+class TestAgentGuidance:
+    """The status tool must hand the assistant usable instructions."""
+
+    def _mgr(self, *, indexed, building=False, has_index=True):
+        m = MagicMock()
+        m.is_building.return_value = building
+        m.has_index.return_value = has_index
+        m.indexed_email_count.return_value = indexed
+        m.last_error = None
+        return m
+
+    async def _status(self, mgr, *, accessible, tmp_path=None):
+        patches = [
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr)
+        ]
+        if accessible:
+            patches.append(
+                patch(
+                    "apple_mail_mcp.index.disk.find_mail_directory",
+                    return_value=tmp_path,
+                )
+            )
+        else:
+            patches.append(
+                patch(
+                    "apple_mail_mcp.index.disk.find_mail_directory",
+                    side_effect=PermissionError("no FDA"),
+                )
+            )
+        from apple_mail_mcp.server import get_index_status
+
+        for p in patches:
+            p.start()
+        try:
+            return await get_index_status()
+        finally:
+            for p in patches:
+                p.stop()
+
+    @pytest.mark.asyncio
+    async def test_always_returns_user_message_and_instructions(self, tmp_path):
+        r = await self._status(
+            self._mgr(indexed=10), accessible=True, tmp_path=tmp_path
+        )
+        assert r["user_message"]
+        assert "next_steps" in r or r["state"] == "ready"
+        assert "assistant_instructions" in r
+
+    @pytest.mark.asyncio
+    async def test_no_fda_gives_gui_first_steps(self):
+        r = await self._status(
+            self._mgr(indexed=0, has_index=False), accessible=False
+        )
+        steps = r["next_steps"]
+        # The first instruction must be a GUI action, not a command.
+        assert "System Settings" in steps[0]
+        assert any("Full Disk Access" in s for s in steps)
+
+    @pytest.mark.asyncio
+    async def test_telemetry_fields_present(self, tmp_path):
+        r = await self._status(
+            self._mgr(indexed=5), accessible=True, tmp_path=tmp_path
+        )
+        for key in (
+            "install_mode",
+            "server_version",
+            "index_mode",
+            "write_tools_enabled",
+            "index_command",
+        ):
+            assert key in r, key
+
+    def test_index_command_matches_install_mode(self, monkeypatch):
+        from apple_mail_mcp.server import _index_command, _install_mode
+
+        monkeypatch.delenv("APPLE_MAIL_MCP_LAUNCHER", raising=False)
+        assert _install_mode() == "cli"
+        assert _index_command() == "apple-mail-mcp index --verbose"
+
+        monkeypatch.setenv("APPLE_MAIL_MCP_LAUNCHER", "mcpb")
+        monkeypatch.delenv("APPLE_MAIL_MCP_REF", raising=False)
+        assert _install_mode() == "bundle"
+        # Bundle users have no CLI on PATH -> must go through uvx.
+        assert _index_command().startswith("uvx --from apple-mail-mcp")
+
+        monkeypatch.setenv("APPLE_MAIL_MCP_REF", "git+https://example/x@main")
+        assert "git+https://example/x@main" in _index_command()
+
+    def test_index_command_has_no_hardcoded_fork(self, monkeypatch):
+        """Upstream-safety: no fork URL baked into the source."""
+        from pathlib import Path
+
+        import apple_mail_mcp.server as mod
+
+        assert "iret77" not in Path(mod.__file__).read_text()

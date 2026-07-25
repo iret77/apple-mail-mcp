@@ -35,6 +35,30 @@ Add to your MCP client:
 }
 ```
 
+### Permissions: who needs Full Disk Access?
+
+Building the index reads `~/Library/Mail`, which macOS protects. TCC
+grants that access to the **process that launches the server**, not to
+this package — the single most common setup mistake:
+
+| Index built by | Grant Full Disk Access to |
+|---|---|
+| The server, automatically | **the app that starts it** (e.g. Claude Desktop) |
+| You, via `apple-mail-mcp index` | **the terminal app** you run it in |
+
+Granting it to your terminal does *not* help when an MCP client spawns
+the server — the client is the responsible app then.
+
+If you'd rather not grant your MCP client full disk access, use the
+manual route: set `APPLE_MAIL_INDEX_AUTO_BUILD=false`, build the index
+from a terminal that has access, and the server will read it from
+`~/.apple-mail-mcp/index.db` (not a protected path). Search and the
+write tools keep working; only live disk reads fall back to a slower
+path.
+
+Call the `get_index_status()` tool at any time — it reports which setup
+is active and what to do next.
+
 ### Build the Search Index (Recommended)
 
 ```bash

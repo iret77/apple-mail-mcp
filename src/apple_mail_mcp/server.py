@@ -349,6 +349,159 @@ def _detect_matched_columns(query: str, result) -> str:
     return detect_matched_columns(query, result)
 
 
+# ========== Diagnostics Helpers ==========
+
+
+def _server_version() -> str:
+    """Installed package version, or 'unknown' if not resolvable."""
+    try:
+        from importlib.metadata import version
+
+        return version("apple-mail-mcp")
+    except Exception:
+        return "unknown"
+
+
+def _install_mode() -> str:
+    """How this server was launched: 'bundle' (.mcpb) or 'cli'.
+
+    The .mcpb launcher shim exports ``APPLE_MAIL_MCP_LAUNCHER=mcpb``.
+    This decides which index command to hand the user: bundle users
+    have no ``apple-mail-mcp`` on their PATH, so telling them to run it
+    would be a dead end.
+    """
+    return "bundle" if os.environ.get("APPLE_MAIL_MCP_LAUNCHER") else "cli"
+
+
+def _index_command() -> str:
+    """A copy-pasteable command that builds the index for this install.
+
+    Bundle installs have no ``apple-mail-mcp`` on the user's PATH, so
+    the plain command would be a dead end; run the same distribution
+    through ``uvx`` instead. The launcher passes its own source in
+    ``APPLE_MAIL_MCP_REF`` (a git ref for a development build); without
+    it, the published package name is correct.
+    """
+    if _install_mode() == "bundle":
+        ref = os.environ.get("APPLE_MAIL_MCP_REF", "").strip()
+        source = ref or "apple-mail-mcp"
+        return f"uvx --from {source} apple-mail-mcp index --verbose"
+    return "apple-mail-mcp index --verbose"
+
+
+def _index_guidance(
+    *,
+    state: str,
+    mail_dir_accessible: bool,
+    auto_build: bool,
+) -> tuple[str | None, str | None, list[str], str]:
+    """Turn raw index state into instructions a non-technical user can follow.
+
+    macOS grants Full Disk Access to the *responsible app* — whichever
+    process launches the server — so the fix differs by setup. Returns
+    ``(problem, note, next_steps, user_message)``: ``problem`` when
+    something needs fixing, ``note`` when the setup is fine but worth
+    explaining, and always a plain-language message plus GUI-first
+    steps. The terminal command appears only where it is unavoidable.
+    """
+    cmd = _index_command()
+    app = "Claude" if _install_mode() == "bundle" else "the app running this"
+
+    if state == "building":
+        return (
+            None,
+            "Index build in progress.",
+            [
+                "No action needed — the index is building in the background.",
+                "Body search will be incomplete until it finishes; "
+                "flagging and read/unread already work.",
+                "Ask for the index status again in a few minutes.",
+            ],
+            "I'm still building the mail search index — flagging and "
+            "read/unread work already, full-text search will follow "
+            "shortly.",
+        )
+
+    if mail_dir_accessible:
+        if state == "ready":
+            return (None, None, [], "The mail index is ready.")
+        # Readable Mail but nothing indexed yet.
+        if auto_build:
+            return (
+                "No usable index yet; it builds automatically on server start.",
+                None,
+                [
+                    f"Quit {app} completely (Cmd-Q) and reopen it to "
+                    "trigger the build.",
+                    "Then ask for the index status again.",
+                ],
+                "There's no mail search index yet. Restarting the app "
+                "will build it automatically.",
+            )
+        return (
+            "No usable index, and automatic building is switched off.",
+            None,
+            [
+                "Either switch 'Build the search index automatically' "
+                "back on in the extension's Configure dialog and restart "
+                f"{app},",
+                f"or open Terminal and run:  {cmd}",
+            ],
+            "There's no mail search index yet, and automatic building is "
+            "turned off — so it has to be built once.",
+        )
+
+    # Mail is unreadable from here: this process has no Full Disk Access.
+    if state == "ready":
+        # Manual setup working exactly as intended.
+        return (
+            None,
+            "Running without Full Disk Access, using an index built elsewhere.",
+            [
+                "Nothing is broken — search uses the existing index, and "
+                "flagging/read-unread work normally.",
+                f"To pick up newer mail, run in Terminal:  {cmd}",
+            ],
+            "Everything works. Search uses the index that was built "
+            "outside the app; re-run the index command when you want it "
+            "refreshed.",
+        )
+
+    if auto_build:
+        return (
+            "Cannot read Mail (no Full Disk Access) and there is no index.",
+            None,
+            [
+                "Open System Settings.",
+                "Go to Privacy & Security > Full Disk Access.",
+                f"Switch on {app} in that list.",
+                f"Quit {app} completely (Cmd-Q) and reopen it — the index "
+                "then builds itself.",
+                "Prefer not to grant that? Instead switch 'Build the "
+                "search index automatically' off in the Configure dialog "
+                f"and run this in Terminal:  {cmd}",
+            ],
+            "I can't read your mail archive: this app doesn't have Full "
+            "Disk Access, so there's no search index yet. Flagging and "
+            "read/unread still work.",
+        )
+
+    return (
+        "No index, and this app has no Full Disk Access (manual mode).",
+        None,
+        [
+            "Open Terminal.",
+            "Give the Terminal app Full Disk Access: System Settings > "
+            "Privacy & Security > Full Disk Access.",
+            f"Run:  {cmd}",
+            "After it finishes, search works here — no permission "
+            "needed for this app.",
+        ],
+        "The index still has to be built once from Terminal — that's the "
+        "trade-off for not granting this app full disk access.",
+    )
+
+
 # ========== Write-Tool Helpers ==========
 
 
@@ -542,8 +695,9 @@ async def _apply_write(
     if not_found and not _get_index_manager().has_index():
         result["hint"] = (
             "Some ids weren't found by scanning the default account. Pass "
-            "both account and mailbox, or build the index "
-            "('apple-mail-mcp index') for reliable resolution."
+            "both account and mailbox for reliable resolution, or call "
+            "get_index_status() — building the index makes id lookup "
+            "exact, and it will explain how."
         )
     return result
 
@@ -1356,7 +1510,10 @@ async def search(
 
     _EMPTY_HINT = (
         "No results. Try fewer keywords (2-3 specific terms), "
-        "check spelling, or use scope='all' to search everywhere."
+        "check spelling, or use scope='all' to search everywhere. "
+        "If searches keep coming up empty, call get_index_status() — "
+        "the index may be missing, still building, or blocked by "
+        "macOS permissions, and it will say how to fix that."
     )
 
     def _maybe_hint(results: list) -> list | dict:
@@ -1653,24 +1810,37 @@ async def set_read_status(
 @mcp.tool
 async def get_index_status() -> dict:
     """
-    Report search-index health and setup problems.
+    Diagnose the mail index: readiness, build progress, and setup
+    problems — with step-by-step instructions to fix them.
 
-    Use this to answer "is the index ready / how far along is it?" and
-    as the first step when email search returns nothing, or a write
-    reports ids as not_found. It reads state only — nothing is changed.
+    Call this whenever email tooling behaves unexpectedly, without
+    waiting to be asked: search returns nothing, a write reports ids as
+    not_found, or the user asks "is it working / how far along is it /
+    why can't you find my mail". Reads state only; changes nothing.
+
+    When the result contains `problem` or `next_steps`, do not just dump
+    the JSON: tell the user what is wrong in their own language and walk
+    them through the steps. Most users have never opened a terminal —
+    `next_steps` is ordered and written for them, so follow it as given.
 
     Returns:
-        Dict describing the current state:
+        Dict with, among others:
         - state: "building" | "ready" | "empty" | "absent"
+        - user_message: one plain sentence to relay to the user
+        - next_steps: ordered, non-technical instructions (may be empty)
+        - problem / note: what's wrong, or why the setup is fine anyway
         - indexed_emails / disk_emails / progress_percent: build
-          progress (the index commits continuously, so counts rise
-          while a build runs)
+          progress (counts rise continuously while a build runs)
         - mail_dir_accessible: False means macOS Full Disk Access is
-          missing for this app — the most common cause of an empty
-          index. `problem` then carries a fix-it hint.
-        - last_error: most recent build/sync failure, if any
-        - read_only, excluded_accounts, failed_parse_jobs, last_sync,
-          staleness_hours, db_size_mb: configuration and health
+          missing for the app running this server — the most common
+          cause of an empty index
+        - index_command: the exact command for *this* install, if one
+          is needed
+        - index_mode ("automatic"/"manual"), install_mode
+          ("bundle"/"cli"), server_version, read_only,
+          write_tools_enabled: setup and telemetry
+        - last_error, failed_parse_jobs, last_sync, staleness_hours,
+          db_size_mb, excluded_accounts: health details
     """
     manager = _get_index_manager()
 
@@ -1711,7 +1881,11 @@ async def get_index_status() -> dict:
         "mail_dir_accessible": mail_dir_accessible,
         "mail_directory": mail_dir,
         "index_mode": "automatic" if auto_build else "manual",
+        "install_mode": _install_mode(),
+        "server_version": _server_version(),
         "read_only": get_read_only_mode(),
+        "write_tools_enabled": not get_read_only_mode(),
+        "index_command": _index_command(),
         "last_error": manager.last_error,
     }
 
@@ -1746,44 +1920,29 @@ async def get_index_status() -> dict:
             logger.debug("get_stats failed: %s", exc, exc_info=True)
             result["stats_error"] = str(exc)
 
-    # A single actionable sentence beats making the model infer the
-    # fix from raw fields. The advice depends on which of the two
-    # supported setups the user is in:
-    #   automatic — this app has Full Disk Access and self-builds
-    #   manual    — this app has no Full Disk Access; the index is
-    #               built out-of-band from a terminal that does
-    _MANUAL_CMD = "apple-mail-mcp index --verbose"
-    if state == "building":
-        result["problem"] = (
-            "Index build in progress. Body search is incomplete until "
-            "it finishes; flag/read tools work already."
-        )
-    elif not mail_dir_accessible and state == "ready":
-        # Manual mode working as designed: the index was built
-        # elsewhere and is readable; only live disk reads are blocked.
-        result["note"] = (
-            "Running without Full Disk Access. Search uses the existing "
-            "index and flag/read tools work; single-email reads use the "
-            f"slower live path. Refresh the index with '{_MANUAL_CMD}' "
-            "in a terminal that has Full Disk Access."
-        )
-    elif not mail_dir_accessible:
-        result["problem"] = (
-            "No index, and Mail is unreadable from here (no Full Disk "
-            "Access). Either grant this app Full Disk Access (System "
-            "Settings > Privacy & Security > Full Disk Access) and "
-            f"restart it, or run '{_MANUAL_CMD}' in a terminal that has "
-            "it — both work. Body search is unavailable until one of "
-            "them happens; flag/read tools work regardless."
-        )
-    elif state in ("absent", "empty"):
-        result["problem"] = (
-            f"No usable index yet. Run '{_MANUAL_CMD}' to build it."
-            if not auto_build
-            else "No usable index yet. It builds automatically when the "
-            f"server starts, or run '{_MANUAL_CMD}' now."
-        ) + " Body search is unavailable until then."
-
+    # Raw fields alone leave a non-technical user stranded: derive an
+    # explicit diagnosis plus ordered, GUI-first steps the assistant can
+    # read out verbatim.
+    problem, note, next_steps, user_message = _index_guidance(
+        state=state,
+        mail_dir_accessible=mail_dir_accessible,
+        auto_build=auto_build,
+    )
+    if problem:
+        result["problem"] = problem
+    if note:
+        result["note"] = note
+    if next_steps:
+        result["next_steps"] = next_steps
+    result["user_message"] = user_message
+    result["assistant_instructions"] = (
+        "Relay `user_message` in the user's language, then walk them "
+        "through `next_steps` one at a time. Assume no terminal "
+        "experience: prefer the System Settings steps, and only offer a "
+        "command if the steps include one — then give it verbatim in a "
+        "code block and explain what it does. Do not tell the user to "
+        "edit config files or environment variables."
+    )
     return result
 
 
