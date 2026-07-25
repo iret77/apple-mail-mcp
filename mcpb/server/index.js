@@ -23,7 +23,7 @@ import {
   accessSync,
   constants,
   statSync,
-  utimesSync,
+  readFileSync,
   writeFileSync,
   mkdirSync,
 } from "node:fs";
@@ -33,6 +33,10 @@ import { homedir } from "node:os";
 const DEFAULT_REF =
   "git+https://github.com/iret77/apple-mail-mcp@feat/write-ops-flag-read";
 const UPDATE_INTERVAL_H = 24;
+// Bump on every bundle release. The stamp records it, so installing a
+// new bundle always re-resolves the server once — otherwise a same-day
+// bundle update would run against a cached, older server build.
+const LAUNCHER_REVISION = "0.5.4";
 const UPDATE_TIMEOUT_MS = 45_000; // stay well under the MCP init timeout
 
 /** Env values arrive as strings — "false" must not read as truthy. */
@@ -100,10 +104,17 @@ const env = {
 const stampDir = join(home, ".apple-mail-mcp");
 const stampFile = join(stampDir, ".mcpb-update-stamp");
 
+/** Identity of what we last resolved: bundle revision + source ref. */
+const stampId = `${LAUNCHER_REVISION}|${ref}`;
+
 function updateIsDue() {
   if (forceRefresh) return true;
   if (!autoUpdate) return false;
   try {
+    // A different bundle revision or a different source means the
+    // cached build is not what this launcher expects — refresh now,
+    // regardless of age.
+    if (readFileSync(stampFile, "utf8").trim() !== stampId) return true;
     const ageH = (Date.now() - statSync(stampFile).mtimeMs) / 3_600_000;
     return ageH >= UPDATE_INTERVAL_H;
   } catch {
@@ -114,12 +125,7 @@ function updateIsDue() {
 function touchStamp() {
   try {
     mkdirSync(stampDir, { recursive: true });
-    if (existsSync(stampFile)) {
-      const now = new Date();
-      utimesSync(stampFile, now, now);
-    } else {
-      writeFileSync(stampFile, "");
-    }
+    writeFileSync(stampFile, stampId);
   } catch {
     /* stamping is best-effort */
   }
