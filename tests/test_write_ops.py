@@ -14,6 +14,7 @@ without macOS / Mail.app.
 from __future__ import annotations
 
 import json
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1016,3 +1017,120 @@ class TestAgentGuidance:
         import apple_mail_mcp.server as mod
 
         assert "iret77" not in Path(mod.__file__).read_text()
+
+
+class TestRefreshIndex:
+    """refresh_index(): on-demand index update."""
+
+    def _mgr(self, *, building=False, usable=True, changes=0, err=None):
+        m = MagicMock()
+        m.is_building.return_value = building
+        m.has_usable_index.return_value = usable
+        m.sync_updates.return_value = changes
+        m.last_error = err
+        return m
+
+    @pytest.mark.asyncio
+    async def test_incremental_sync_reports_changes(self):
+        mgr = self._mgr(changes=7)
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index()
+
+        assert r["status"] == "completed"
+        assert r["changes"] == 7
+        mgr.sync_updates.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_changes_is_still_success(self):
+        mgr = self._mgr(changes=0)
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index()
+
+        assert r["status"] == "completed"
+        assert "up to date" in r["message"]
+
+    @pytest.mark.asyncio
+    async def test_permission_failure_is_not_reported_as_success(self):
+        """sync_updates returns 0 on FDA failure — must not read as OK."""
+        mgr = self._mgr(changes=0, err="PermissionError: denied")
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index()
+
+        assert r["status"] == "failed"
+        assert r["error"] == "PermissionError: denied"
+        assert r["next_steps"]
+
+    @pytest.mark.asyncio
+    async def test_refuses_while_a_build_runs(self):
+        mgr = self._mgr(building=True)
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index()
+
+        assert r["status"] == "already_running"
+        mgr.sync_updates.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_full_rebuild_runs_detached(self):
+        mgr = self._mgr()
+        done = threading.Event()
+        mgr.build_from_disk.side_effect = lambda *a, **k: done.set()
+
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index(full=True)
+
+        assert r["status"] == "started"  # returns without waiting
+        assert done.wait(timeout=5), "build thread did not run"
+        mgr.sync_updates.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_index_triggers_build_not_sync(self):
+        mgr = self._mgr(usable=False)
+        done = threading.Event()
+        mgr.build_from_disk.side_effect = lambda *a, **k: done.set()
+
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index()
+
+        assert r["status"] == "started"
+        assert done.wait(timeout=5)
+        mgr.sync_updates.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allowed_in_read_only_mode(self):
+        """Refreshing the local index is not a mail mutation."""
+        mgr = self._mgr(changes=1)
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server.get_read_only_mode", return_value=True
+            ),
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index()
+
+        assert r["status"] == "completed"

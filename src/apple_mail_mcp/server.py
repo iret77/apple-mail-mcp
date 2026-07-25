@@ -6,7 +6,7 @@ Apple Mail MCP Server
 2. FTS5 search — full-text body search in ~2ms with BM25 ranking
 3. JXA fallback — batch property fetching for multi-email listing
 
-TOOLS (11 total):
+TOOLS (12 total):
 - list_accounts() - List email accounts
 - list_mailboxes(account?) - List mailboxes
 - get_emails(..., filter?) - Unified email listing with filters
@@ -18,6 +18,7 @@ TOOLS (11 total):
 - set_flag(ids, color?) - Flag/unflag emails, optionally by color (write)
 - set_read_status(ids, read?) - Mark emails read/unread (write)
 - get_index_status() - Index health + setup diagnostics
+- refresh_index(full?) - Update the search index on demand
 
 RESOURCES (1 total):
 - index://status - JSON snapshot of search-index health
@@ -33,6 +34,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path as _Path
@@ -360,6 +362,13 @@ def _server_version() -> str:
         return version("apple-mail-mcp")
     except Exception:
         return "unknown"
+
+
+def get_index_auto_build_flag() -> bool:
+    """Read the auto-build setting (thin wrapper for a lazy import)."""
+    from .config import get_index_auto_build
+
+    return get_index_auto_build()
 
 
 def _install_mode() -> str:
@@ -1805,6 +1814,90 @@ async def set_read_status(
         mailbox,
         lambda groups: WriteBuilder.set_read(groups, read),
     )
+
+
+@mcp.tool
+async def refresh_index(full: bool = False) -> dict:
+    """
+    Update the search index so recent mail becomes searchable.
+
+    The index otherwise syncs only when the server starts, so a
+    long-running client drifts out of date. Call this when the user asks
+    to refresh/update the index, when `get_index_status` reports a large
+    `staleness_hours`, or when a message the user just received cannot be
+    found.
+
+    This touches only the local index — never the mail itself — so it is
+    allowed in read-only mode.
+
+    Args:
+        full: False (default) syncs changes since the last run — fast,
+            returns when done. True discards the index and rebuilds from
+            scratch; that takes minutes, so it runs in the background and
+            returns immediately. Only use it when the index is suspected
+            to be corrupt.
+
+    Returns:
+        Dict with `status` ("completed", "started", "already_running" or
+        "failed"), a `message` to relay, and `changes` (added + deleted +
+        moved) for a completed sync.
+    """
+    manager = _get_index_manager()
+
+    if manager.is_building():
+        return {
+            "status": "already_running",
+            "message": (
+                "A full index build is already running. Check "
+                "get_index_status for progress."
+            ),
+        }
+
+    # A full rebuild is far too slow to block an MCP call on, and so is
+    # the first build of a large mailbox — run both detached.
+    if full or not manager.has_usable_index():
+
+        def _build() -> None:
+            try:
+                manager.build_from_disk()
+            except Exception:
+                logger.warning("Background index build failed", exc_info=True)
+
+        threading.Thread(target=_build, daemon=True).start()
+        return {
+            "status": "started",
+            "message": (
+                "Building the index in the background. This can take "
+                "several minutes on a large mailbox — ask for the index "
+                "status to see progress."
+            ),
+        }
+
+    changes = await asyncio.to_thread(manager.sync_updates)
+    if manager.last_error:
+        # sync_updates reports 0 changes for a permission failure too,
+        # so never present that as a successful refresh.
+        _, _, next_steps, user_message = _index_guidance(
+            state="ready",
+            mail_dir_accessible=False,
+            auto_build=get_index_auto_build_flag(),
+        )
+        return {
+            "status": "failed",
+            "message": user_message,
+            "error": manager.last_error,
+            "next_steps": next_steps,
+        }
+
+    return {
+        "status": "completed",
+        "changes": changes,
+        "message": (
+            f"Index updated: {changes} change(s)."
+            if changes
+            else "Index was already up to date."
+        ),
+    }
 
 
 @mcp.tool

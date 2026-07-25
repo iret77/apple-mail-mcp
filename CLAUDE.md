@@ -27,7 +27,7 @@ src/apple_mail_mcp/
     └── mail_core.js    # Shared JXA utilities (MailCore object)
 ```
 
-## MCP Tools (11 total)
+## MCP Tools (12 total)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -42,6 +42,7 @@ src/apple_mail_mcp/
 | `set_flag(ids, color?)` | *Write* — flag/unflag single or batch, optional color | message_ids, color, account?, mailbox? |
 | `set_read_status(ids, read?)` | *Write* — mark read (seen) / unread (unseen) | message_ids, read, account?, mailbox? |
 | `get_index_status()` | Index health + setup diagnostics (state, progress, Full Disk Access) | - |
+| `refresh_index(full?)` | Sync the index on demand (full=True rebuilds in background) | full |
 
 ### Write tools (`set_flag`, `set_read_status`)
 

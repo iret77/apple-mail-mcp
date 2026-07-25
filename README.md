@@ -95,6 +95,7 @@ for the full schema and precedence rules.
 | `set_flag(message_ids, color?)` | **Write** — flag/unflag one email or a batch, optionally by color (red, orange, yellow, green, blue, purple, gray) |
 | `set_read_status(message_ids, read?)` | **Write** — mark one email or a batch read (seen) or unread (unseen) |
 | `get_index_status()` | Index health and setup diagnostics — build state, progress, and whether Full Disk Access is missing |
+| `refresh_index(full?)` | Update the index on demand — the index otherwise syncs only at server start |
 
 ### Write operations
 
