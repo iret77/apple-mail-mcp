@@ -349,6 +349,26 @@ const MAX_SCAN = {max_scan};
 const updated = [];
 const notFound = [];
 
+// Apply the change to the message at `idx`, but only after confirming
+// it really is `targetId`. The id list is a snapshot: if the mailbox
+// changes between fetching it and writing (mail arrives, a message is
+// moved or deleted), positions shift and the same index would point at
+// a different message — silently modifying the wrong mail. On a
+// mismatch, re-resolve by id and skip if that fails.
+function applyToMessage(collection, idx, targetId) {{
+    let msg = collection[idx];
+    try {{
+        if (msg.id() !== targetId) {{
+            msg = collection.byId(targetId);
+            if (msg.id() !== targetId) return false;
+        }}
+    }} catch (e) {{
+        return false;
+    }}
+    {self.apply_js}
+    return true;
+}}
+
 for (const g of groups) {{
     let account;
     try {{
@@ -381,9 +401,11 @@ for (const g of groups) {{
                 if (idx === -1) continue;
                 remaining.delete(targetId);
                 try {{
-                    const msg = mailboxes[m].messages[idx];
-                    {self.apply_js}
-                    updated.push(targetId);
+                    if (applyToMessage(mailboxes[m].messages, idx, targetId)) {{
+                        updated.push(targetId);
+                    }} else {{
+                        notFound.push(targetId);
+                    }}
                 }} catch (e) {{
                     notFound.push(targetId);
                 }}
@@ -417,9 +439,11 @@ for (const g of groups) {{
             continue;
         }}
         try {{
-            const msg = mailbox.messages[idx];
-            {self.apply_js}
-            updated.push(targetId);
+            if (applyToMessage(mailbox.messages, idx, targetId)) {{
+                updated.push(targetId);
+            }} else {{
+                notFound.push(targetId);
+            }}
         }} catch (e) {{
             notFound.push(targetId);
         }}

@@ -1134,3 +1134,33 @@ class TestRefreshIndex:
             r = await refresh_index()
 
         assert r["status"] == "completed"
+
+
+class TestWriteTargetsVerifiedById:
+    """A write must never land on a different message than requested."""
+
+    def test_identity_is_checked_before_applying(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_flag(
+            [{"account": "W", "mailbox": "INBOX", "ids": [1]}],
+            flagged=True,
+            flag_index=0,
+        ).build()
+        # The id snapshot can go stale between fetch and write, so the
+        # generated script must verify identity and re-resolve by id.
+        assert "function applyToMessage" in script
+        assert "msg.id() !== targetId" in script
+        assert "collection.byId(targetId)" in script
+
+    def test_no_unguarded_positional_write_remains(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        for groups in (
+            [{"account": "W", "mailbox": "INBOX", "ids": [1]}],
+            [{"account": "W", "ids": [1], "scan": True}],
+        ):
+            script = WriteBuilder.set_read(groups, True).build()
+            assert "const msg = mailbox.messages[idx]" not in script
+            assert "const msg = mailboxes[m].messages[idx]" not in script
+            assert "applyToMessage(" in script
