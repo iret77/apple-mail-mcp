@@ -95,6 +95,32 @@ class TestWriteBuilder:
         # not appear unescaped.
         assert '\\"il' in script
 
+    def test_scan_group_generates_bounded_scan_loop(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        groups = [{"account": "Work", "ids": [1, 2], "scan": True}]
+        script = WriteBuilder.set_read(
+            groups, True, max_scan_mailboxes=25
+        ).build()
+        assert "if (g.scan)" in script
+        assert "account.mailboxes()" in script
+        assert "MAX_SCAN = 25" in script
+        assert "msg.readStatus = true;" in script
+
+    def test_located_and_scan_groups_coexist(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        groups = [
+            {"account": "Work", "mailbox": "INBOX", "ids": [3]},
+            {"account": "Work", "ids": [1, 2], "scan": True},
+        ]
+        script = WriteBuilder.set_flag(
+            groups, flagged=True, flag_index=0
+        ).build()
+        # Both the located branch (getMailbox) and the scan branch are present.
+        assert "MailCore.getMailbox(account, g.mailbox)" in script
+        assert "if (g.scan)" in script
+
 
 # ========== _normalize_message_ids ==========
 
@@ -490,6 +516,146 @@ class TestExcludedAccountGate:
 
         exec_mock.assert_not_called()
         assert result["skipped_hidden"] == [1]
+
+
+class TestScanFallback:
+    """Index-free / index-miss write resolution via a bounded JXA scan."""
+
+    @pytest.mark.asyncio
+    async def test_scan_group_when_index_misses_and_account_given(self):
+        """An id the index can't place scans the given account's mailboxes."""
+        mgr = _mock_index(location=None)  # index present, but misses the id
+        amap = _mock_acct_map()
+        captured = {}
+
+        async def fake_exec(script, **kw):
+            captured["script"] = script
+            return {"updated": [9], "not_found": []}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            result = await set_flag(9, color="red", account="Work")
+
+        assert result["updated"] == [9]
+        assert '"scan": true' in captured["script"]
+        assert "msg.flagIndex = 0;" in captured["script"]
+
+    @pytest.mark.asyncio
+    async def test_scan_group_when_no_index(self):
+        mgr = _mock_index(location=None, has_index=False)
+        amap = _mock_acct_map()
+        captured = {}
+
+        async def fake_exec(script, **kw):
+            captured["script"] = script
+            return {"updated": [5, 6], "not_found": []}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_read_status
+
+            result = await set_read_status([5, 6], account="Work")
+
+        assert set(result["updated"]) == {5, 6}
+        assert '"scan": true' in captured["script"]
+
+    @pytest.mark.asyncio
+    async def test_scan_timeout_reports_not_found(self):
+        """A timed-out scan reports its ids as not_found, not an error."""
+        mgr = _mock_index(location=None)
+        amap = _mock_acct_map()
+
+        async def boom(script, **kw):
+            raise TimeoutError("scan too slow")
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=boom,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_read_status
+
+            result = await set_read_status(9, account="Work")
+
+        assert result["not_found"] == [9]
+        assert result["updated"] == []
+
+    @pytest.mark.asyncio
+    async def test_located_write_survives_scan_timeout(self):
+        """A located write commits even if a sibling scan times out."""
+
+        # id 1 has an index location; id 2 does not → scan (which fails).
+        def locate(mid, account=None, mailbox=None):
+            return ("uuid-work", "INBOX") if mid == 1 else None
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.find_email_location.side_effect = locate
+        amap = _mock_acct_map()
+
+        async def exec_router(script, **kw):
+            if '"scan": true' in script:
+                raise TimeoutError("scan too slow")
+            return {"updated": [1], "not_found": []}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=exec_router,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_read_status
+
+            result = await set_read_status([1, 2], account="Work")
+
+        assert result["updated"] == [1]  # located write survived
+        assert result["not_found"] == [2]  # scan id fell through
+
+
+class TestAutoBuildConfig:
+    def test_default_true(self, monkeypatch):
+        import apple_mail_mcp.config as cfg
+
+        monkeypatch.delenv("APPLE_MAIL_INDEX_AUTO_BUILD", raising=False)
+        monkeypatch.setattr(
+            cfg, "CONFIG_FILE_PATH", cfg.Path("/nonexistent/config.toml")
+        )
+        cfg._invalidate_config_cache()
+        try:
+            assert cfg.get_index_auto_build() is True
+        finally:
+            cfg._invalidate_config_cache()
+
+    def test_env_false(self, monkeypatch):
+        import apple_mail_mcp.config as cfg
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", "false")
+        assert cfg.get_index_auto_build() is False
+
+    def test_env_true(self, monkeypatch):
+        import apple_mail_mcp.config as cfg
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", "1")
+        assert cfg.get_index_auto_build() is True
 
 
 class TestReadOnlyRefusal:

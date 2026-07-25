@@ -275,20 +275,38 @@ class WriteBuilder:
     through ``json.dumps`` of ``groups``, so nothing untrusted is
     interpolated into executable JS.
 
+    Two group shapes are accepted:
+
+    - **Located** — ``{"account", "mailbox", "ids"}``: open that mailbox
+      once and apply. Fast; used when the index (or an explicit hint)
+      knows where an id lives.
+    - **Scan** — ``{"account", "ids", "scan": true}`` (no mailbox):
+      iterate the account's mailboxes (bounded by ``max_scan_mailboxes``)
+      looking for each id and apply on match. The index-free fallback,
+      mirroring ``get_email``'s all-mailbox scan.
+
     Construct via the :meth:`set_read` / :meth:`set_flag` factories.
 
     Args:
-        groups: ``[{"account": str, "mailbox": str, "ids": [int, ...]}, ...]``
+        groups: list of located and/or scan group dicts (see above).
         apply_js: JS run per located message, with ``msg`` in scope.
+        max_scan_mailboxes: cap on mailboxes visited per scan group.
     """
 
     groups: list[dict]
     apply_js: str
+    max_scan_mailboxes: int = 50
 
     @classmethod
-    def set_read(cls, groups: list[dict], read: bool) -> "WriteBuilder":
+    def set_read(
+        cls, groups: list[dict], read: bool, max_scan_mailboxes: int = 50
+    ) -> "WriteBuilder":
         """Build a read/unread (seen/unseen) writer."""
-        return cls(groups, f"msg.readStatus = {'true' if read else 'false'};")
+        return cls(
+            groups,
+            f"msg.readStatus = {'true' if read else 'false'};",
+            max_scan_mailboxes,
+        )
 
     @classmethod
     def set_flag(
@@ -296,6 +314,7 @@ class WriteBuilder:
         groups: list[dict],
         flagged: bool,
         flag_index: int | None = None,
+        max_scan_mailboxes: int = 50,
     ) -> "WriteBuilder":
         """Build a flag/unflag writer.
 
@@ -312,7 +331,7 @@ class WriteBuilder:
             apply_js = (
                 f"msg.flaggedStatus = true; msg.flagIndex = {int(flag_index)};"
             )
-        return cls(groups, apply_js)
+        return cls(groups, apply_js, max_scan_mailboxes)
 
     def build(self) -> str:
         """Generate the JXA script string.
@@ -323,18 +342,62 @@ class WriteBuilder:
         ``not_found`` rather than failing the whole batch.
         """
         groups_json = json.dumps(self.groups)
+        max_scan = int(self.max_scan_mailboxes)
         return f"""
 const groups = {groups_json};
+const MAX_SCAN = {max_scan};
 const updated = [];
 const notFound = [];
 
 for (const g of groups) {{
+    let account;
+    try {{
+        account = MailCore.getAccount(g.account);
+    }} catch (e) {{
+        for (const id of g.ids) notFound.push(id);
+        continue;
+    }}
+
+    if (g.scan) {{
+        // No known mailbox: scan the account's mailboxes for each id.
+        let mailboxes;
+        try {{
+            mailboxes = account.mailboxes();
+        }} catch (e) {{
+            for (const id of g.ids) notFound.push(id);
+            continue;
+        }}
+        const remaining = new Set(g.ids);
+        const limit = Math.min(mailboxes.length, MAX_SCAN);
+        for (let m = 0; m < limit && remaining.size > 0; m++) {{
+            let ids;
+            try {{
+                ids = mailboxes[m].messages.id();
+            }} catch (e) {{
+                continue;  // skip inaccessible mailbox (Junk/Drafts -1728)
+            }}
+            for (const targetId of Array.from(remaining)) {{
+                const idx = ids.indexOf(targetId);
+                if (idx === -1) continue;
+                remaining.delete(targetId);
+                try {{
+                    const msg = mailboxes[m].messages[idx];
+                    {self.apply_js}
+                    updated.push(targetId);
+                }} catch (e) {{
+                    notFound.push(targetId);
+                }}
+            }}
+        }}
+        for (const id of remaining) notFound.push(id);
+        continue;
+    }}
+
+    // Located group: open the known mailbox directly.
     let mailbox;
     try {{
-        const account = MailCore.getAccount(g.account);
         mailbox = MailCore.getMailbox(account, g.mailbox);
     }} catch (e) {{
-        // Account/mailbox unreachable — every id in this group is lost.
         for (const id of g.ids) notFound.push(id);
         continue;
     }}

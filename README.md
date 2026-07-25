@@ -77,8 +77,11 @@ for the full schema and precedence rules.
 return per-id outcome buckets (`updated`, `not_found`, `skipped_hidden`) so
 partial success is always visible. Both are refused when the server runs
 read-only (`APPLE_MAIL_READ_ONLY=true`, `[server] read_only = true`, or
-`apple-mail-mcp serve -r`). Message ids are located via the search index, so
-build it (or pass both `account` and `mailbox`) for reliable resolution.
+`apple-mail-mcp serve -r`). Message ids are located via the search index;
+when it can't place an id, the tools fall back to an `account`+`mailbox`
+hint and then to a bounded mailbox scan, so they work even before the index
+exists. The index is built automatically on first run (see
+`APPLE_MAIL_INDEX_AUTO_BUILD`), so no manual setup is required.
 
 ## Performance
 

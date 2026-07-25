@@ -54,8 +54,13 @@ per-id buckets `{updated, not_found, skipped_hidden}` (+ optional
 - **ID resolution:** Mail.app ids are per-mailbox ROWIDs — not globally
   addressable. `_resolve_write_targets()` reuses the index location
   resolver (`find_email_location`), groups ids by `(account, mailbox)`,
-  and runs **one** `osascript` batch (`WriteBuilder`) per call. Ids the
-  index can't place fall back to an explicit `account` + `mailbox` hint.
+  and runs a `WriteBuilder` `osascript` batch. Ids the index can't place
+  fall back to an explicit `account` + `mailbox` hint, then to a bounded
+  all-mailbox **scan** of a visible account (`{"scan": true}` group,
+  mirroring `get_email` Strategy 3) — so writes work with no index at
+  all. `_apply_write` runs located and scan groups in *separate*
+  osascript calls (bounded timeout on the scan) so a slow scan can't
+  discard the fast located writes.
 - **Excluded-account boundary (#90):** ids resolving into a hidden
   account go to `skipped_hidden`, never to JXA; an explicitly-named
   hidden `account` skips the whole batch.
@@ -519,6 +524,7 @@ silently using degraded config.
 | `APPLE_MAIL_INDEX_PATH` | `[index] path` | `~/.apple-mail-mcp/index.db` | Index database location |
 | `APPLE_MAIL_INDEX_MAX_EMAILS` | `[index] max_emails` | _unset_ | Optional per-mailbox ceiling (default: uncapped) |
 | `APPLE_MAIL_INDEX_STALENESS_HOURS` | `[index] staleness_hours` | `24` | Hours before refresh |
+| `APPLE_MAIL_INDEX_AUTO_BUILD` | `[index] auto_build` | `true` | Build the index in the background on first `serve` when none exists (requires Full Disk Access; failure logged, not fatal). Set `false` to require a manual `apple-mail-mcp index` |
 | `APPLE_MAIL_INDEX_EXCLUDE_MAILBOXES` | `[index] exclude_mailboxes` | `["Drafts"]` | Mailboxes to skip during indexing |
 | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` | `[index] exclude_accounts` | _unset_ | Accounts (by display name, exact/case-sensitive) hidden from the whole server: never indexed, filtered from search, invisible to list/get tools (#90) |
 | `APPLE_MAIL_READ_ONLY` | `[server] read_only` | `false` | Disable write operations (enforced via `_ensure_writable()` in `server.py`, #80) |

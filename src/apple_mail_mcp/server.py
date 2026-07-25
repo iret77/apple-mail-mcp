@@ -408,11 +408,15 @@ async def _resolve_write_targets(
     resolves into an excluded account (#90) is dropped into
     ``skipped_hidden`` and never dispatched to JXA. Ids the index can't
     place fall back to an explicit ``account`` + ``mailbox`` hint (which
-    JXA then verifies) — matching ``get_email`` Strategy 1 — and are
-    otherwise reported ``not_found``.
+    JXA then verifies) — matching ``get_email`` Strategy 1 — and, failing
+    that, to a bounded all-mailbox **scan** of a visible account (a
+    ``{"account", "ids", "scan": True}`` group, mirroring ``get_email``
+    Strategy 3) so writes work with no index at all. Only ids with no
+    visible account to scan land in ``not_found``.
 
-    Returns ``(groups, not_found, skipped_hidden)`` where ``groups`` is
-    ``[{"account": name, "mailbox": name, "ids": [...]}, ...]``.
+    Returns ``(groups, not_found, skipped_hidden)``. Located groups are
+    ``{"account", "mailbox", "ids"}``; the optional scan group is
+    ``{"account", "ids", "scan": True}``.
     """
     # Explicit hidden account: refuse the whole batch up front, exactly
     # as the read tools do at their entry gate.
@@ -441,6 +445,7 @@ async def _resolve_write_targets(
     )
 
     grouped: dict[tuple[str, str], list[int]] = {}
+    scan_ids: list[int] = []
     not_found: list[int] = []
     skipped_hidden: list[int] = []
 
@@ -456,17 +461,32 @@ async def _resolve_write_targets(
                     skipped_hidden.append(mid)
                     continue
                 located = (acct_map.uuid_to_name(acct_uuid), mb_name)
-        if located is None:
+        if located is None and hint_location is not None:
             located = hint_location
         if located is None:
-            not_found.append(mid)
+            # No index hit, no hint: defer to a bounded JXA scan below.
+            scan_ids.append(mid)
             continue
         grouped.setdefault(located, []).append(mid)
 
-    groups = [
+    groups: list[dict] = [
         {"account": acct, "mailbox": mb, "ids": mids}
         for (acct, mb), mids in grouped.items()
     ]
+
+    # Index-free / index-miss fallback: scan one visible account's
+    # mailboxes for the ids we couldn't place. Bounded (mailbox cap in the
+    # builder, timeout at the call site). Only one account is scanned —
+    # the same single-account limitation as get_email's Strategy 3.
+    if scan_ids:
+        scan_account = await _resolve_visible_account(account)
+        if scan_account is None or scan_account in excluded_names:
+            not_found.extend(scan_ids)
+        else:
+            groups.append(
+                {"account": scan_account, "ids": scan_ids, "scan": True}
+            )
+
     return groups, not_found, skipped_hidden
 
 
@@ -478,23 +498,40 @@ async def _apply_write(
 ) -> WriteResult:
     """Shared orchestration for the batch write tools.
 
-    Normalizes ids, resolves targets (with the account gate), runs one
-    osascript invocation over the located groups, and merges JXA's
-    per-id outcome with the ids that were unresolvable up front.
-    ``make_builder`` maps ``groups -> WriteBuilder`` (the only per-tool
-    difference).
+    Normalizes ids, resolves targets (with the account gate), then runs
+    the located groups and any scan group in *separate* osascript calls —
+    so a slow/timed-out mailbox scan can't discard the fast, precise
+    located writes — and merges every id's outcome. ``make_builder`` maps
+    ``groups -> WriteBuilder`` (the only per-tool difference).
     """
     ids = _normalize_message_ids(message_ids)
     groups, not_found, skipped_hidden = await _resolve_write_targets(
         ids, account, mailbox
     )
 
+    located = [g for g in groups if not g.get("scan")]
+    scan = [g for g in groups if g.get("scan")]
     updated: list[int] = []
-    if groups:
-        builder = make_builder(groups)
-        res = await execute_with_core_async(builder.build())
-        updated = [int(x) for x in res.get("updated", [])]
-        not_found = not_found + [int(x) for x in res.get("not_found", [])]
+
+    if located:
+        res = await execute_with_core_async(make_builder(located).build())
+        updated += [int(x) for x in res.get("updated", [])]
+        not_found += [int(x) for x in res.get("not_found", [])]
+
+    if scan:
+        builder = make_builder(scan)
+        builder.max_scan_mailboxes = STRATEGY3_MAX_MAILBOXES
+        try:
+            res = await execute_with_core_async(
+                builder.build(), timeout=STRATEGY3_TIMEOUT
+            )
+            updated += [int(x) for x in res.get("updated", [])]
+            not_found += [int(x) for x in res.get("not_found", [])]
+        except Exception as exc:
+            # Best-effort fallback: a timed-out or failed scan reports its
+            # ids as not_found rather than erroring the whole call.
+            logger.debug("write scan fallback failed: %s", exc, exc_info=True)
+            not_found += [i for g in scan for i in g["ids"]]
 
     result: WriteResult = {
         "updated": updated,
@@ -503,8 +540,9 @@ async def _apply_write(
     }
     if not_found and not _get_index_manager().has_index():
         result["hint"] = (
-            "Some ids could not be located. Without a search index, pass "
-            "both account and mailbox, or run 'apple-mail-mcp index'."
+            "Some ids weren't found by scanning the default account. Pass "
+            "both account and mailbox, or build the index "
+            "('apple-mail-mcp index') for reliable resolution."
         )
     return result
 

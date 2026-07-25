@@ -32,6 +32,7 @@ CONFIG_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "exclude_mailboxes": (list,),
         "exclude_accounts": (list,),
         "include_mailboxes": (list,),
+        "auto_build": (bool,),
     },
     "server": {
         "read_only": (bool,),
@@ -286,6 +287,26 @@ def get_index_exclude_accounts() -> set[str]:
     return set()
 
 
+def get_index_auto_build() -> bool:
+    """
+    Whether the server builds the index on first run when none exists.
+
+    Resolution: ``APPLE_MAIL_INDEX_AUTO_BUILD`` env, then ``[index]
+    auto_build`` in ``config.toml``, then ``True``. When enabled and no
+    index is present at ``serve`` startup, the server kicks off a
+    background ``build_from_disk`` so a fresh install is usable (search,
+    write id-resolution) without a manual ``apple-mail-mcp index`` call.
+    Requires Full Disk Access; a failed build is logged, not fatal.
+    """
+    env = os.environ.get("APPLE_MAIL_INDEX_AUTO_BUILD")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    val = _from_toml("index", "auto_build")
+    if val is not None:
+        return bool(val)
+    return True
+
+
 def get_index_staleness_hours() -> float:
     """
     Get the staleness threshold for the index, in hours.
@@ -376,6 +397,12 @@ config_version = 1
 # Hours before the index is considered stale and should be re-synced.
 # Env: APPLE_MAIL_INDEX_STALENESS_HOURS
 # staleness_hours = 24.0
+
+# Build the index automatically on first run when none exists (background;
+# requires Full Disk Access). Set false to require a manual
+# `apple-mail-mcp index` instead.
+# Env: APPLE_MAIL_INDEX_AUTO_BUILD
+# auto_build = true
 
 # Mailboxes to skip during indexing.
 # Empty list ([]) explicitly disables all exclusions.
