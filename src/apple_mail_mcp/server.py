@@ -636,7 +636,7 @@ async def _resolve_write_targets(
     ids: list[int],
     account: str | None,
     mailbox: str | None,
-) -> tuple[list[dict], list[int], list[int]]:
+) -> tuple[list[dict], list[int], list[int], dict[int, tuple[str, str]]]:
     """Resolve message ids to JXA write groups, honoring the account gate.
 
     Reuses the index's location resolver (the same machinery ``get_email``
@@ -893,26 +893,40 @@ async def _retry_by_stable_id(
     if not unambiguous:
         return empty, missing, []
 
-    target_account = await _resolve_visible_account(account)
+    # Scan the account the message actually lived in — NOT the default
+    # one. Aiming every recovery at `Mail.accounts()[0]` would make it
+    # useless for anyone whose mail is not in the first account, and
+    # worse: with the same Message-ID present in two accounts (a
+    # forward, a list subscribed twice), preferring a same-named
+    # mailbox there would flag the wrong account's copy and report it
+    # as done.
+    acct_map = _get_account_map()
     excluded = _excluded_account_names()
-    # None means "first account" to MailCore.getAccount — only a problem
-    # when exclusions are active and no visible account is left.
-    if excluded and (target_account is None or target_account in excluded):
+    by_account: dict[str, dict[str, list]] = {}
+    for header, mid in unambiguous.items():
+        scope = placed.get(mid)
+        if scope is None:
+            continue
+        acct_name = acct_map.uuid_to_name(scope[0])
+        if acct_name in excluded:
+            continue
+        entry = by_account.setdefault(
+            acct_name, {"headers": [], "prefer": set()}
+        )
+        entry["headers"].append(header)
+        entry["prefer"].add(scope[1])
+    if not by_account:
         return empty, missing, []
 
-    # Point the scan at the mailboxes the index knows for these
-    # messages, so a re-filed copy is preferred over any other.
-    prefer = sorted(
-        {placed[mid][1] for mid in unambiguous.values() if mid in placed}
-    )
     builder = make_builder(
         [
             {
-                "account": target_account,
-                "headers": sorted(unambiguous),
-                "prefer_mailboxes": prefer,
+                "account": acct_name,
+                "headers": sorted(entry["headers"]),
+                "prefer_mailboxes": sorted(entry["prefer"]),
                 "by_header": True,
             }
+            for acct_name, entry in sorted(by_account.items())
         ]
     )
     builder.max_scan_mailboxes = STRATEGY3_MAX_MAILBOXES
@@ -2075,7 +2089,9 @@ async def refresh_index(full: bool = False) -> dict:
     """
     manager = _get_index_manager()
 
-    if manager.is_building():
+    from .index.manager import IndexBusyError
+
+    if manager.is_building() or manager.write_lock_held():
         return {
             "status": "already_running",
             "message": (
@@ -2091,7 +2107,7 @@ async def refresh_index(full: bool = False) -> dict:
         def _build() -> None:
             try:
                 manager.build_from_disk()
-            except RuntimeError as exc:
+            except IndexBusyError as exc:
                 # Another build or sync holds the write lock.
                 logger.info("Index build not started: %s", exc)
             except Exception:
@@ -2107,7 +2123,24 @@ async def refresh_index(full: bool = False) -> dict:
             ),
         }
 
-    changes = await asyncio.to_thread(manager.sync_updates)
+    try:
+        changes = await asyncio.to_thread(manager.sync_updates)
+    except IndexBusyError:
+        return {
+            "status": "already_running",
+            "message": (
+                "An index build or sync is already running. Ask for the "
+                "index status to see how far along it is."
+            ),
+        }
+    except Exception as exc:
+        # A raw traceback is useless to the user this tool exists for.
+        logger.warning("Index sync failed", exc_info=True)
+        return {
+            "status": "failed",
+            "message": "The index could not be updated.",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     if manager.last_error:
         # sync_updates reports 0 changes for a permission failure too,
         # so never present that as a successful refresh.

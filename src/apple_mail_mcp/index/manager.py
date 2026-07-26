@@ -45,6 +45,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class IndexBusyError(RuntimeError):
+    """A build or sync is already running.
+
+    Distinct from a failure: nothing is wrong, the caller simply must
+    not present the skipped work as completed.
+    """
+
+
 @dataclass
 class IndexStats:
     """Statistics about the search index."""
@@ -127,6 +135,10 @@ class IndexManager:
         # phase, "warming up" and "wedged" look identical — both show
         # zero indexed messages.
         self._build_progress: dict | None = None
+
+    def write_lock_held(self) -> bool:
+        """True while a build or sync holds the single-writer lock."""
+        return self._write_lock.locked()
 
     def is_building(self) -> bool:
         """True while a full index build is running in this process."""
@@ -446,7 +458,7 @@ class IndexManager:
         # each DELETE the other's rows. Acquired non-blocking so a
         # second caller is told "already running" instead of queueing.
         if not self._write_lock.acquire(blocking=False):
-            raise RuntimeError(
+            raise IndexBusyError(
                 "An index build or sync is already running; "
                 "wait for it to finish."
             )
@@ -594,69 +606,48 @@ class IndexManager:
             # status tool reporting a phantom in-progress build.
             self._building = False
             self._build_progress = None
-            self._write_lock.release()
+
+            # NOTE: the write lock is released at the very END of this
+            # block. Everything below still writes — the final flush and
+            # the FTS rebuild are the heaviest writes in the program —
+            # and releasing early let a waiting sync grab the lock, whose
+            # open transaction then made these writes fail with
+            # "database is locked" from inside this `finally`.
 
             # Nothing was opened (e.g. Mail unreadable): no schema
             # state to restore. Guarded with a conditional rather than
             # an early return — returning from `finally` would swallow
             # the exception that brought us here.
             if conn is not None:
-                # Flush any remaining partial batch (crash-safe)
-                if batch:
-                    self._flush_batch(conn, batch, batch_attachments)
-                    total_indexed += len(batch)
+                # Restore the triggers FIRST. DROP TRIGGER is DDL and
+                # autocommits, so a rollback does not bring them back:
+                # if anything below throws before this runs, the
+                # triggers are gone from the database file permanently
+                # and new mail silently stops entering the search
+                # index. Nothing may precede this.
+                self._recreate_fts_triggers(conn)
 
-                # Update sync state for whatever we managed to index
-                if mailbox_counts:
-                    now = datetime.now().isoformat()
-                    for (account, mailbox), count in mailbox_counts.items():
-                        conn.execute(
-                            """INSERT OR REPLACE INTO sync_state
-                             (account, mailbox, last_sync, message_count)
-                             VALUES (?, ?, ?, ?)""",
-                            (account, mailbox, now, count),
-                        )
-                    conn.commit()
+                # Best-effort from here: losing the tail of a build is
+                # recoverable, breaking the schema is not.
+                try:
+                    # Flush any remaining partial batch (crash-safe)
+                    if batch:
+                        self._flush_batch(conn, batch, batch_attachments)
+                        total_indexed += len(batch)
 
-                # Re-enable triggers BEFORE rebuilding FTS to close the
-                # watcher race condition: if the file watcher (or any other
-                # writer) inserts a row after the bulk loop ends but before
-                # the FTS rebuild — or between rebuild and trigger
-                # recreation in the original ordering — that row would land
-                # in `emails` but never enter `emails_fts`. By recreating
-                # triggers first, any concurrent INSERT after this point
-                # fires the trigger normally; the subsequent FTS rebuild
-                # then re-syncs everything in `emails`, double-covering rows
-                # added during the rebuild call itself.
-                conn.executescript("""
-                  CREATE TRIGGER IF NOT EXISTS emails_ai
-                  AFTER INSERT ON emails BEGIN
-                      INSERT INTO emails_fts(rowid, subject, sender, content)
-                      VALUES (new.rowid, new.subject, new.sender, new.content);
-                  END;
-
-                  CREATE TRIGGER IF NOT EXISTS emails_ad
-                  AFTER DELETE ON emails BEGIN
-                      INSERT INTO emails_fts(
-                          emails_fts, rowid, subject, sender, content
-                      ) VALUES(
-                          'delete', old.rowid, old.subject,
-                          old.sender, old.content
-                      );
-                  END;
-
-                  CREATE TRIGGER IF NOT EXISTS emails_au
-                  AFTER UPDATE ON emails BEGIN
-                      INSERT INTO emails_fts(
-                          emails_fts, rowid, subject, sender, content
-                      ) VALUES(
-                          'delete', old.rowid, old.subject,
-                          old.sender, old.content
-                      );
-                      INSERT INTO emails_fts(rowid, subject, sender, content)
-                      VALUES (new.rowid, new.subject, new.sender, new.content);
-                  END;
-              """)
+                    # Update sync state for whatever we managed to index
+                    if mailbox_counts:
+                        now = datetime.now().isoformat()
+                        for (acct_, mbox_), count in mailbox_counts.items():
+                            conn.execute(
+                                """INSERT OR REPLACE INTO sync_state
+                                 (account, mailbox, last_sync, message_count)
+                                 VALUES (?, ?, ?, ?)""",
+                                (acct_, mbox_, now, count),
+                            )
+                        conn.commit()
+                except sqlite3.Error:
+                    logger.exception("Could not finalize index build")
 
                 # Rebuild FTS index (must run even if scan crashed
                 # mid-iteration, otherwise emails table has rows
@@ -666,8 +657,11 @@ class IndexManager:
                         msg = "Building search index..."
                         progress_callback(total_indexed, total_indexed, msg)
 
-                    rebuild_fts_index(conn)
-                    optimize_fts_index(conn)
+                    try:
+                        rebuild_fts_index(conn)
+                        optimize_fts_index(conn)
+                    except sqlite3.Error:
+                        logger.exception("FTS rebuild failed")
 
                 # Log cap warnings (aggregate summary)
                 if capped_mailboxes:
@@ -684,11 +678,54 @@ class IndexManager:
                         )
                         progress_callback(total_indexed, total_indexed, msg)
 
+            # Released last: every write above must be protected.
+            self._write_lock.release()
+
         # Disk inventory just changed — drop the cache so the next
         # status call reflects truth.
         self.invalidate_disk_count_cache()
         self._last_error = None  # a completed build clears prior failures
         return total_indexed
+
+    @staticmethod
+    def _recreate_fts_triggers(conn: sqlite3.Connection) -> None:
+        """Restore the FTS sync triggers.
+
+        `DROP TRIGGER` is DDL and autocommits, so a rollback never
+        brings them back. If a build ends without running this, the
+        triggers are gone from the database FILE — surviving restarts —
+        and every later insert lands in `emails` but never in
+        `emails_fts`: body search silently stops seeing new mail.
+        """
+        conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS emails_ai
+            AFTER INSERT ON emails BEGIN
+                INSERT INTO emails_fts(rowid, subject, sender, content)
+                VALUES (new.rowid, new.subject, new.sender, new.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS emails_ad
+            AFTER DELETE ON emails BEGIN
+                INSERT INTO emails_fts(
+                    emails_fts, rowid, subject, sender, content
+                ) VALUES(
+                    'delete', old.rowid, old.subject,
+                    old.sender, old.content
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS emails_au
+            AFTER UPDATE ON emails BEGIN
+                INSERT INTO emails_fts(
+                    emails_fts, rowid, subject, sender, content
+                ) VALUES(
+                    'delete', old.rowid, old.subject,
+                    old.sender, old.content
+                );
+                INSERT INTO emails_fts(rowid, subject, sender, content)
+                VALUES (new.rowid, new.subject, new.sender, new.content);
+            END;
+        """)
 
     @staticmethod
     def _flush_batch(
@@ -740,8 +777,10 @@ class IndexManager:
             Number of changes (added + deleted + moved)
         """
         if not self._write_lock.acquire(blocking=False):
+            # Distinguishable from "0 changes": the caller must not
+            # report a sync that never ran as a successful no-op.
             logger.info("Skipping sync: a build or sync is already running")
-            return 0
+            raise IndexBusyError("An index build or sync is already running.")
 
         try:
             return self._sync_updates_locked(progress_callback)

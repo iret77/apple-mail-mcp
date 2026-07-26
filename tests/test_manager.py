@@ -11,6 +11,7 @@ Tests the central orchestration class for the FTS5 search index:
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1055,18 +1056,23 @@ class TestBuildSyncMutualExclusion:
         m = IndexManager(db_path=temp_db_path)
         assert m._write_lock.acquire(blocking=False)
         try:
-            with pytest.raises(RuntimeError, match="already running"):
+            from apple_mail_mcp.index.manager import IndexBusyError
+
+            with pytest.raises(IndexBusyError, match="already running"):
                 m.build_from_disk()
         finally:
             m._write_lock.release()
 
-    def test_sync_is_skipped_while_a_build_holds_the_lock(self, temp_db_path):
-        from apple_mail_mcp.index.manager import IndexManager
+    def test_sync_signals_busy_rather_than_faking_success(self, temp_db_path):
+        """Returning 0 was indistinguishable from "no changes", so the
+        tool reported a sync that never ran as up to date."""
+        from apple_mail_mcp.index.manager import IndexBusyError, IndexManager
 
         m = IndexManager(db_path=temp_db_path)
         assert m._write_lock.acquire(blocking=False)
         try:
-            assert m.sync_updates() == 0  # skipped, not crashed
+            with pytest.raises(IndexBusyError):
+                m.sync_updates()
         finally:
             m._write_lock.release()
 
@@ -1127,3 +1133,91 @@ class TestBuildSyncMutualExclusion:
             m.build_from_disk()
 
         assert {"emails_ai", "emails_ad", "emails_au"} <= triggers()
+
+
+class TestBuildFinallyIsRobust:
+    """The cleanup path must restore schema state come what may."""
+
+    def test_triggers_restored_even_when_the_final_flush_fails(
+        self, temp_db_path, tmp_path
+    ):
+        """The earlier test only failed before anything was batched, so
+        it never exercised the flush path. A flush error must not skip
+        trigger restoration — DROP TRIGGER autocommits, so the triggers
+        would be gone from the file permanently."""
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        conn = m._get_conn()
+
+        def triggers() -> set:
+            return {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+
+        emails = [
+            {
+                "id": i,
+                "account": "acct",
+                "mailbox": "INBOX",
+                "subject": "s",
+                "sender": "a@b",
+                "content": "c",
+                "date_received": "2026-01-01",
+                "emlx_path": f"/p/{i}.emlx",
+                "message_id_header": f"<{i}@x>",
+                "attachments": [],
+            }
+            for i in range(3)
+        ]
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                return_value=iter(emails),
+            ),
+            patch.object(
+                IndexManager,
+                "_flush_batch",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ),
+        ):
+            # The flush failure is contained, not propagated...
+            m.build_from_disk()
+
+        # ...and the schema is intact.
+        assert {"emails_ai", "emails_ad", "emails_au"} <= triggers()
+        assert m.is_building() is False
+        assert m._write_lock.acquire(blocking=False)
+        m._write_lock.release()
+
+    def test_lock_is_held_until_the_last_write(self):
+        """Releasing before the flush/FTS rebuild let a waiting sync
+        grab the lock and make those writes fail."""
+        import inspect
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        src = inspect.getsource(IndexManager.build_from_disk)
+        release = src.rindex("_write_lock.release()")
+        for later in ("_recreate_fts_triggers", "rebuild_fts_index"):
+            assert src.index(later) < release, later
+
+    def test_triggers_are_restored_before_any_other_cleanup(self):
+        import inspect
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        src = inspect.getsource(IndexManager.build_from_disk)
+        finally_at = src.rindex("finally:")
+        tail = src[finally_at:]
+        assert tail.index("_recreate_fts_triggers") < tail.index("_flush_batch")

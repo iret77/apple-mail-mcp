@@ -1052,6 +1052,7 @@ class TestRefreshIndex:
     def _mgr(self, *, building=False, usable=True, changes=0, err=None):
         m = MagicMock()
         m.is_building.return_value = building
+        m.write_lock_held.return_value = False
         m.has_usable_index.return_value = usable
         m.sync_updates.return_value = changes
         m.last_error = err
