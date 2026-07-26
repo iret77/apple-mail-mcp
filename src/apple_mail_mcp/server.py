@@ -437,6 +437,7 @@ def _index_guidance(
     mail_dir_accessible: bool,
     auto_build: bool,
     stalled: bool = False,
+    phase: str | None = None,
 ) -> tuple[str | None, str | None, list[str], str]:
     """Turn raw index state into instructions a non-technical user can follow.
 
@@ -463,6 +464,21 @@ def _index_guidance(
                 ],
                 "The index build looks stuck — nothing has been written for "
                 "a while. Restarting the app should clear it.",
+            )
+        if phase == "reading_metadata":
+            return (
+                None,
+                "Index build starting: reading Mail's metadata.",
+                [
+                    "No action needed. Nothing is written during this "
+                    "phase, so a count of zero is expected — on a large "
+                    "mailbox it can last several minutes.",
+                    "Ask again in a few minutes; the count starts rising "
+                    "once indexing begins.",
+                ],
+                "The index build is in its warm-up phase — it's reading "
+                "Mail's metadata before it can write anything, so zero "
+                "indexed so far is normal.",
             )
         return (
             None,
@@ -2151,10 +2167,13 @@ async def get_index_status() -> dict:
         # raw count cannot when a slow mailbox is being parsed.
         progress = manager.build_progress()
         if progress is not None:
-            done, seconds_ago = progress
-            result["build_emails_done"] = done
-            result["seconds_since_progress"] = round(seconds_ago, 1)
-            result["build_appears_stalled"] = seconds_ago > 120
+            result["build_phase"] = progress["phase"]
+            result["build_emails_done"] = progress["emails_done"]
+            result["build_files_seen"] = progress["files_seen"]
+            result["seconds_since_progress"] = progress[
+                "seconds_since_progress"
+            ]
+            result["build_appears_stalled"] = progress["appears_stalled"]
         cached_total = manager.cached_disk_count()
         if cached_total:
             result["disk_emails"] = cached_total
@@ -2218,6 +2237,7 @@ async def get_index_status() -> dict:
         mail_dir_accessible=mail_dir_accessible,
         auto_build=auto_build,
         stalled=bool(result.get("build_appears_stalled")),
+        phase=result.get("build_phase"),
     )
     if problem:
         result["problem"] = problem

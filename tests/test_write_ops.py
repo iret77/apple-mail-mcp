@@ -1552,7 +1552,13 @@ class TestBuildProgressVisibility:
         mgr.has_index.return_value = True
         mgr.indexed_email_count.return_value = 17_500
         mgr.cached_disk_count.return_value = 70_000
-        mgr.build_progress.return_value = (17_500, 2.0)  # actively working
+        mgr.build_progress.return_value = {
+            "phase": "indexing",
+            "emails_done": 17_500,
+            "files_seen": 17500,
+            "seconds_since_progress": 2.0,
+            "appears_stalled": False,
+        }
         mgr.last_error = None
 
         with (
@@ -1579,7 +1585,13 @@ class TestBuildProgressVisibility:
         mgr.has_index.return_value = True
         mgr.indexed_email_count.return_value = 42
         mgr.cached_disk_count.return_value = None  # never walked yet
-        mgr.build_progress.return_value = (42, 1.0)
+        mgr.build_progress.return_value = {
+            "phase": "indexing",
+            "emails_done": 42,
+            "files_seen": 42,
+            "seconds_since_progress": 1.0,
+            "appears_stalled": False,
+        }
         mgr.last_error = None
 
         with (
@@ -1600,13 +1612,19 @@ class TestBuildProgressVisibility:
 class TestStallDetection:
     """ "Working" and "wedged" must be distinguishable."""
 
-    def _building_mgr(self, seconds_ago):
+    def _building_mgr(self, seconds_ago, phase="indexing"):
         m = MagicMock()
         m.is_building.return_value = True
         m.has_index.return_value = True
         m.indexed_email_count.return_value = 0
         m.cached_disk_count.return_value = 70_000
-        m.build_progress.return_value = (500, seconds_ago)
+        m.build_progress.return_value = {
+            "phase": phase,
+            "emails_done": 500,
+            "files_seen": 500,
+            "seconds_since_progress": seconds_ago,
+            "appears_stalled": seconds_ago > 120,
+        }
         m.last_error = None
         return m
 
@@ -1731,3 +1749,78 @@ class TestOversizedEmailsAreVisible:
         # The count difference is explained, not left to guesswork.
         assert "size limit" in r["skipped_note"]
         assert "APPLE_MAIL_INDEX_MAX_EMAIL_MB" in r["skipped_note"]
+
+
+class TestWarmUpPhaseIsNotMistakenForAStall:
+    """Zero indexed during metadata reading is expected, not a fault."""
+
+    def _mgr(self, phase, idle):
+        m = MagicMock()
+        m.is_building.return_value = True
+        m.has_index.return_value = True
+        m.indexed_email_count.return_value = 0
+        m.cached_disk_count.return_value = 63_953
+        m.build_progress.return_value = {
+            "phase": phase,
+            "emails_done": 0,
+            "files_seen": 0,
+            "seconds_since_progress": idle,
+            "appears_stalled": False,
+        }
+        m.last_error = None
+        return m
+
+    async def _status(self, mgr, tmp_path):
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            return await get_index_status()
+
+    @pytest.mark.asyncio
+    async def test_metadata_phase_explains_the_zero(self, tmp_path):
+        r = await self._status(self._mgr("reading_metadata", 150.0), tmp_path)
+
+        assert r["build_phase"] == "reading_metadata"
+        assert "problem" not in r  # 150s of no writes is normal here
+        assert "warm-up" in r["user_message"]
+        assert any("zero" in s.lower() for s in r["next_steps"])
+
+    @pytest.mark.asyncio
+    async def test_indexing_phase_with_zero_reads_differently(self, tmp_path):
+        r = await self._status(self._mgr("indexing", 5.0), tmp_path)
+
+        assert r["build_phase"] == "indexing"
+        assert "warm-up" not in r["user_message"]
+
+    def test_metadata_phase_gets_a_longer_grace_period(self, temp_db_path):
+        """Reading metadata legitimately takes minutes; indexing must not."""
+        from apple_mail_mcp.index import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        assert (
+            m._STALL_SECONDS["reading_metadata"] > m._STALL_SECONDS["indexing"]
+        )
+
+    def test_heartbeat_reports_phase_and_liveness(self, temp_db_path):
+        from apple_mail_mcp.index import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        assert m.build_progress() is None  # nothing running
+
+        m._mark_progress("reading_metadata")
+        p = m.build_progress()
+        assert p["phase"] == "reading_metadata"
+        assert p["emails_done"] == 0
+        assert p["appears_stalled"] is False
+
+        m._mark_progress("indexing", done=500, seen=512)
+        p = m.build_progress()
+        assert p["phase"] == "indexing"
+        assert p["emails_done"] == 500
+        assert p["files_seen"] == 512

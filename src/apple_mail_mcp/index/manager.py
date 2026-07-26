@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from ..config import (
     get_index_max_emails,
@@ -131,29 +131,57 @@ class IndexManager:
         # describe *this* server's activity.
         self._building = False
         self._last_error: str | None = None
-        # Build heartbeat: (emails_done, monotonic_ts), updated on every
-        # committed batch. Without it, "no progress" and "wedged" look
-        # identical from the outside — the count alone cannot tell them
-        # apart while the parser is chewing through a slow mailbox.
-        self._build_progress: tuple[int, float] | None = None
+        # Build heartbeat. Records the phase, how much has been read
+        # and written, and when that last changed. The phase matters:
+        # a build spends its first minutes reading Apple's metadata
+        # before a single row is written, and without naming that
+        # phase, "warming up" and "wedged" look identical — both show
+        # zero indexed messages.
+        self._build_progress: dict | None = None
 
     def is_building(self) -> bool:
         """True while a full index build is running in this process."""
         return self._building
 
-    def build_progress(self) -> tuple[int, float] | None:
-        """Heartbeat of the running build: (emails_done, seconds_ago).
+    # Reading Apple's metadata for a large mailbox legitimately takes
+    # minutes with nothing to show, so it gets a longer grace period
+    # than the indexing loop, which should tick every few seconds.
+    _STALL_SECONDS: ClassVar[dict[str, float]] = {
+        "reading_metadata": 600.0,
+        "indexing": 120.0,
+    }
 
-        ``seconds_ago`` is how long since the last committed batch. A
-        small value means the build is working even if the total looks
-        unchanged; a large one means it is stuck, and that distinction
-        is the whole point of reporting it.
+    def build_progress(self) -> dict | None:
+        """Heartbeat of the running build, or None if none is running.
+
+        Returns ``phase`` ("reading_metadata" or "indexing"),
+        ``emails_done``, ``files_seen``, ``seconds_since_progress`` and
+        ``appears_stalled``. The phase is what makes zero progress
+        interpretable: during metadata reading, zero is expected.
         """
         progress = self._build_progress
         if progress is None:
             return None
-        done, ts = progress
-        return done, max(0.0, time.monotonic() - ts)
+        phase = progress["phase"]
+        idle = max(0.0, time.monotonic() - progress["ts"])
+        return {
+            "phase": phase,
+            "emails_done": progress["done"],
+            "files_seen": progress["seen"],
+            "seconds_since_progress": round(idle, 1),
+            "appears_stalled": idle > self._STALL_SECONDS.get(phase, 120.0),
+        }
+
+    def _mark_progress(
+        self, phase: str, *, done: int = 0, seen: int = 0
+    ) -> None:
+        """Stamp the build heartbeat."""
+        self._build_progress = {
+            "phase": phase,
+            "done": done,
+            "seen": seen,
+            "ts": time.monotonic(),
+        }
 
     @property
     def last_error(self) -> str | None:
@@ -424,7 +452,8 @@ class IndexManager:
         # fail, so the status tool can distinguish "never started",
         # "running" and "failed with this error".
         self._building = True
-        self._build_progress = (0, time.monotonic())
+        # Nothing is written during metadata reading; say so explicitly.
+        self._mark_progress("reading_metadata")
         try:
             # Verify we can access the mail directory
             mail_dir = find_mail_directory()
@@ -478,11 +507,19 @@ class IndexManager:
                 except Exception:
                     logger.debug("Could not record skip for %s", path)
 
+            files_seen = 0
             for email_data in scan_all_emails(
                 mail_dir,
                 exclude_account_uuids=exclude_account_uuids,
                 on_skip=_record_skip,
             ):
+                files_seen += 1
+                # Tick well before the first batch commits, so a build
+                # that is parsing steadily never looks frozen.
+                if files_seen % 100 == 0:
+                    self._mark_progress(
+                        "indexing", done=total_indexed, seen=files_seen
+                    )
                 key = (email_data["account"], email_data["mailbox"])
                 count = mailbox_counts.get(key, 0)
 
@@ -512,9 +549,10 @@ class IndexManager:
 
                 if len(batch) >= batch_size:
                     self._flush_batch(conn, batch, batch_attachments)
-                    self._build_progress = (
-                        total_indexed + len(batch),
-                        time.monotonic(),
+                    self._mark_progress(
+                        "indexing",
+                        done=total_indexed + len(batch),
+                        seen=files_seen,
                     )
                     total_indexed += len(batch)
 
