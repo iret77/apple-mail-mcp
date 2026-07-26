@@ -163,7 +163,10 @@ class IndexManager:
                 "at": datetime.now().isoformat(timespec="seconds"),
                 "level": level,
                 "message": message,
-                **fields,
+                # Coerce: these go straight into an MCP response, and a
+                # non-serializable value would break the whole status
+                # reply rather than this one event.
+                **{k: str(v) for k, v in fields.items()},
             }
             with self._events_lock:
                 self._events.append(event)
@@ -524,6 +527,10 @@ class IndexManager:
             on_started()
 
         conn = None
+        # Set when a swallowed error in the cleanup path means the
+        # index is NOT actually complete — e.g. the FTS rebuild failed,
+        # leaving rows in `emails` that body search can never find.
+        finalize_error: str | None = None
         batch: list[tuple] = []
         # Deferred attachment rows: (email_tuple_index, attachments)
         batch_attachments: list[tuple[int, list]] = []
@@ -703,7 +710,8 @@ class IndexManager:
                                 (acct_, mbox_, now, count),
                             )
                         conn.commit()
-                except sqlite3.Error:
+                except sqlite3.Error as exc:
+                    finalize_error = f"{type(exc).__name__}: {exc}"
                     logger.exception("Could not finalize index build")
 
                 # Rebuild FTS index (must run even if scan crashed
@@ -717,7 +725,8 @@ class IndexManager:
                     try:
                         rebuild_fts_index(conn)
                         optimize_fts_index(conn)
-                    except sqlite3.Error:
+                    except sqlite3.Error as exc:
+                        finalize_error = f"{type(exc).__name__}: {exc}"
                         logger.exception("FTS rebuild failed")
 
                 # Log cap warnings (aggregate summary)
@@ -741,8 +750,22 @@ class IndexManager:
         # Disk inventory just changed — drop the cache so the next
         # status call reflects truth.
         self.invalidate_disk_count_cache()
-        self._last_error = None  # a completed build clears prior failures
-        self.record_event("info", "Index build finished", emails=total_indexed)
+        if finalize_error:
+            # Rows exist but the index is not usable as promised — a
+            # failed FTS rebuild leaves body search permanently empty.
+            # Reporting success here is how that stays invisible.
+            self._last_error = finalize_error
+            self.record_event(
+                "error",
+                "Index build finished with errors; search may be incomplete",
+                error=finalize_error,
+                emails=total_indexed,
+            )
+        else:
+            self._last_error = None  # a clean build clears prior failures
+            self.record_event(
+                "info", "Index build finished", emails=total_indexed
+            )
         return total_indexed
 
     @staticmethod
@@ -841,6 +864,7 @@ class IndexManager:
             raise IndexBusyError("An index build or sync is already running.")
 
         self.record_event("info", "Sync started")
+        self._last_error = None  # this run's verdict, not a previous one
         try:
             changes = self._sync_updates_locked(progress_callback)
         except BaseException as exc:
@@ -849,7 +873,17 @@ class IndexManager:
             raise
         finally:
             self._write_lock.release()
-        self.record_event("info", "Sync finished", changes=changes)
+        if self._last_error:
+            # The Full-Disk-Access path reports a soft failure by
+            # returning 0 rather than raising. Announcing "finished"
+            # then puts a success at the top of the ring the model is
+            # told to quote from — the exact lie this ring exists to
+            # prevent.
+            self.record_event(
+                "error", "Sync did not run", error=self._last_error
+            )
+        else:
+            self.record_event("info", "Sync finished", changes=changes)
         return changes
 
     def _sync_updates_locked(self, progress_callback=None) -> int:

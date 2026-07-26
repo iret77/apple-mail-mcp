@@ -431,7 +431,8 @@ def _log_file_path() -> str:
     try:
         from .config import get_log_path
 
-        return str(get_log_path()) or "(disabled)"
+        path = get_log_path()
+        return str(path) if path is not None else "(disabled)"
     except Exception:
         return "(unknown)"
 

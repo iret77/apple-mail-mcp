@@ -323,7 +323,7 @@ def get_index_max_email_mb() -> float:
     return 25.0
 
 
-def get_log_path() -> Path:
+def get_log_path() -> Path | None:
     """Where the server writes its own log.
 
     The server's stderr is not reachable when it runs as a desktop
@@ -334,7 +334,10 @@ def get_log_path() -> Path:
     """
     env = os.environ.get("APPLE_MAIL_LOG_PATH")
     if env is not None:
-        return Path(env).expanduser() if env else Path("")
+        # Explicit None for "disabled": Path("") normalizes to ".",
+        # which is a truthy directory — the guard never fired and the
+        # handler tried to open the current directory as a file.
+        return Path(env).expanduser() if env else None
     return DEFAULT_LOG_PATH
 
 

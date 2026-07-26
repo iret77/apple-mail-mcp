@@ -17,7 +17,6 @@ Usage:
     apple-mail-mcp rebuild    # Force rebuild index
 """
 
-import contextlib
 import sys
 import time
 from collections.abc import Callable
@@ -95,16 +94,35 @@ def _setup_file_logging() -> Path | None:
     must not grow without bound. Returns the active path, or None.
     """
     import logging
+    import os as _os
     from logging.handlers import RotatingFileHandler
 
     from .config import get_log_path
 
+    class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
+        """Rotating handler that recreates the file 0600 every time.
+
+        A one-shot chmod cannot hold this: on rollover the handler
+        reopens the path with plain open(), i.e. 0644 under the usual
+        umask, and the live log — which carries mail paths and, via
+        account resolution, excluded-account names — would silently
+        become world-readable from the first rotation onward.
+        """
+
+        def _open(self):
+            fd = _os.open(
+                self.baseFilename,
+                _os.O_APPEND | _os.O_CREAT | _os.O_WRONLY,
+                0o600,
+            )
+            return _os.fdopen(fd, self.mode, encoding=self.encoding)
+
     path = get_log_path()
-    if not str(path):
+    if path is None:
         return None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
+        handler = _OwnerOnlyRotatingFileHandler(
             path, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
         )
         handler.setFormatter(
@@ -113,9 +131,6 @@ def _setup_file_logging() -> Path | None:
         root = logging.getLogger("apple_mail_mcp")
         root.setLevel(logging.INFO)
         root.addHandler(handler)
-        # Mail paths and subjects can pass through log records.
-        with contextlib.suppress(OSError):
-            path.chmod(0o600)
         return path
     except OSError as e:
         print(f"Warning: could not open log file: {e}", file=sys.stderr)
@@ -137,8 +152,14 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
     log_path = _setup_file_logging()
 
     manager = IndexManager.get_instance()
-    if log_path:
-        manager.record_event("info", f"Server started; logging to {log_path}")
+    # Unconditional: this is the only entry that anchors "this process
+    # started at T", and it must exist precisely when diagnostics are
+    # already degraded.
+    manager.record_event(
+        "info",
+        "Server started",
+        log=str(log_path) if log_path else "file logging unavailable",
+    )
 
     # Clean up old attachment files
     try:

@@ -2279,8 +2279,10 @@ class TestDiagnosticsAreReachable:
         monkeypatch.setenv("APPLE_MAIL_LOG_PATH", "/tmp/custom.log")
         assert str(get_log_path()) == "/tmp/custom.log"
 
+        # Disabled must be an explicit None: Path("") normalizes to
+        # ".", which is truthy, so the old guard never fired.
         monkeypatch.setenv("APPLE_MAIL_LOG_PATH", "")
-        assert str(get_log_path()) == "."  # falsy -> disabled
+        assert get_log_path() is None
 
     def test_file_log_is_written_and_owner_only(self, tmp_path, monkeypatch):
         import logging
@@ -2304,3 +2306,131 @@ class TestDiagnosticsAreReachable:
             for h in list(root.handlers):
                 h.close()
                 root.removeHandler(h)
+
+
+class TestDiagnosticsDoNotLie:
+    """Regressions for the review of the diagnostics pass itself."""
+
+    def test_disabled_logging_is_reported_as_disabled(self, monkeypatch):
+        from apple_mail_mcp.cli import _setup_file_logging
+        from apple_mail_mcp.server import _log_file_path
+
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", "")
+        assert _setup_file_logging() is None
+        assert _log_file_path() == "(disabled)"
+
+    def test_rotated_log_stays_owner_only(self, tmp_path, monkeypatch):
+        """chmod once is not enough: on rollover the handler reopens the
+        path with plain open(), i.e. 0644 under the usual umask."""
+        import logging
+
+        from apple_mail_mcp.cli import _setup_file_logging
+
+        target = tmp_path / "server.log"
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", str(target))
+        _setup_file_logging()
+        root = logging.getLogger("apple_mail_mcp")
+        try:
+            handler = root.handlers[-1]
+            handler.maxBytes = 200  # force a rollover
+            log = logging.getLogger("apple_mail_mcp.rotate_test")
+            for i in range(50):
+                log.info("padding line %d %s", i, "x" * 40)
+            handler.flush()
+
+            assert (tmp_path / "server.log.1").exists(), "no rollover"
+            for f in (target, tmp_path / "server.log.1"):
+                assert oct(f.stat().st_mode)[-3:] == "600", f
+        finally:
+            for h in list(root.handlers):
+                h.close()
+                root.removeHandler(h)
+
+    def test_failed_sync_is_not_topped_by_a_success_event(self, temp_db_path):
+        """The FDA path returns 0 instead of raising, so "Sync finished"
+        landed on top of the ring the model is told to quote."""
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        with patch(
+            "apple_mail_mcp.index.disk.find_mail_directory",
+            side_effect=PermissionError("no FDA"),
+        ):
+            assert m.sync_updates() == 0
+
+        top = m.recent_events()[0]
+        assert top["level"] == "error"
+        assert "finished" not in top["message"].lower()
+        assert m.last_error and "PermissionError" in m.last_error
+
+    def test_swallowed_finalize_error_is_not_reported_as_success(
+        self, temp_db_path, tmp_path
+    ):
+        """Rows exist but FTS is empty: body search is permanently
+        broken, so "finished" with last_error None hides it completely."""
+        import sqlite3 as _sqlite3
+
+        from apple_mail_mcp.index import manager as mgr_mod
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        emails = [
+            {
+                "id": i,
+                "account": "acct",
+                "mailbox": "INBOX",
+                "subject": "s",
+                "sender": "a@b",
+                "content": "c",
+                "date_received": "2026-01-01",
+                "emlx_path": f"/p/{i}.emlx",
+                "message_id_header": f"<{i}@x>",
+                "attachments": [],
+            }
+            for i in range(2)
+        ]
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                return_value=iter(emails),
+            ),
+            patch.object(
+                mgr_mod,
+                "rebuild_fts_index",
+                side_effect=_sqlite3.OperationalError("disk full"),
+            ),
+        ):
+            m.build_from_disk()
+
+        assert m.last_error and "disk full" in m.last_error
+        top = m.recent_events()[0]
+        assert top["level"] == "error"
+        assert "incomplete" in top["message"].lower()
+
+    def test_start_event_exists_even_without_file_logging(
+        self, temp_db_path, monkeypatch
+    ):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        m.record_event("info", "Server started", log="file logging unavailable")
+        assert m.recent_events()[0]["message"] == "Server started"
+
+    def test_event_fields_are_always_serializable(self, temp_db_path):
+        import json
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        class Weird:
+            def __str__(self):
+                return "weird-value"
+
+        m = IndexManager(db_path=temp_db_path)
+        m.record_event("info", "x", obj=Weird(), n=5)
+        # Must survive the JSON round-trip the MCP response performs.
+        json.dumps(m.recent_events())
