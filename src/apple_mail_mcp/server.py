@@ -2185,6 +2185,15 @@ async def get_index_status() -> dict:
                     ),
                 }
             )
+            skipped = await asyncio.to_thread(manager.count_skipped_too_large)
+            if skipped:
+                result["skipped_too_large"] = skipped
+                result["skipped_note"] = (
+                    f"{skipped} message(s) exceed the size limit and are "
+                    f"not searchable — this is why indexed_emails can be "
+                    f"below disk_emails. Raise APPLE_MAIL_INDEX_MAX_EMAIL_MB "
+                    f"(default 25) and rebuild to include them."
+                )
             legacy = await asyncio.to_thread(manager.count_without_stable_id)
             result["without_stable_id"] = legacy
             if legacy:

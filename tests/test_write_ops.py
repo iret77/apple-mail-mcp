@@ -1644,3 +1644,90 @@ class TestStallDetection:
         table count is still catching up."""
         r = await self._status(self._building_mgr(5.0), tmp_path)
         assert r["build_emails_done"] == 500
+
+
+class TestOversizedEmailsAreVisible:
+    """A skipped message must never be silently missing from search."""
+
+    def test_limit_is_configurable(self, monkeypatch):
+        from apple_mail_mcp.index.disk import max_emlx_size
+
+        monkeypatch.delenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", raising=False)
+        assert max_emlx_size() == 25 * 1024 * 1024
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "100")
+        assert max_emlx_size() == 100 * 1024 * 1024
+
+    def test_too_large_detection(self, tmp_path, monkeypatch):
+        from apple_mail_mcp.index.disk import emlx_too_large
+
+        f = tmp_path / "big.emlx"
+        f.write_bytes(b"x" * 2048)
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "1")
+        assert emlx_too_large(f) is False  # 2 KB under a 1 MB cap
+
+        # 1 KB cap expressed in MB
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", str(1 / 1024))
+        assert emlx_too_large(f) is True
+
+    def test_scan_reports_the_skip_instead_of_swallowing_it(
+        self, tmp_path, monkeypatch
+    ):
+        from apple_mail_mcp.index import disk
+
+        mail_dir = tmp_path
+        big = tmp_path / "big.emlx"
+        big.write_bytes(b"x" * 4096)
+
+        monkeypatch.setattr(
+            disk, "scan_emlx_files", lambda *a, **k: iter([big])
+        )
+        monkeypatch.setattr(disk, "read_envelope_index", lambda d: {})
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", str(1 / 1024))
+
+        skips: list = []
+        results = list(
+            disk.scan_all_emails(
+                mail_dir, on_skip=lambda p, r: skips.append((p, r))
+            )
+        )
+
+        assert results == []
+        assert skips == [(big, "too_large")]
+
+    @pytest.mark.asyncio
+    async def test_status_explains_the_gap(self, tmp_path):
+        mgr = MagicMock()
+        mgr.is_building.return_value = False
+        mgr.has_index.return_value = True
+        mgr.indexed_email_count.return_value = 63_875
+        mgr.count_skipped_too_large.return_value = 4
+        mgr.count_without_stable_id.return_value = 0
+        mgr.last_error = None
+        stats = MagicMock()
+        stats.disk_email_count = 63_879
+        stats.mailbox_count = 24
+        stats.attachment_count = 0
+        stats.db_size_mb = 1.0
+        stats.failed_jobs_count = 4
+        stats.excluded_accounts = []
+        stats.last_sync = None
+        stats.staleness_hours = None
+        mgr.get_stats.return_value = stats
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["skipped_too_large"] == 4
+        # The count difference is explained, not left to guesswork.
+        assert "size limit" in r["skipped_note"]
+        assert "APPLE_MAIL_INDEX_MAX_EMAIL_MB" in r["skipped_note"]

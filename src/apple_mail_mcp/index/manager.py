@@ -45,6 +45,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _SkipReason(Exception):
+    """Carries a skip reason into the DLQ's error_type/message columns.
+
+    The DLQ records failures as exceptions; a deliberate skip is not an
+    exception but must be recorded the same way, so it stays visible.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+    def __str__(self) -> str:
+        return self.reason
+
+
 @dataclass
 class IndexStats:
     """Statistics about the search index."""
@@ -399,7 +414,11 @@ class IndexManager:
             PermissionError: If Full Disk Access is not granted
             FileNotFoundError: If Mail directory not found
         """
-        from .disk import find_mail_directory, scan_all_emails
+        from .disk import (
+            _infer_account_mailbox,
+            find_mail_directory,
+            scan_all_emails,
+        )
 
         # Mark the build as running before the first thing that can
         # fail, so the status tool can distinguish "never started",
@@ -443,8 +462,26 @@ class IndexManager:
         batch_size = 500
 
         try:
+
+            def _record_skip(path: Path, reason: str) -> None:
+                """Never drop a message without a trace: a skipped file
+                goes into the DLQ so the status tool can explain the
+                gap between disk and index counts."""
+                try:
+                    acct, mbox = _infer_account_mailbox(path, mail_dir)
+                    self.record_parse_failure(
+                        str(path),
+                        acct,
+                        mbox,
+                        _SkipReason(reason),
+                    )
+                except Exception:
+                    logger.debug("Could not record skip for %s", path)
+
             for email_data in scan_all_emails(
-                mail_dir, exclude_account_uuids=exclude_account_uuids
+                mail_dir,
+                exclude_account_uuids=exclude_account_uuids,
+                on_skip=_record_skip,
             ):
                 key = (email_data["account"], email_data["mailbox"])
                 count = mailbox_counts.get(key, 0)
@@ -867,6 +904,25 @@ class IndexManager:
                 .execute(
                     "SELECT COUNT(*) AS n FROM emails "
                     "WHERE rfc822_message_id IS NULL"
+                )
+                .fetchone()
+            )
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def count_skipped_too_large(self) -> int:
+        """Messages skipped for exceeding the size ceiling.
+
+        Explains part of any gap between `disk_email_count` and
+        `email_count` — a gap that would otherwise look like data loss.
+        """
+        try:
+            row = (
+                self._get_conn()
+                .execute(
+                    "SELECT COUNT(*) AS n FROM failed_index_jobs "
+                    "WHERE error_message = 'too_large'"
                 )
                 .fetchone()
             )

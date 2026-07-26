@@ -537,6 +537,7 @@ silently using degraded config.
 | `APPLE_MAIL_INDEX_PATH` | `[index] path` | `~/.apple-mail-mcp/index.db` | Index database location |
 | `APPLE_MAIL_INDEX_MAX_EMAILS` | `[index] max_emails` | _unset_ | Optional per-mailbox ceiling (default: uncapped) |
 | `APPLE_MAIL_INDEX_STALENESS_HOURS` | `[index] staleness_hours` | `24` | Hours before refresh |
+| `APPLE_MAIL_INDEX_MAX_EMAIL_MB` | `[index] max_email_mb` | `25` | Largest single `.emlx` to parse. Bigger messages are skipped, recorded in the DLQ as `too_large`, and reported by `get_index_status` as `skipped_too_large` — never dropped silently |
 | `APPLE_MAIL_INDEX_AUTO_BUILD` | `[index] auto_build` | `true` | Build the index in the background on first `serve` when none exists (requires Full Disk Access; failure logged, not fatal). Set `false` to require a manual `apple-mail-mcp index` |
 | `APPLE_MAIL_INDEX_EXCLUDE_MAILBOXES` | `[index] exclude_mailboxes` | `["Drafts"]` | Mailboxes to skip during indexing |
 | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` | `[index] exclude_accounts` | _unset_ | Accounts (by display name, exact/case-sensitive) hidden from the whole server: never indexed, filtered from search, invisible to list/get tools (#90) |

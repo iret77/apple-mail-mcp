@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 # Mail.app version folder (V10 for macOS Catalina+)
 # Deprecated: use find_mail_directory() which auto-detects.
@@ -101,8 +101,37 @@ def extract_message_id(path: Path) -> int:
     return int(path.name.split(".")[0])
 
 
-# Maximum email file size to prevent OOM from malformed/huge files (25 MB)
+# Default ceiling on a single .emlx, guarding against OOM from a
+# malformed or enormous message. Configurable — see
+# `max_emlx_size()` and APPLE_MAIL_INDEX_MAX_EMAIL_MB.
 MAX_EMLX_SIZE = 25 * 1024 * 1024
+
+
+class EmailTooLargeError(ValueError):
+    """An `.emlx` exceeds the configured size ceiling.
+
+    Raised only where a caller can record it. Skipping such a file is a
+    deliberate trade-off, but it must never be invisible: a silently
+    dropped message is simply missing from search with no explanation.
+    """
+
+
+def max_emlx_size() -> int:
+    """Current size ceiling in bytes (config, default 25 MB)."""
+    try:
+        from ..config import get_index_max_email_mb
+
+        return int(get_index_max_email_mb() * 1024 * 1024)
+    except Exception:
+        return MAX_EMLX_SIZE
+
+
+def emlx_too_large(path: Path) -> bool:
+    """True when `path` exceeds the configured ceiling."""
+    try:
+        return path.stat().st_size > max_emlx_size()
+    except OSError:
+        return False
 
 
 @dataclass
@@ -338,8 +367,10 @@ def parse_emlx(path: Path) -> EmlxEmail | None:
         EmlxEmail with parsed content, or None if parsing fails
     """
     try:
-        # Check file size to prevent OOM from huge/malformed files
-        if path.stat().st_size > MAX_EMLX_SIZE:
+        # Check file size to prevent OOM from huge/malformed files.
+        # Callers that can report the skip should test `emlx_too_large`
+        # first; returning None here keeps the parser total.
+        if path.stat().st_size > max_emlx_size():
             return None
 
         content = path.read_bytes()
@@ -848,7 +879,7 @@ def get_attachment_content(
     try:
         if not emlx_path.exists():
             return None
-        if emlx_path.stat().st_size > MAX_EMLX_SIZE:
+        if emlx_path.stat().st_size > max_emlx_size():
             return None
 
         content = emlx_path.read_bytes()
@@ -1118,6 +1149,7 @@ def scan_emlx_files(
 def scan_all_emails(
     mail_dir: Path,
     exclude_account_uuids: set[str] | None = None,
+    on_skip: Callable[[Path, str], None] | None = None,
 ) -> Iterator[dict]:
     """
     Scan all emails from the Mail directory.
@@ -1144,12 +1176,22 @@ def scan_all_emails(
     for emlx_path in scan_emlx_files(
         mail_dir, exclude_account_uuids=exclude_account_uuids
     ):
+        # Test the ceiling before parsing so the reason for a skip is
+        # known and can be reported, instead of surfacing as a bare None.
+        if emlx_too_large(emlx_path):
+            if on_skip is not None:
+                on_skip(emlx_path, "too_large")
+            continue
         try:
             parsed = parse_emlx(emlx_path)
         except Exception as e:
             logger.warning("Skipping corrupt file %s: %s", emlx_path, e)
+            if on_skip is not None:
+                on_skip(emlx_path, f"{type(e).__name__}: {e}")
             continue
         if not parsed:
+            if on_skip is not None:
+                on_skip(emlx_path, "unparseable")
             continue
 
         msg_id = parsed.id

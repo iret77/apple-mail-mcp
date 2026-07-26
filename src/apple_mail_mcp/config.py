@@ -33,6 +33,7 @@ CONFIG_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "exclude_accounts": (list,),
         "include_mailboxes": (list,),
         "auto_build": (bool,),
+        "max_email_mb": (int, float),
     },
     "server": {
         "read_only": (bool,),
@@ -287,6 +288,27 @@ def get_index_exclude_accounts() -> set[str]:
     return set()
 
 
+def get_index_max_email_mb() -> float:
+    """
+    Largest ``.emlx`` file the indexer will parse, in megabytes.
+
+    Resolution: ``APPLE_MAIL_INDEX_MAX_EMAIL_MB`` env, then
+    ``[index] max_email_mb`` in ``config.toml``, then ``25``.
+
+    The cap exists so one malformed or enormous message cannot exhaust
+    memory. Messages above it are recorded as skipped (visible in
+    ``get_index_status``) rather than silently dropped; raise it if you
+    need very large mail to be searchable.
+    """
+    env = os.environ.get("APPLE_MAIL_INDEX_MAX_EMAIL_MB")
+    if env is not None and env != "":
+        return float(env)
+    val = _from_toml("index", "max_email_mb")
+    if val is not None:
+        return float(val)
+    return 25.0
+
+
 def get_index_auto_build() -> bool:
     """
     Whether the server builds the index on first run when none exists.
@@ -397,6 +419,12 @@ config_version = 1
 # Hours before the index is considered stale and should be re-synced.
 # Env: APPLE_MAIL_INDEX_STALENESS_HOURS
 # staleness_hours = 24.0
+
+# Largest single email to parse, in MB. Bigger messages are skipped and
+# reported in the index status. Raise it to make very large mail
+# searchable, at the cost of more memory during indexing.
+# Env: APPLE_MAIL_INDEX_MAX_EMAIL_MB
+# max_email_mb = 25
 
 # Build the index automatically on first run when none exists (background;
 # requires Full Disk Access). Set false to require a manual
