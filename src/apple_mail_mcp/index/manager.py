@@ -427,6 +427,7 @@ class IndexManager:
     def build_from_disk(
         self,
         progress_callback: Callable[[int, int | None, str], None] | None = None,
+        on_started: Callable[[], None] | None = None,
     ) -> int:
         """
         Build the index by reading .emlx files directly from disk.
@@ -473,6 +474,11 @@ class IndexManager:
         # Phases are reported so a slow preparation step is never
         # mistaken for a hang.
         self._mark_progress("clearing")
+        # Only now has the build truly begun: the lock is held and the
+        # state is visible. Callers use this to distinguish a started
+        # build from one refused on the first line.
+        if on_started is not None:
+            on_started()
 
         conn = None
         batch: list[tuple] = []

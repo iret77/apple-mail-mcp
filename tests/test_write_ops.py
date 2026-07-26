@@ -724,6 +724,7 @@ class TestIndexStatusTool:
     def _mgr(self, *, building=False, has_index=True, indexed=100, err=None):
         m = MagicMock()
         m.is_building.return_value = building
+        m.write_lock_held.return_value = False
         m.has_index.return_value = has_index
         m.indexed_email_count.return_value = indexed
         m.cached_disk_count.return_value = None
@@ -862,6 +863,7 @@ class TestIndexModes:
     def _mgr(self, *, indexed, building=False, has_index=True):
         m = MagicMock()
         m.is_building.return_value = building
+        m.write_lock_held.return_value = False
         m.has_index.return_value = has_index
         m.indexed_email_count.return_value = indexed
         m.last_error = None
@@ -955,6 +957,7 @@ class TestAgentGuidance:
     def _mgr(self, *, indexed, building=False, has_index=True):
         m = MagicMock()
         m.is_building.return_value = building
+        m.write_lock_held.return_value = False
         m.has_index.return_value = has_index
         m.indexed_email_count.return_value = indexed
         m.last_error = None
@@ -1052,6 +1055,7 @@ class TestRefreshIndex:
     def _mgr(self, *, building=False, usable=True, changes=0, err=None):
         m = MagicMock()
         m.is_building.return_value = building
+        m.write_lock_held.return_value = False
         m.write_lock_held.return_value = False
         m.has_usable_index.return_value = usable
         m.sync_updates.return_value = changes
@@ -1550,6 +1554,7 @@ class TestBuildProgressVisibility:
     async def test_progress_reported_from_cached_disk_count(self, tmp_path):
         mgr = MagicMock()
         mgr.is_building.return_value = True
+        mgr.write_lock_held.return_value = False
         mgr.has_index.return_value = True
         mgr.indexed_email_count.return_value = 17_500
         mgr.cached_disk_count.return_value = 70_000
@@ -1583,6 +1588,7 @@ class TestBuildProgressVisibility:
     async def test_no_cached_total_still_reports_count(self, tmp_path):
         mgr = MagicMock()
         mgr.is_building.return_value = True
+        mgr.write_lock_held.return_value = False
         mgr.has_index.return_value = True
         mgr.indexed_email_count.return_value = 42
         mgr.cached_disk_count.return_value = None  # never walked yet
@@ -1616,6 +1622,7 @@ class TestStallDetection:
     def _building_mgr(self, seconds_ago, phase="indexing"):
         m = MagicMock()
         m.is_building.return_value = True
+        m.write_lock_held.return_value = False
         m.has_index.return_value = True
         m.indexed_email_count.return_value = 0
         m.cached_disk_count.return_value = 70_000
@@ -1719,6 +1726,7 @@ class TestOversizedEmailsAreVisible:
     async def test_status_explains_the_gap(self, tmp_path):
         mgr = MagicMock()
         mgr.is_building.return_value = False
+        mgr.write_lock_held.return_value = False
         mgr.has_index.return_value = True
         mgr.indexed_email_count.return_value = 63_875
         mgr.count_skipped_too_large.return_value = 4
@@ -1758,6 +1766,7 @@ class TestWarmUpPhaseIsNotMistakenForAStall:
     def _mgr(self, phase, idle):
         m = MagicMock()
         m.is_building.return_value = True
+        m.write_lock_held.return_value = False
         m.has_index.return_value = True
         m.indexed_email_count.return_value = 0
         m.cached_disk_count.return_value = 63_953
@@ -2027,3 +2036,114 @@ class TestReviewFindings:
         row = skip_row("/p", "acct", "INBOX", SKIP_REASON_TOO_LARGE)
         # count_skipped_too_large matches error_message = 'too_large'
         assert row[4] == "too_large"
+
+
+class TestRefreshIndexTellsTheTruth:
+    """ "started" must mean started — the bug that made a refused
+    rebuild look like a running one."""
+
+    def _mgr(self, *, busy=False):
+        m = MagicMock()
+        m.is_building.return_value = False
+        m.write_lock_held.return_value = busy
+        m.has_usable_index.return_value = True
+        m.last_error = None
+        return m
+
+    @pytest.mark.asyncio
+    async def test_refused_build_is_not_reported_as_started(self):
+        from apple_mail_mcp.index.manager import IndexBusyError
+
+        mgr = self._mgr()
+        mgr.build_from_disk.side_effect = IndexBusyError("already running")
+
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index(full=True)
+
+        assert r["status"] == "already_running"
+        assert "rebuild" in r["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_crashing_build_is_reported_as_failed(self):
+        mgr = self._mgr()
+        mgr.build_from_disk.side_effect = OSError("disk gone")
+
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index(full=True)
+
+        assert r["status"] == "failed"
+        assert "OSError" in r["error"]
+
+    @pytest.mark.asyncio
+    async def test_real_start_is_confirmed_via_on_started(self):
+        mgr = self._mgr()
+
+        def build(progress_callback=None, on_started=None):
+            if on_started:
+                on_started()
+
+        mgr.build_from_disk.side_effect = build
+
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index(full=True)
+
+        assert r["status"] == "started"
+
+    @pytest.mark.asyncio
+    async def test_busy_lock_short_circuits_before_spawning(self):
+        mgr = self._mgr(busy=True)
+
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index(full=True)
+
+        assert r["status"] == "already_running"
+        mgr.build_from_disk.assert_not_called()
+
+
+class TestRunningSyncIsVisible:
+    """A sync holds the write lock but sets no build phase, so it was
+    invisible: counts frozen, last_sync stale, state 'ready'."""
+
+    @pytest.mark.asyncio
+    async def test_status_reports_a_running_sync(self, tmp_path):
+        mgr = MagicMock()
+        mgr.is_building.return_value = False
+        mgr.write_lock_held.return_value = True
+        mgr.has_index.return_value = True
+        mgr.indexed_email_count.return_value = 63_875
+        mgr.cached_disk_count.return_value = 63_977
+        mgr.build_progress.return_value = None
+        mgr.last_error = None
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["sync_running"] is True
+        assert "update is running" in r["user_message"]
+        # Not a fault — no fresh disk walk, no "problem".
+        assert "problem" not in r
+        mgr.get_stats.assert_not_called()

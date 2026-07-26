@@ -132,6 +132,11 @@ MAX_WRITE_BATCH = 500
 # per mailbox, which is heavier than the integer-id scan Strategy 3 does
 # — its 15s budget would make recovery time out exactly on the large
 # mailboxes it exists for.
+# How long refresh_index waits for a spawned build to actually begin
+# before answering. Long enough to catch an immediate refusal, short
+# enough not to stall the caller.
+BUILD_START_TIMEOUT = 5.0
+
 RECOVERY_TIMEOUT = _clamped_env_int("APPLE_MAIL_RECOVERY_TIMEOUT", 60, 5, 300)
 
 # Ceiling for a located (precisely targeted) write. Well under the
@@ -449,6 +454,7 @@ def _index_guidance(
     auto_build: bool,
     stalled: bool = False,
     phase: str | None = None,
+    syncing: bool = False,
 ) -> tuple[str | None, str | None, list[str], str]:
     """Turn raw index state into instructions a non-technical user can follow.
 
@@ -462,6 +468,18 @@ def _index_guidance(
     cmd = _index_command()
     app = "Claude" if _install_mode() == "bundle" else "the app running this"
 
+    if syncing:
+        return (
+            None,
+            "An index update is running.",
+            [
+                "No action needed — counts and the last-sync time only "
+                "move when it finishes.",
+                "Ask again in a few minutes.",
+            ],
+            "An index update is running right now; the numbers won't "
+            "change until it completes.",
+        )
     if state == "building":
         if stalled:
             return (
@@ -2103,17 +2121,47 @@ async def refresh_index(full: bool = False) -> dict:
     # A full rebuild is far too slow to block an MCP call on, and so is
     # the first build of a large mailbox — run both detached.
     if full or not manager.has_usable_index():
+        # Confirm the build actually begins before claiming it did.
+        # Reporting "started" for a thread that died on the first line
+        # is how a refused build looked like a running one: the status
+        # then said "ready" forever and nothing explained the mismatch.
+        started = threading.Event()
+        outcome: list[BaseException] = []
 
         def _build() -> None:
             try:
-                manager.build_from_disk()
-            except IndexBusyError as exc:
-                # Another build or sync holds the write lock.
-                logger.info("Index build not started: %s", exc)
-            except Exception:
-                logger.warning("Background index build failed", exc_info=True)
+                manager.build_from_disk(on_started=started.set)
+            except BaseException as exc:
+                outcome.append(exc)
+                if isinstance(exc, IndexBusyError):
+                    logger.info("Index build not started: %s", exc)
+                else:
+                    logger.warning(
+                        "Background index build failed", exc_info=True
+                    )
+            finally:
+                started.set()  # never leave the caller waiting
 
         threading.Thread(target=_build, daemon=True).start()
+        await asyncio.to_thread(started.wait, BUILD_START_TIMEOUT)
+
+        if outcome:
+            exc = outcome[0]
+            if isinstance(exc, IndexBusyError):
+                return {
+                    "status": "already_running",
+                    "message": (
+                        "An index update is already running, so a rebuild "
+                        "could not start. Ask for the index status to see "
+                        "how far along it is, then try again."
+                    ),
+                }
+            return {
+                "status": "failed",
+                "message": "The index rebuild could not be started.",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
         return {
             "status": "started",
             "message": (
@@ -2219,6 +2267,10 @@ async def get_index_status() -> dict:
         logger.debug("Mail directory probe failed: %s", exc)
 
     building = manager.is_building()
+    # A sync holds the same write lock but sets no build phase, so it
+    # was completely invisible: counts and last_sync only move when it
+    # finishes, which looks exactly like nothing happening.
+    syncing = manager.write_lock_held() and not building
     has_index = manager.has_index()
     indexed = await asyncio.to_thread(manager.indexed_email_count)
 
@@ -2241,6 +2293,7 @@ async def get_index_status() -> dict:
         "mail_dir_accessible": mail_dir_accessible,
         "mail_directory": mail_dir,
         "index_mode": "automatic" if auto_build else "manual",
+        "sync_running": syncing,
         "install_mode": _install_mode(),
         "server_version": _server_version(),
         "read_only": get_read_only_mode(),
@@ -2272,9 +2325,17 @@ async def get_index_status() -> dict:
                 min(100.0, 100.0 * indexed / cached_total), 1
             )
 
+    # A sync competes for the same I/O as a build, so it gets the same
+    # treatment: report from the cached count instead of walking.
+    if syncing:
+        cached_total = manager.cached_disk_count()
+        if cached_total:
+            result["disk_emails"] = cached_total
+
     # Richer stats need a disk walk; skip them when Mail is
-    # unreachable (they'd only fail) or mid-build (see above).
-    if has_index and not building and mail_dir_accessible:
+    # unreachable (they'd only fail) or while a build or sync is
+    # running (see above).
+    if has_index and not building and not syncing and mail_dir_accessible:
         try:
             stats = await asyncio.to_thread(manager.get_stats)
             result.update(
@@ -2329,6 +2390,7 @@ async def get_index_status() -> dict:
         auto_build=auto_build,
         stalled=bool(result.get("build_appears_stalled")),
         phase=result.get("build_phase"),
+        syncing=syncing,
     )
     if problem:
         result["problem"] = problem
