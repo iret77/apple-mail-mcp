@@ -74,6 +74,22 @@ def parse_failure_row(
     )
 
 
+SKIP_REASON_TOO_LARGE = "too_large"
+
+
+def skip_row(
+    emlx_path: str, account: str, mailbox: str, reason: str
+) -> tuple[str, str, str, str, str]:
+    """Build the DLQ tuple for a deliberately skipped file.
+
+    A skip is not an error, but it must be recorded the same way: a
+    message that is silently absent from the index is indistinguishable
+    from data loss. `reason` lands in `error_message`, which is what
+    `count_skipped_too_large()` matches on.
+    """
+    return (emlx_path, account, mailbox, "Skipped", reason)
+
+
 def insert_attachments(
     conn: sqlite3.Connection,
     email_rowid: int,

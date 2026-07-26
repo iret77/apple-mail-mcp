@@ -1824,3 +1824,205 @@ class TestWarmUpPhaseIsNotMistakenForAStall:
         assert p["phase"] == "indexing"
         assert p["emails_done"] == 500
         assert p["files_seen"] == 512
+
+
+class TestReviewFindings:
+    """Regressions for the defects the code review surfaced."""
+
+    # --- data corruption in the write path -------------------------
+
+    def test_header_catch_handles_both_group_shapes(self):
+        """A catch reading g.ids on a header group throws inside the
+        catch, which escapes and kills the entire batch."""
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_read(
+            [{"account": "W", "headers": ["<a@b>"], "by_header": True}], True
+        ).build()
+        assert "g.ids || g.headers" in script
+        assert (
+            "for (const id of g.ids) notFound.push(id);\n    continue"
+            not in (script)
+        )
+
+    def test_recovery_never_writes_into_trash_or_junk(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_flag(
+            [{"account": "W", "headers": ["<a@b>"], "by_header": True}],
+            flagged=True,
+        ).build()
+        assert "DISCARD_MAILBOXES" in script
+        for name in ("trash", "junk", "deleted messages", "spam"):
+            assert f'"{name}"' in script
+
+    def test_header_is_retired_only_after_a_successful_apply(self):
+        """Retiring on match meant a failed apply consumed the header
+        and no later mailbox was tried."""
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_read(
+            [{"account": "W", "headers": ["<a@b>"], "by_header": True}], True
+        ).build()
+        applied = script.index("r = applyByHeader")
+        retired = script.index("remaining.delete(target)")
+        assert applied < retired
+
+    @pytest.mark.asyncio
+    async def test_recovery_lookup_is_scoped_to_the_resolved_mailbox(self):
+        """Unscoped, get_rfc822_id can return another message's header
+        (ids are unique per mailbox only) — and we'd flag that message."""
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.has_usable_index.return_value = True
+        mgr.find_email_location.return_value = ("uuid-work", "INBOX")
+        mgr.get_rfc822_id.return_value = "<moved@x>"
+        amap = _mock_acct_map()
+
+        async def fake_exec(script, **kw):
+            if '"by_header": true' in script:
+                return {
+                    "updated": ["<moved@x>"],
+                    "unchanged": [],
+                    "not_found": [],
+                }
+            return {"updated": [], "unchanged": [], "not_found": [5]}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            await set_flag(5, color="red")
+
+        # Scope must be passed, not omitted.
+        args = mgr.get_rfc822_id.call_args[0]
+        assert args[0] == 5
+        assert args[1] == "uuid-work"
+        assert args[2] == "INBOX"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_header_is_not_credited_to_every_id(self):
+        """Two ids sharing one header: JXA writes ONE copy, so crediting
+        both would report a write that never happened."""
+
+        def locate(mid, account=None, mailbox=None):
+            return ("uuid-work", "INBOX" if mid == 1 else "Archive")
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.has_usable_index.return_value = True
+        mgr.find_email_location.side_effect = locate
+        mgr.get_rfc822_id.return_value = "<dup@x>"  # same header for both
+        amap = _mock_acct_map()
+        calls = []
+
+        async def fake_exec(script, **kw):
+            calls.append(script)
+            return {"updated": [], "unchanged": [], "not_found": [1, 2]}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            r = await set_flag([1, 2], color="red")
+
+        assert set(r["not_found"]) == {1, 2}
+        assert r["updated"] == []
+        # Ambiguous -> no recovery attempt at all.
+        assert not any('"by_header": true' in s for s in calls)
+
+    @pytest.mark.asyncio
+    async def test_located_write_failure_still_buckets_every_id(self):
+        """The contract is exactly-once bucketing; a raising osascript
+        must not leave ids in no bucket at all."""
+        mgr = _mock_index(location=("uuid-work", "INBOX"))
+        mgr.get_rfc822_id.return_value = None
+        amap = _mock_acct_map()
+
+        async def boom(script, **kw):
+            raise TimeoutError("osascript wedged")
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=boom,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_read_status
+
+            r = await set_read_status([1, 2])
+
+        assert set(r["not_found"]) == {1, 2}
+
+    def test_located_write_has_a_bounded_timeout(self):
+        from apple_mail_mcp.server import WRITE_TIMEOUT
+
+        assert 5 <= WRITE_TIMEOUT <= 300
+
+    def test_recovery_gets_a_larger_budget_than_the_id_scan(self):
+        """Header scans fetch strings, not ints — the 15s id-scan budget
+        would make recovery time out exactly when it is needed."""
+        from apple_mail_mcp.server import RECOVERY_TIMEOUT, STRATEGY3_TIMEOUT
+
+        assert RECOVERY_TIMEOUT > STRATEGY3_TIMEOUT
+
+    # --- config validation -----------------------------------------
+
+    def test_zero_size_limit_is_rejected_in_toml(self, tmp_path, monkeypatch):
+        import apple_mail_mcp.config as cfg
+
+        f = tmp_path / "config.toml"
+        f.write_text("config_version = 1\n[index]\nmax_email_mb = 0\n")
+        monkeypatch.setattr(cfg, "CONFIG_FILE_PATH", f)
+        cfg._invalidate_config_cache()
+        try:
+            with pytest.raises(cfg.ConfigError, match="must be > 0"):
+                cfg._load_config_file()
+        finally:
+            cfg._invalidate_config_cache()
+
+    def test_zero_size_limit_from_env_falls_back_to_default(self, monkeypatch):
+        """0 would skip every message and flood the DLQ."""
+        import apple_mail_mcp.config as cfg
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "0")
+        assert cfg.get_index_max_email_mb() == 25.0
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "-5")
+        assert cfg.get_index_max_email_mb() == 25.0
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "nonsense")
+        assert cfg.get_index_max_email_mb() == 25.0
+
+    # --- skip accounting across all three paths --------------------
+
+    def test_all_index_paths_record_oversized_skips(self):
+        """The build recorded skips; sync and watcher dropped them."""
+        from pathlib import Path as _P
+
+        for mod in ("sync", "watcher"):
+            src = _P(f"src/apple_mail_mcp/index/{mod}.py").read_text()
+            assert "emlx_too_large" in src, mod
+            assert "SKIP_REASON_TOO_LARGE" in src, mod
+
+    def test_skip_row_matches_what_the_counter_queries(self):
+        from apple_mail_mcp.index.schema import (
+            SKIP_REASON_TOO_LARGE,
+            skip_row,
+        )
+
+        row = skip_row("/p", "acct", "INBOX", SKIP_REASON_TOO_LARGE)
+        # count_skipped_too_large matches error_message = 'too_large'
+        assert row[4] == "too_large"

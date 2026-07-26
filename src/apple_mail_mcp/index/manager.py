@@ -45,21 +45,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class _SkipReason(Exception):
-    """Carries a skip reason into the DLQ's error_type/message columns.
-
-    The DLQ records failures as exceptions; a deliberate skip is not an
-    exception but must be recorded the same way, so it stays visible.
-    """
-
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason
-
-    def __str__(self) -> str:
-        return self.reason
-
-
 @dataclass
 class IndexStats:
     """Statistics about the search index."""
@@ -117,6 +102,10 @@ class IndexManager:
         self._local = threading.local()
         self._open_conns: list[sqlite3.Connection] = []
         self._conn_lock = threading.Lock()
+        # SQLite allows a single writer. A build and a sync running at
+        # once fight over it: one wipes rows the other just wrote, and
+        # the loser dies on "database is locked". Both take this lock.
+        self._write_lock = threading.Lock()
         self._watcher: IndexWatcher | None = None
         self._watcher_callback: Callable[[int, int], None] | None = None
         # (count, expiry_monotonic) — None until first successful read.
@@ -452,55 +441,71 @@ class IndexManager:
         # Mark the build as running before the first thing that can
         # fail, so the status tool can distinguish "never started",
         # "running" and "failed with this error".
+        # Only one build or sync may touch the database at a time.
+        # SQLite gives us a single writer; two concurrent rebuilds would
+        # each DELETE the other's rows. Acquired non-blocking so a
+        # second caller is told "already running" instead of queueing.
+        if not self._write_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "An index build or sync is already running; "
+                "wait for it to finish."
+            )
+
+        # Everything below runs inside try/finally: the flag, the
+        # dropped triggers and the emptied tables must be restored on
+        # EVERY exit path. A failure between here and the bulk loop used
+        # to leave `_building` stuck True (the server then reported
+        # "building" forever) and the FTS triggers permanently dropped
+        # (new mail silently stopped entering the search index).
         self._building = True
         # Phases are reported so a slow preparation step is never
         # mistaken for a hang.
         self._mark_progress("clearing")
-        try:
-            # Verify we can access the mail directory
-            mail_dir = find_mail_directory()
-        except Exception as e:
-            self._building = False
-            self._last_error = f"{type(e).__name__}: {e}"
-            raise
 
-        # Resolve excluded account names -> UUIDs (one JXA call, only
-        # when exclusions are configured) so the JXA-free disk walk can
-        # skip whole accounts. Excluded accounts never enter the index.
-        exclude_account_uuids = self._resolve_exclusions()
-
-        conn = self._get_conn()
-        max_per_mailbox = get_index_max_emails()
-
-        # Track counts per mailbox to enforce limits
-        mailbox_counts: dict[tuple[str, str], int] = {}
-        capped_mailboxes: set[tuple[str, str]] = set()
-        total_indexed = 0
-
-        # Drop the FTS triggers BEFORE clearing, not after. With
-        # `emails_ad` still attached, `DELETE FROM emails` fires one
-        # FTS5 delete per row — on a 60k index that is minutes of work
-        # during which nothing is written, and it is entirely wasted:
-        # the FTS content is rebuilt from scratch at the end anyway.
-        conn.execute("DROP TRIGGER IF EXISTS emails_ai")
-        conn.execute("DROP TRIGGER IF EXISTS emails_ad")
-        conn.execute("DROP TRIGGER IF EXISTS emails_au")
-
-        # Clear existing data for rebuild
-        self._mark_progress("clearing")
-        conn.execute("DELETE FROM attachments")
-        conn.execute("DELETE FROM emails")
-        conn.execute("DELETE FROM sync_state")
-        # Empty the FTS index in a single operation instead of the
-        # per-row deletes the trigger would have done.
-        conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('delete-all')")
-
+        conn = None
         batch: list[tuple] = []
         # Deferred attachment rows: (email_tuple_index, attachments)
         batch_attachments: list[tuple[int, list]] = []
         batch_size = 500
+        mailbox_counts: dict[tuple[str, str], int] = {}
+        capped_mailboxes: set[tuple[str, str]] = set()
+        total_indexed = 0
 
         try:
+            # Verify we can access the mail directory
+            try:
+                mail_dir = find_mail_directory()
+            except Exception as e:
+                self._last_error = f"{type(e).__name__}: {e}"
+                raise
+
+            # Resolve excluded account names -> UUIDs (one JXA call,
+            # only when exclusions are configured) so the JXA-free disk
+            # walk can skip whole accounts. Excluded accounts never
+            # enter the index.
+            exclude_account_uuids = self._resolve_exclusions()
+
+            conn = self._get_conn()
+            max_per_mailbox = get_index_max_emails()
+
+            # Drop the FTS triggers BEFORE clearing, not after. With
+            # `emails_ad` still attached, `DELETE FROM emails` fires one
+            # FTS5 delete per row — on a 60k index that is minutes of
+            # work during which nothing is written, and it is entirely
+            # wasted: the FTS content is rebuilt from scratch below.
+            conn.execute("DROP TRIGGER IF EXISTS emails_ai")
+            conn.execute("DROP TRIGGER IF EXISTS emails_ad")
+            conn.execute("DROP TRIGGER IF EXISTS emails_au")
+
+            # Clear existing data for rebuild
+            conn.execute("DELETE FROM attachments")
+            conn.execute("DELETE FROM emails")
+            conn.execute("DELETE FROM sync_state")
+            # Empty the FTS index in a single operation instead of the
+            # per-row deletes the trigger would have done.
+            conn.execute(
+                "INSERT INTO emails_fts(emails_fts) VALUES('delete-all')"
+            )
 
             def _record_skip(path: Path, reason: str) -> None:
                 """Never drop a message without a trace: a skipped file
@@ -508,11 +513,11 @@ class IndexManager:
                 gap between disk and index counts."""
                 try:
                     acct, mbox = _infer_account_mailbox(path, mail_dir)
-                    self.record_parse_failure(
-                        str(path),
-                        acct,
-                        mbox,
-                        _SkipReason(reason),
+                    from .schema import RECORD_PARSE_FAILURE_SQL, skip_row
+
+                    conn.execute(
+                        RECORD_PARSE_FAILURE_SQL,
+                        skip_row(str(path), acct, mbox, reason),
                     )
                 except Exception:
                     logger.debug("Could not record skip for %s", path)
@@ -574,95 +579,110 @@ class IndexManager:
                     batch = []
                     batch_attachments = []
 
+        except BaseException:
+            # Abandon whatever the failed run had open, so the write
+            # lock is not held for the rest of the process lifetime.
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    logger.debug("rollback after failed build failed")
+            raise
         finally:
             # The build is no longer running, however it ended. Set
             # before the flush so a failure in cleanup can't leave the
             # status tool reporting a phantom in-progress build.
             self._building = False
             self._build_progress = None
+            self._write_lock.release()
 
-            # Flush any remaining partial batch (crash-safe)
-            if batch:
-                self._flush_batch(conn, batch, batch_attachments)
-                total_indexed += len(batch)
+            # Nothing was opened (e.g. Mail unreadable): no schema
+            # state to restore. Guarded with a conditional rather than
+            # an early return — returning from `finally` would swallow
+            # the exception that brought us here.
+            if conn is not None:
+                # Flush any remaining partial batch (crash-safe)
+                if batch:
+                    self._flush_batch(conn, batch, batch_attachments)
+                    total_indexed += len(batch)
 
-            # Update sync state for whatever we managed to index
-            if mailbox_counts:
-                now = datetime.now().isoformat()
-                for (account, mailbox), count in mailbox_counts.items():
-                    conn.execute(
-                        """INSERT OR REPLACE INTO sync_state
-                           (account, mailbox, last_sync, message_count)
-                           VALUES (?, ?, ?, ?)""",
-                        (account, mailbox, now, count),
+                # Update sync state for whatever we managed to index
+                if mailbox_counts:
+                    now = datetime.now().isoformat()
+                    for (account, mailbox), count in mailbox_counts.items():
+                        conn.execute(
+                            """INSERT OR REPLACE INTO sync_state
+                             (account, mailbox, last_sync, message_count)
+                             VALUES (?, ?, ?, ?)""",
+                            (account, mailbox, now, count),
+                        )
+                    conn.commit()
+
+                # Re-enable triggers BEFORE rebuilding FTS to close the
+                # watcher race condition: if the file watcher (or any other
+                # writer) inserts a row after the bulk loop ends but before
+                # the FTS rebuild — or between rebuild and trigger
+                # recreation in the original ordering — that row would land
+                # in `emails` but never enter `emails_fts`. By recreating
+                # triggers first, any concurrent INSERT after this point
+                # fires the trigger normally; the subsequent FTS rebuild
+                # then re-syncs everything in `emails`, double-covering rows
+                # added during the rebuild call itself.
+                conn.executescript("""
+                  CREATE TRIGGER IF NOT EXISTS emails_ai
+                  AFTER INSERT ON emails BEGIN
+                      INSERT INTO emails_fts(rowid, subject, sender, content)
+                      VALUES (new.rowid, new.subject, new.sender, new.content);
+                  END;
+
+                  CREATE TRIGGER IF NOT EXISTS emails_ad
+                  AFTER DELETE ON emails BEGIN
+                      INSERT INTO emails_fts(
+                          emails_fts, rowid, subject, sender, content
+                      ) VALUES(
+                          'delete', old.rowid, old.subject,
+                          old.sender, old.content
+                      );
+                  END;
+
+                  CREATE TRIGGER IF NOT EXISTS emails_au
+                  AFTER UPDATE ON emails BEGIN
+                      INSERT INTO emails_fts(
+                          emails_fts, rowid, subject, sender, content
+                      ) VALUES(
+                          'delete', old.rowid, old.subject,
+                          old.sender, old.content
+                      );
+                      INSERT INTO emails_fts(rowid, subject, sender, content)
+                      VALUES (new.rowid, new.subject, new.sender, new.content);
+                  END;
+              """)
+
+                # Rebuild FTS index (must run even if scan crashed
+                # mid-iteration, otherwise emails table has rows
+                # but FTS5 is empty)
+                if total_indexed > 0:
+                    if progress_callback:
+                        msg = "Building search index..."
+                        progress_callback(total_indexed, total_indexed, msg)
+
+                    rebuild_fts_index(conn)
+                    optimize_fts_index(conn)
+
+                # Log cap warnings (aggregate summary)
+                if capped_mailboxes:
+                    logger.warning(
+                        "%d mailbox(es) hit the per-mailbox cap (%d). "
+                        "Increase APPLE_MAIL_INDEX_MAX_EMAILS to index more.",
+                        len(capped_mailboxes),
+                        max_per_mailbox,
                     )
-                conn.commit()
-
-            # Re-enable triggers BEFORE rebuilding FTS to close the
-            # watcher race condition: if the file watcher (or any other
-            # writer) inserts a row after the bulk loop ends but before
-            # the FTS rebuild — or between rebuild and trigger
-            # recreation in the original ordering — that row would land
-            # in `emails` but never enter `emails_fts`. By recreating
-            # triggers first, any concurrent INSERT after this point
-            # fires the trigger normally; the subsequent FTS rebuild
-            # then re-syncs everything in `emails`, double-covering rows
-            # added during the rebuild call itself.
-            conn.executescript("""
-                CREATE TRIGGER IF NOT EXISTS emails_ai
-                AFTER INSERT ON emails BEGIN
-                    INSERT INTO emails_fts(rowid, subject, sender, content)
-                    VALUES (new.rowid, new.subject, new.sender, new.content);
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS emails_ad
-                AFTER DELETE ON emails BEGIN
-                    INSERT INTO emails_fts(
-                        emails_fts, rowid, subject, sender, content
-                    ) VALUES(
-                        'delete', old.rowid, old.subject,
-                        old.sender, old.content
-                    );
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS emails_au
-                AFTER UPDATE ON emails BEGIN
-                    INSERT INTO emails_fts(
-                        emails_fts, rowid, subject, sender, content
-                    ) VALUES(
-                        'delete', old.rowid, old.subject,
-                        old.sender, old.content
-                    );
-                    INSERT INTO emails_fts(rowid, subject, sender, content)
-                    VALUES (new.rowid, new.subject, new.sender, new.content);
-                END;
-            """)
-
-            # Rebuild FTS index (must run even if scan crashed
-            # mid-iteration, otherwise emails table has rows
-            # but FTS5 is empty)
-            if total_indexed > 0:
-                if progress_callback:
-                    msg = "Building search index..."
-                    progress_callback(total_indexed, total_indexed, msg)
-
-                rebuild_fts_index(conn)
-                optimize_fts_index(conn)
-
-            # Log cap warnings (aggregate summary)
-            if capped_mailboxes:
-                logger.warning(
-                    "%d mailbox(es) hit the per-mailbox cap (%d). "
-                    "Increase APPLE_MAIL_INDEX_MAX_EMAILS to index more.",
-                    len(capped_mailboxes),
-                    max_per_mailbox,
-                )
-                if progress_callback:
-                    msg = (
-                        f"Warning: {len(capped_mailboxes)} mailbox(es) "
-                        f"hit cap ({max_per_mailbox})"
-                    )
-                    progress_callback(total_indexed, total_indexed, msg)
+                    if progress_callback:
+                        msg = (
+                            f"Warning: {len(capped_mailboxes)} mailbox(es) "
+                            f"hit cap ({max_per_mailbox})"
+                        )
+                        progress_callback(total_indexed, total_indexed, msg)
 
         # Disk inventory just changed — drop the cache so the next
         # status call reflects truth.
@@ -719,6 +739,17 @@ class IndexManager:
         Returns:
             Number of changes (added + deleted + moved)
         """
+        if not self._write_lock.acquire(blocking=False):
+            logger.info("Skipping sync: a build or sync is already running")
+            return 0
+
+        try:
+            return self._sync_updates_locked(progress_callback)
+        finally:
+            self._write_lock.release()
+
+    def _sync_updates_locked(self, progress_callback=None) -> int:
+        """Body of :meth:`sync_updates`, holding the write lock."""
         from .disk import find_mail_directory
         from .sync import sync_from_disk
 
@@ -918,6 +949,11 @@ class IndexManager:
         elsewhere — routinely, since most accounts are open on several
         devices. The header survives that, so it is the handle to fall
         back on once a ROWID stops resolving.
+
+        Scope with ``account``/``mailbox`` whenever the caller knows
+        them: ``message_id`` is unique only within a mailbox, so an
+        unscoped lookup can return a *different* message's header — and
+        the caller would then go and modify that unrelated message.
 
         Returns None when unknown (row absent, or indexed before schema
         v6 and not yet re-indexed).

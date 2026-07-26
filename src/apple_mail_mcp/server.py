@@ -128,6 +128,17 @@ MAX_RESULT_LIMIT = 200
 # also bounds a single script's work.
 MAX_WRITE_BATCH = 500
 
+# The header-recovery scan batch-fetches a Message-ID string per message
+# per mailbox, which is heavier than the integer-id scan Strategy 3 does
+# — its 15s budget would make recovery time out exactly on the large
+# mailboxes it exists for.
+RECOVERY_TIMEOUT = _clamped_env_int("APPLE_MAIL_RECOVERY_TIMEOUT", 60, 5, 300)
+
+# Ceiling for a located (precisely targeted) write. Well under the
+# 120s executor default so a wedged Mail.app cannot hold an MCP call
+# past most client timeouts.
+WRITE_TIMEOUT = _clamped_env_int("APPLE_MAIL_WRITE_TIMEOUT", 60, 5, 300)
+
 
 def _validate_pagination(limit: int, offset: int = 0) -> tuple[int, int]:
     """Clamp pagination params to sane bounds (clamp, don't raise —
@@ -640,14 +651,19 @@ async def _resolve_write_targets(
     Strategy 3) so writes work with no index at all. Only ids with no
     visible account to scan land in ``not_found``.
 
-    Returns ``(groups, not_found, skipped_hidden)``. Located groups are
-    ``{"account", "mailbox", "ids"}``; the optional scan group is
-    ``{"account", "ids", "scan": True}``.
+    Returns ``(groups, not_found, skipped_hidden, placed)`` where
+    ``placed`` maps each id to the ``(account_uuid, mailbox)`` the index
+    resolved it to. Recovery needs that scope: a Mail.app id is unique
+    only within a mailbox, so looking its stable header up unscoped can
+    return a different message's header entirely.
+
+    Located groups are ``{"account", "mailbox", "ids"}``; the optional
+    scan group is ``{"account", "ids", "scan": True}``.
     """
     # Explicit hidden account: refuse the whole batch up front, exactly
     # as the read tools do at their entry gate.
     if _hidden_account(account):
-        return [], [], list(ids)
+        return [], [], list(ids), {}
 
     manager = _get_index_manager()
     has_index = manager.has_index()
@@ -674,6 +690,7 @@ async def _resolve_write_targets(
     scan_ids: list[int] = []
     not_found: list[int] = []
     skipped_hidden: list[int] = []
+    placed: dict[int, tuple[str, str]] = {}
 
     for mid in ids:
         located: tuple[str, str] | None = None
@@ -687,6 +704,7 @@ async def _resolve_write_targets(
                     skipped_hidden.append(mid)
                     continue
                 located = (acct_map.uuid_to_name(acct_uuid), mb_name)
+                placed[mid] = (acct_uuid, mb_name)
         if located is None and hint_location is not None:
             located = hint_location
         if located is None:
@@ -718,7 +736,7 @@ async def _resolve_write_targets(
                 {"account": scan_account, "ids": scan_ids, "scan": True}
             )
 
-    return groups, not_found, skipped_hidden
+    return groups, not_found, skipped_hidden, placed
 
 
 async def _apply_write(
@@ -736,7 +754,7 @@ async def _apply_write(
     ``groups -> WriteBuilder`` (the only per-tool difference).
     """
     ids = _normalize_message_ids(message_ids)
-    groups, not_found, skipped_hidden = await _resolve_write_targets(
+    groups, not_found, skipped_hidden, placed = await _resolve_write_targets(
         ids, account, mailbox
     )
 
@@ -746,10 +764,19 @@ async def _apply_write(
     unchanged: list[int] = []
 
     if located:
-        res = await execute_with_core_async(make_builder(located).build())
-        updated += [int(x) for x in res.get("updated", [])]
-        unchanged += [int(x) for x in res.get("unchanged", [])]
-        not_found += [int(x) for x in res.get("not_found", [])]
+        try:
+            res = await execute_with_core_async(
+                make_builder(located).build(), timeout=WRITE_TIMEOUT
+            )
+            updated += [int(x) for x in res.get("updated", [])]
+            unchanged += [int(x) for x in res.get("unchanged", [])]
+            not_found += [int(x) for x in res.get("not_found", [])]
+        except Exception as exc:
+            # The contract is that every id lands in exactly one bucket.
+            # Letting this raise would leave the caller with no idea
+            # which writes did or did not happen.
+            logger.warning("located write failed: %s", exc, exc_info=True)
+            not_found += [i for g in located for i in g["ids"]]
 
     if scan:
         builder = make_builder(scan)
@@ -773,7 +800,7 @@ async def _apply_write(
     # survives moves, and apply there.
     if not_found:
         recovered, still_missing, moved = await _retry_by_stable_id(
-            not_found, account, make_builder
+            not_found, account, make_builder, placed
         )
         updated += recovered["updated"]
         unchanged += recovered["unchanged"]
@@ -814,6 +841,7 @@ async def _retry_by_stable_id(
     missing: list[int],
     account: str | None,
     make_builder,
+    placed: dict[int, tuple[str, str]],
 ) -> tuple[dict[str, list[int]], list[int], list[int]]:
     """Re-apply a failed write using the RFC822 Message-ID.
 
@@ -832,14 +860,37 @@ async def _retry_by_stable_id(
     if not manager.has_index():
         return empty, missing, []
 
-    # Map each dead id to its stable header (skip ids indexed before
-    # schema v6, which have none on record).
+    # Map each dead id to its stable header. SCOPE the lookup to where
+    # the index placed that id: a Mail.app id is unique only within a
+    # mailbox, so an unscoped lookup can return a different message's
+    # header — and we would then modify that unrelated message.
     header_by_id: dict[int, str] = {}
     for mid in missing:
-        header = await asyncio.to_thread(manager.get_rfc822_id, mid)
+        scope = placed.get(mid)
+        if scope is None:
+            # Never resolved to a location, so there is nothing to scope
+            # by and no way to tell copies apart. Leave it missing.
+            continue
+        acct_uuid, mbox = scope
+        header = await asyncio.to_thread(
+            manager.get_rfc822_id, mid, acct_uuid, mbox
+        )
         if header:
             header_by_id[mid] = header
     if not header_by_id:
+        return empty, missing, []
+
+    # One header may belong to several requested ids (the same mail
+    # filed in two mailboxes). The scan applies to ONE copy per header,
+    # so crediting every id sharing it would report writes that never
+    # happened. Recover only unambiguous headers.
+    ids_per_header: dict[str, list[int]] = {}
+    for mid, header in header_by_id.items():
+        ids_per_header.setdefault(header, []).append(mid)
+    unambiguous = {
+        h: ids[0] for h, ids in ids_per_header.items() if len(ids) == 1
+    }
+    if not unambiguous:
         return empty, missing, []
 
     target_account = await _resolve_visible_account(account)
@@ -849,11 +900,17 @@ async def _retry_by_stable_id(
     if excluded and (target_account is None or target_account in excluded):
         return empty, missing, []
 
+    # Point the scan at the mailboxes the index knows for these
+    # messages, so a re-filed copy is preferred over any other.
+    prefer = sorted(
+        {placed[mid][1] for mid in unambiguous.values() if mid in placed}
+    )
     builder = make_builder(
         [
             {
                 "account": target_account,
-                "headers": sorted(set(header_by_id.values())),
+                "headers": sorted(unambiguous),
+                "prefer_mailboxes": prefer,
                 "by_header": True,
             }
         ]
@@ -861,21 +918,19 @@ async def _retry_by_stable_id(
     builder.max_scan_mailboxes = STRATEGY3_MAX_MAILBOXES
     try:
         res = await execute_with_core_async(
-            builder.build(), timeout=STRATEGY3_TIMEOUT
+            builder.build(), timeout=RECOVERY_TIMEOUT
         )
     except Exception as exc:
         logger.debug("stable-id recovery failed: %s", exc, exc_info=True)
         return empty, missing, []
 
-    # JXA answers in headers; map back to the ids the caller passed.
-    ids_for = {}
-    for mid, header in header_by_id.items():
-        ids_for.setdefault(header, []).append(mid)
-
+    # JXA answers in headers; map each back to its single id.
     results: dict[str, list[int]] = {"updated": [], "unchanged": []}
     for bucket in ("updated", "unchanged"):
         for header in res.get(bucket, []):
-            results[bucket].extend(ids_for.get(header, []))
+            mid = unambiguous.get(header)
+            if mid is not None:
+                results[bucket].append(mid)
 
     recovered = set(results["updated"]) | set(results["unchanged"])
     still_missing = [m for m in missing if m not in recovered]
@@ -2036,6 +2091,9 @@ async def refresh_index(full: bool = False) -> dict:
         def _build() -> None:
             try:
                 manager.build_from_disk()
+            except RuntimeError as exc:
+                # Another build or sync holds the write lock.
+                logger.info("Index build not started: %s", exc)
             except Exception:
                 logger.warning("Background index build failed", exc_info=True)
 

@@ -21,15 +21,17 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .disk import find_mail_directory, parse_emlx
+from .disk import emlx_too_large, find_mail_directory, parse_emlx
 from .schema import (
     CLEAR_PARSE_FAILURE_SQL,
     INSERT_EMAIL_SQL,
     RECORD_PARSE_FAILURE_SQL,
+    SKIP_REASON_TOO_LARGE,
     create_connection,
     email_to_row,
     insert_attachments,
     parse_failure_row,
+    skip_row,
 )
 
 if TYPE_CHECKING:
@@ -300,6 +302,23 @@ class IndexWatcher:
                 # via the live watcher.
                 if account in self._exclude_account_uuids:
                     continue
+                # Oversized files never parse; record the skip instead
+                # of retrying three times and dropping them silently.
+                if emlx_too_large(path):
+                    try:
+                        conn.execute(
+                            RECORD_PARSE_FAILURE_SQL,
+                            skip_row(
+                                str(path),
+                                account,
+                                mailbox,
+                                SKIP_REASON_TOO_LARGE,
+                            ),
+                        )
+                    except sqlite3.Error:
+                        logger.debug("Could not record skip for %s", path)
+                    continue
+
                 email = None
                 last_error: BaseException | None = None
 

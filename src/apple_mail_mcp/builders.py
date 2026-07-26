@@ -351,6 +351,11 @@ class WriteBuilder:
         return f"""
 const groups = {groups_json};
 const MAX_SCAN = {max_scan};
+// Never apply a recovered write in a discard mailbox.
+const DISCARD_MAILBOXES = [
+    "trash", "deleted items", "deleted messages", "bin",
+    "junk", "junk email", "spam",
+];
 const updated = [];
 const unchanged = [];
 const notFound = [];
@@ -407,7 +412,10 @@ for (const g of groups) {{
     try {{
         account = MailCore.getAccount(g.account);
     }} catch (e) {{
-        for (const id of g.ids) notFound.push(id);
+        // Group shapes differ: located/scan carry `ids`, recovery
+        // carries `headers`. Reading the wrong one throws INSIDE a
+        // catch, which escapes and kills the whole batch.
+        for (const t of (g.ids || g.headers || [])) notFound.push(t);
         continue;
     }}
 
@@ -424,26 +432,46 @@ for (const g of groups) {{
             continue;
         }}
         const remaining = new Set(g.headers);
-        const limit = Math.min(mailboxes.length, MAX_SCAN);
+        // Prefer the mailboxes the index already associates with these
+        // messages, and never write into a discard mailbox: the same
+        // message often still exists in Trash after being re-filed, and
+        // flagging that copy leaves the visible one untouched.
+        const preferred = g.prefer_mailboxes || [];
+        const ordered = [];
+        const rest = [];
+        for (let m = 0; m < mailboxes.length; m++) {{
+            let nm = "";
+            try {{ nm = String(mailboxes[m].name()); }} catch (e) {{}}
+            if (DISCARD_MAILBOXES.indexOf(nm.toLowerCase()) !== -1) continue;
+            if (preferred.indexOf(nm) !== -1) ordered.push(mailboxes[m]);
+            else rest.push(mailboxes[m]);
+        }}
+        const candidates = ordered.concat(rest);
+        const limit = Math.min(candidates.length, MAX_SCAN);
         for (let m = 0; m < limit && remaining.size > 0; m++) {{
             let headers;
             try {{
-                headers = mailboxes[m].messages.messageId();
+                headers = candidates[m].messages.messageId();
             }} catch (e) {{
                 continue;  // skip inaccessible mailbox
             }}
             for (const target of Array.from(remaining)) {{
                 const idx = headers.indexOf(target);
                 if (idx === -1) continue;
-                remaining.delete(target);
+                let r = "failed";
                 try {{
-                    const r = applyByHeader(
-                        mailboxes[m].messages, idx, target);
-                    if (r === "updated") updated.push(target);
-                    else if (r === "unchanged") unchanged.push(target);
-                    else notFound.push(target);
+                    r = applyByHeader(candidates[m].messages, idx, target);
                 }} catch (e) {{
-                    notFound.push(target);
+                    r = "failed";
+                }}
+                // Only retire the header once it actually landed;
+                // otherwise a later mailbox may still hold a good copy.
+                if (r === "updated") {{
+                    remaining.delete(target);
+                    updated.push(target);
+                }} else if (r === "unchanged") {{
+                    remaining.delete(target);
+                    unchanged.push(target);
                 }}
             }}
         }}

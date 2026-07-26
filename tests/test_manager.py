@@ -1042,3 +1042,88 @@ class TestRebuildClearsCheaply:
 
         assert m.indexed_email_count() == 0
         assert elapsed < 2.0, f"clearing took {elapsed:.1f}s"
+
+
+class TestBuildSyncMutualExclusion:
+    """A build and a sync must never run against the DB at once."""
+
+    def test_second_build_is_refused_while_one_holds_the_lock(
+        self, temp_db_path
+    ):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        assert m._write_lock.acquire(blocking=False)
+        try:
+            with pytest.raises(RuntimeError, match="already running"):
+                m.build_from_disk()
+        finally:
+            m._write_lock.release()
+
+    def test_sync_is_skipped_while_a_build_holds_the_lock(self, temp_db_path):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        assert m._write_lock.acquire(blocking=False)
+        try:
+            assert m.sync_updates() == 0  # skipped, not crashed
+        finally:
+            m._write_lock.release()
+
+    def test_lock_is_released_when_the_build_fails(self, temp_db_path):
+        """A failure used to leave _building stuck True forever, so the
+        server reported 'building' until restart."""
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        with patch(
+            "apple_mail_mcp.index.disk.find_mail_directory",
+            side_effect=PermissionError("no FDA"),
+        ):
+            with pytest.raises(PermissionError):
+                m.build_from_disk()
+
+        assert m.is_building() is False
+        assert m.build_progress() is None
+        assert m._write_lock.acquire(blocking=False)
+        m._write_lock.release()
+
+    def test_failed_build_leaves_the_fts_triggers_intact(
+        self, temp_db_path, tmp_path
+    ):
+        """Triggers are dropped before the tables are cleared; if that
+        window is unprotected, a failure permanently stops new mail from
+        entering the search index."""
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        conn = m._get_conn()
+
+        def triggers() -> set:
+            return {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+
+        assert {"emails_ai", "emails_ad", "emails_au"} <= triggers()
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                side_effect=RuntimeError("boom mid-scan"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            m.build_from_disk()
+
+        assert {"emails_ai", "emails_ad", "emails_au"} <= triggers()

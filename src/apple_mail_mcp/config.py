@@ -150,6 +150,12 @@ def _validate(data: dict, path: Path) -> None:
             f"{path}: `[index] max_emails` must be >= 0, "
             f"got {index['max_emails']}."
         )
+    if "max_email_mb" in index and index["max_email_mb"] <= 0:
+        raise ConfigError(
+            f"{path}: `[index] max_email_mb` must be > 0, "
+            f"got {index['max_email_mb']}. A value of 0 would skip every "
+            f"message; omit the key to use the default."
+        )
     if "staleness_hours" in index and index["staleness_hours"] < 0:
         raise ConfigError(
             f"{path}: `[index] staleness_hours` must be >= 0, "
@@ -302,9 +308,16 @@ def get_index_max_email_mb() -> float:
     """
     env = os.environ.get("APPLE_MAIL_INDEX_MAX_EMAIL_MB")
     if env is not None and env != "":
-        return float(env)
+        try:
+            parsed = float(env)
+        except ValueError:
+            parsed = 0.0
+        # A non-positive ceiling would skip every message and flood the
+        # dead letter queue; treat it as "unset" rather than obey it.
+        if parsed > 0:
+            return parsed
     val = _from_toml("index", "max_email_mb")
-    if val is not None:
+    if val is not None and float(val) > 0:
         return float(val)
     return 25.0
 
