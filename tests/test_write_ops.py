@@ -2147,3 +2147,160 @@ class TestRunningSyncIsVisible:
         # Not a fault — no fresh disk walk, no "problem".
         assert "problem" not in r
         mgr.get_stats.assert_not_called()
+
+
+class TestDiagnosticsAreReachable:
+    """The extension's stderr is a black hole: everything a user needs
+    to diagnose must come back through the status tool."""
+
+    def test_every_build_failure_lands_in_last_error(
+        self, temp_db_path, tmp_path
+    ):
+        """Only the unreadable-mail-dir case used to set last_error, so
+        any other crash left the status reporting "no errors"."""
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                side_effect=RuntimeError("boom mid-scan"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            m.build_from_disk()
+
+        assert "RuntimeError" in (m.last_error or "")
+        assert "boom mid-scan" in m.last_error
+
+    def test_failure_is_also_in_the_event_ring(self, temp_db_path, tmp_path):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                side_effect=RuntimeError("boom"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            m.build_from_disk()
+
+        events = m.recent_events()
+        assert events[0]["level"] == "error"
+        assert "failed" in events[0]["message"].lower()
+        # The start is recorded too, so "did it even begin?" is answerable.
+        assert any("started" in e["message"].lower() for e in events)
+
+    def test_events_are_newest_first_and_bounded(self, temp_db_path):
+        from apple_mail_mcp.index.manager import MAX_EVENTS, IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        for i in range(MAX_EVENTS + 20):
+            m.record_event("info", f"event {i}")
+
+        events = m.recent_events(limit=5)
+        assert len(events) == 5
+        assert events[0]["message"] == f"event {MAX_EVENTS + 19}"
+        assert len(m._events) == MAX_EVENTS  # ring, not a leak
+
+    def test_recording_never_raises(self, temp_db_path):
+        """Diagnostics must not be able to break what they describe."""
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+
+        class Unprintable:
+            def __repr__(self):
+                raise ValueError("nope")
+
+        m.record_event("info", "x", weird=Unprintable())  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_status_carries_events_and_build_identity(self, tmp_path):
+        mgr = MagicMock()
+        mgr.is_building.return_value = False
+        mgr.write_lock_held.return_value = False
+        mgr.has_index.return_value = True
+        mgr.indexed_email_count.return_value = 10
+        mgr.count_skipped_too_large.return_value = 0
+        mgr.count_without_stable_id.return_value = 0
+        mgr.build_progress.return_value = None
+        mgr.last_error = None
+        mgr.recent_events.return_value = [
+            {
+                "at": "2026-07-26T17:20:00",
+                "level": "error",
+                "message": "Index build failed",
+                "error": "OSError: nope",
+            }
+        ]
+        stats = MagicMock()
+        stats.disk_email_count = 10
+        stats.mailbox_count = 1
+        stats.attachment_count = 0
+        stats.db_size_mb = 1.0
+        stats.failed_jobs_count = 0
+        stats.excluded_accounts = []
+        stats.last_sync = None
+        stats.staleness_hours = None
+        mgr.get_stats.return_value = stats
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["recent_events"][0]["message"] == "Index build failed"
+        assert r["server_revision"]
+        assert "log_file" in r
+        assert "source_ref" in r
+
+    def test_log_path_is_configurable_and_disableable(self, monkeypatch):
+        from apple_mail_mcp.config import get_log_path
+
+        monkeypatch.delenv("APPLE_MAIL_LOG_PATH", raising=False)
+        assert get_log_path().name == "server.log"
+
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", "/tmp/custom.log")
+        assert str(get_log_path()) == "/tmp/custom.log"
+
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", "")
+        assert str(get_log_path()) == "."  # falsy -> disabled
+
+    def test_file_log_is_written_and_owner_only(self, tmp_path, monkeypatch):
+        import logging
+
+        from apple_mail_mcp.cli import _setup_file_logging
+
+        target = tmp_path / "sub" / "server.log"
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", str(target))
+        path = _setup_file_logging()
+        try:
+            logging.getLogger("apple_mail_mcp.test").info("hello from test")
+            for h in logging.getLogger("apple_mail_mcp").handlers:
+                h.flush()
+
+            assert path == target
+            assert target.exists()
+            assert "hello from test" in target.read_text()
+            assert oct(target.stat().st_mode)[-3:] == "600"
+        finally:
+            root = logging.getLogger("apple_mail_mcp")
+            for h in list(root.handlers):
+                h.close()
+                root.removeHandler(h)

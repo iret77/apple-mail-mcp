@@ -403,6 +403,12 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # ========== Diagnostics Helpers ==========
 
 
+# Bumped on every shipped change. The package version alone cannot
+# answer "which build is answering me" when a bundle tracks a moving
+# branch — and that question had to be guessed twice.
+SERVER_REVISION = "2026-07-26.1"
+
+
 def _server_version() -> str:
     """Installed package version, or 'unknown' if not resolvable."""
     try:
@@ -418,6 +424,16 @@ def get_index_auto_build_flag() -> bool:
     from .config import get_index_auto_build
 
     return get_index_auto_build()
+
+
+def _log_file_path() -> str:
+    """Where this process writes its log, for the status report."""
+    try:
+        from .config import get_log_path
+
+        return str(get_log_path()) or "(disabled)"
+    except Exception:
+        return "(unknown)"
 
 
 def _install_mode() -> str:
@@ -2247,6 +2263,12 @@ async def get_index_status() -> dict:
         - index_mode ("automatic"/"manual"), install_mode
           ("bundle"/"cli"), server_version, read_only,
           write_tools_enabled: setup and telemetry
+        - recent_events: what the server actually did, newest first
+          (build/sync started, finished, failed). This is the only
+          diagnostic channel a desktop-extension user can reach — quote
+          from it when explaining unexpected behaviour.
+        - server_revision / source_ref / log_file: which build is
+          answering, and where its log is
         - last_error, failed_parse_jobs, last_sync, staleness_hours,
           db_size_mb, excluded_accounts: health details
     """
@@ -2296,6 +2318,9 @@ async def get_index_status() -> dict:
         "sync_running": syncing,
         "install_mode": _install_mode(),
         "server_version": _server_version(),
+        "server_revision": SERVER_REVISION,
+        "source_ref": os.environ.get("APPLE_MAIL_MCP_REF") or "(default)",
+        "log_file": str(_log_file_path()),
         "read_only": get_read_only_mode(),
         "write_tools_enabled": not get_read_only_mode(),
         "index_command": _index_command(),
@@ -2399,6 +2424,9 @@ async def get_index_status() -> dict:
     if next_steps:
         result["next_steps"] = next_steps
     result["user_message"] = user_message
+    # The extension's stderr is unreachable, so this ring is the only
+    # place a user can see what the server just did.
+    result["recent_events"] = manager.recent_events()
     result["assistant_instructions"] = (
         "Relay `user_message` in the user's language, then walk them "
         "through `next_steps` one at a time. Assume no terminal "

@@ -18,6 +18,7 @@ import logging
 import sqlite3
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +44,9 @@ if TYPE_CHECKING:
     from .watcher import IndexWatcher
 
 logger = logging.getLogger(__name__)
+
+# How many lifecycle events to keep in memory for the status tool.
+MAX_EVENTS = 50
 
 
 class IndexBusyError(RuntimeError):
@@ -135,10 +139,48 @@ class IndexManager:
         # phase, "warming up" and "wedged" look identical — both show
         # zero indexed messages.
         self._build_progress: dict | None = None
+        # Ring of recent lifecycle events. The server's stderr is not
+        # visible to a user running it as a desktop extension, so this
+        # is the only channel through which "what just happened?" can
+        # be answered — the status tool reads it.
+        self._events: deque[dict] = deque(maxlen=MAX_EVENTS)
+        self._events_lock = threading.Lock()
 
     def write_lock_held(self) -> bool:
         """True while a build or sync holds the single-writer lock."""
         return self._write_lock.locked()
+
+    def record_event(self, level: str, message: str, **fields) -> None:
+        """Record a lifecycle event and mirror it to the logger.
+
+        Two audiences: the log file for a post-mortem after a restart,
+        and this ring for "what is happening right now", which the
+        status tool surfaces. Never raises — diagnostics must not be
+        able to break the operation they describe.
+        """
+        try:
+            event = {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "level": level,
+                "message": message,
+                **fields,
+            }
+            with self._events_lock:
+                self._events.append(event)
+            logger.log(
+                logging.ERROR if level == "error" else logging.INFO,
+                "%s%s",
+                message,
+                f" {fields}" if fields else "",
+            )
+        except Exception:  # pragma: no cover - diagnostics only
+            pass
+
+    def recent_events(self, limit: int = 20) -> list[dict]:
+        """Most recent lifecycle events, newest first."""
+        with self._events_lock:
+            events = list(self._events)
+        return list(reversed(events[-limit:]))
 
     def is_building(self) -> bool:
         """True while a full index build is running in this process."""
@@ -477,6 +519,7 @@ class IndexManager:
         # Only now has the build truly begun: the lock is held and the
         # state is visible. Callers use this to distinguish a started
         # build from one refused on the first line.
+        self.record_event("info", "Index build started")
         if on_started is not None:
             on_started()
 
@@ -597,7 +640,15 @@ class IndexManager:
                     batch = []
                     batch_attachments = []
 
-        except BaseException:
+        except BaseException as exc:
+            # Record EVERY failure. Only the unreadable-mail-directory
+            # case used to set _last_error, so any other exception left
+            # the status cheerfully reporting "no errors" while the
+            # build was dead.
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self.record_event(
+                "error", "Index build failed", error=self._last_error
+            )
             # Abandon whatever the failed run had open, so the write
             # lock is not held for the rest of the process lifetime.
             if conn is not None:
@@ -691,6 +742,7 @@ class IndexManager:
         # status call reflects truth.
         self.invalidate_disk_count_cache()
         self._last_error = None  # a completed build clears prior failures
+        self.record_event("info", "Index build finished", emails=total_indexed)
         return total_indexed
 
     @staticmethod
@@ -785,13 +837,20 @@ class IndexManager:
         if not self._write_lock.acquire(blocking=False):
             # Distinguishable from "0 changes": the caller must not
             # report a sync that never ran as a successful no-op.
-            logger.info("Skipping sync: a build or sync is already running")
+            self.record_event("info", "Sync skipped: index busy")
             raise IndexBusyError("An index build or sync is already running.")
 
+        self.record_event("info", "Sync started")
         try:
-            return self._sync_updates_locked(progress_callback)
+            changes = self._sync_updates_locked(progress_callback)
+        except BaseException as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self.record_event("error", "Sync failed", error=self._last_error)
+            raise
         finally:
             self._write_lock.release()
+        self.record_event("info", "Sync finished", changes=changes)
+        return changes
 
     def _sync_updates_locked(self, progress_callback=None) -> int:
         """Body of :meth:`sync_updates`, holding the write lock."""
@@ -807,6 +866,11 @@ class IndexManager:
             # why the caller must consult `last_error` before claiming
             # the index is up to date.
             self._last_error = f"{type(e).__name__}: {e}"
+            self.record_event(
+                "error",
+                "Sync could not read Mail (Full Disk Access?)",
+                error=self._last_error,
+            )
             return 0
 
         exclude_account_uuids = self._resolve_exclusions()

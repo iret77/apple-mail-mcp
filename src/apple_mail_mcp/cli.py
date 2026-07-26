@@ -17,6 +17,7 @@ Usage:
     apple-mail-mcp rebuild    # Force rebuild index
 """
 
+import contextlib
 import sys
 import time
 from collections.abc import Callable
@@ -86,6 +87,41 @@ def _progress_bar(current: int, total: int | None, width: int = 40) -> str:
     return f"[{bar}] {pct * 100:.0f}%"
 
 
+def _setup_file_logging() -> Path | None:
+    """Send this process's logs to a file we control.
+
+    Desktop extensions get no reachable stderr, so a build that dies
+    leaves nothing behind without this. Rotating and small: diagnostics
+    must not grow without bound. Returns the active path, or None.
+    """
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    from .config import get_log_path
+
+    path = get_log_path()
+    if not str(path):
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            path, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        root = logging.getLogger("apple_mail_mcp")
+        root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        # Mail paths and subjects can pass through log records.
+        with contextlib.suppress(OSError):
+            path.chmod(0o600)
+        return path
+    except OSError as e:
+        print(f"Warning: could not open log file: {e}", file=sys.stderr)
+        return None
+
+
 def _run_serve(watch: bool = False, read_only: bool = False) -> None:
     """Internal function to run the MCP server."""
     import threading
@@ -98,7 +134,11 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
         set_read_only_mode(True)
         print("Read-only mode enabled", file=sys.stderr)
 
+    log_path = _setup_file_logging()
+
     manager = IndexManager.get_instance()
+    if log_path:
+        manager.record_event("info", f"Server started; logging to {log_path}")
 
     # Clean up old attachment files
     try:
