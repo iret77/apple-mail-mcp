@@ -1309,6 +1309,7 @@ class IndexManager:
             db_path=self._db_path,
             on_update=on_update,
             exclude_account_uuids=self._resolve_exclusions(),
+            write_lock=self._write_lock,
         )
 
         return self._watcher.start()
