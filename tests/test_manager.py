@@ -977,3 +977,68 @@ class TestPerThreadConnections:
         assert failed == []
         # Sees the pre-write snapshot rather than blocking on the writer.
         assert count == 0
+
+
+class TestRebuildClearsCheaply:
+    """Clearing must not fire the FTS trigger once per row."""
+
+    def test_triggers_are_dropped_before_the_delete(self):
+        """Regression: with emails_ad attached, DELETE FROM emails costs
+        one FTS5 delete per row — minutes on a large index, and wasted,
+        since the FTS content is rebuilt at the end."""
+        import inspect
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        src = inspect.getsource(IndexManager.build_from_disk)
+        drop_ad = src.index("DROP TRIGGER IF EXISTS emails_ad")
+        delete_emails = src.index('conn.execute("DELETE FROM emails")')
+        assert drop_ad < delete_emails, (
+            "FTS triggers must be dropped before rows are deleted"
+        )
+
+    def test_fts_is_emptied_in_one_statement(self):
+        import inspect
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        src = inspect.getsource(IndexManager.build_from_disk)
+        assert "VALUES('delete-all')" in src
+
+    def test_clearing_a_populated_index_is_fast(self, temp_db_path):
+        """End-to-end: emptying a populated index must not crawl."""
+        import time as _time
+
+        from apple_mail_mcp.index.manager import IndexManager
+        from apple_mail_mcp.index.schema import INSERT_EMAIL_SQL, email_to_row
+
+        m = IndexManager(db_path=temp_db_path)
+        conn = m._get_conn()
+        for i in range(2000):
+            conn.execute(
+                INSERT_EMAIL_SQL,
+                email_to_row(
+                    {
+                        "id": i,
+                        "subject": f"subject {i}",
+                        "content": "body " * 50,
+                        "message_id_header": f"<{i}@x>",
+                    },
+                    "acct",
+                    "INBOX",
+                ),
+            )
+        conn.commit()
+
+        # Same order the rebuild uses: triggers first, then delete.
+        start = _time.monotonic()
+        conn.execute("DROP TRIGGER IF EXISTS emails_ai")
+        conn.execute("DROP TRIGGER IF EXISTS emails_ad")
+        conn.execute("DROP TRIGGER IF EXISTS emails_au")
+        conn.execute("DELETE FROM emails")
+        conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('delete-all')")
+        conn.commit()
+        elapsed = _time.monotonic() - start
+
+        assert m.indexed_email_count() == 0
+        assert elapsed < 2.0, f"clearing took {elapsed:.1f}s"

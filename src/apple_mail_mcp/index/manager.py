@@ -147,6 +147,7 @@ class IndexManager:
     # minutes with nothing to show, so it gets a longer grace period
     # than the indexing loop, which should tick every few seconds.
     _STALL_SECONDS: ClassVar[dict[str, float]] = {
+        "clearing": 120.0,
         "reading_metadata": 600.0,
         "indexing": 120.0,
     }
@@ -452,8 +453,9 @@ class IndexManager:
         # fail, so the status tool can distinguish "never started",
         # "running" and "failed with this error".
         self._building = True
-        # Nothing is written during metadata reading; say so explicitly.
-        self._mark_progress("reading_metadata")
+        # Phases are reported so a slow preparation step is never
+        # mistaken for a hang.
+        self._mark_progress("clearing")
         try:
             # Verify we can access the mail directory
             mail_dir = find_mail_directory()
@@ -475,15 +477,23 @@ class IndexManager:
         capped_mailboxes: set[tuple[str, str]] = set()
         total_indexed = 0
 
-        # Clear existing data for rebuild
-        conn.execute("DELETE FROM attachments")
-        conn.execute("DELETE FROM emails")
-        conn.execute("DELETE FROM sync_state")
-
-        # Disable triggers during bulk insert for performance
+        # Drop the FTS triggers BEFORE clearing, not after. With
+        # `emails_ad` still attached, `DELETE FROM emails` fires one
+        # FTS5 delete per row — on a 60k index that is minutes of work
+        # during which nothing is written, and it is entirely wasted:
+        # the FTS content is rebuilt from scratch at the end anyway.
         conn.execute("DROP TRIGGER IF EXISTS emails_ai")
         conn.execute("DROP TRIGGER IF EXISTS emails_ad")
         conn.execute("DROP TRIGGER IF EXISTS emails_au")
+
+        # Clear existing data for rebuild
+        self._mark_progress("clearing")
+        conn.execute("DELETE FROM attachments")
+        conn.execute("DELETE FROM emails")
+        conn.execute("DELETE FROM sync_state")
+        # Empty the FTS index in a single operation instead of the
+        # per-row deletes the trigger would have done.
+        conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('delete-all')")
 
         batch: list[tuple] = []
         # Deferred attachment rows: (email_tuple_index, attachments)
@@ -508,6 +518,7 @@ class IndexManager:
                     logger.debug("Could not record skip for %s", path)
 
             files_seen = 0
+            self._mark_progress("reading_metadata")
             for email_data in scan_all_emails(
                 mail_dir,
                 exclude_account_uuids=exclude_account_uuids,
