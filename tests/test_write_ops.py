@@ -3255,3 +3255,83 @@ class TestJxaFailuresCarryTheirReason:
 
         assert result["failed"] == [7]
         assert "Message-ID" in result["hint"]
+
+
+class TestAngleBracketsDoNotBreakIdentity:
+    """`<a@b>` and `a@b` are the same message.
+
+    The .emlx header keeps the angle brackets, Apple Mail's messageId
+    property drops them. Every comparison between the two was a strict
+    string compare, so it could never match: two days of Message-ID
+    writes and the whole move-recovery path reported a mute "not found"
+    for messages that were sitting right there.
+    """
+
+    def test_stored_form_really_keeps_the_brackets(self):
+        import email as email_mod
+
+        from apple_mail_mcp.index.disk import header_text
+
+        msg = email_mod.message_from_string(
+            "Message-ID: <Oz9@geopod-ismtpd-11>\r\nSubject: x\r\n\r\nb"
+        )
+        assert header_text(msg, "Message-ID") == "<Oz9@geopod-ismtpd-11>"
+
+    def test_header_key_collapses_both_forms(self):
+        from apple_mail_mcp.server import _header_key
+
+        assert _header_key("<a@b.com>") == _header_key("a@b.com")
+        assert _header_key(" <a@b.com> ") == "a@b.com"
+        assert _header_key(None) == ""
+        # A bracket that is not a wrapper must survive untouched.
+        assert _header_key("a<b@c.com") == "a<b@c.com"
+
+    def test_jxa_compares_on_the_bare_form(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        js = WriteBuilder(
+            groups=[
+                {
+                    "account": "Work",
+                    "headers": ["<a@b.com>"],
+                    "prefer_mailboxes": ["INBOX"],
+                    "by_header": True,
+                }
+            ],
+            apply_js="msg.flaggedStatus = true;",
+            needs_change_js="msg.flaggedStatus() === true",
+        ).build()
+
+        assert "function normHeader(" in js
+        assert "normed.indexOf(normHeader(target))" in js
+        assert "normHeader(msg.messageId()) !== normHeader(targetHeader)" in js
+        # Raw comparisons must be gone.
+        assert "headers.indexOf(target)" not in js
+
+    def test_index_lookup_matches_either_form(self, tmp_path):
+        import sqlite3
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        calls = {}
+
+        class FakeConn:
+            def execute(self, sql, params):
+                calls["sql"] = sql
+                calls["params"] = params
+                return FakeCur()
+
+        class FakeCur:
+            def fetchall(self):
+                return []
+
+        mgr = IndexManager.__new__(IndexManager)
+        mgr._get_conn = lambda: FakeConn()  # type: ignore[assignment]
+
+        mgr.find_by_rfc822("a@b.com")
+        assert calls["params"] == ("<a@b.com>", "a@b.com")
+
+        mgr.find_by_rfc822("<a@b.com>")
+        assert calls["params"] == ("<a@b.com>", "a@b.com")
+        assert "IN (?, ?)" in calls["sql"]
+        del sqlite3
