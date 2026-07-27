@@ -637,7 +637,10 @@ class TestScanFallback:
 
             result = await set_read_status(9, account="Work")
 
-        assert result["not_found"] == [9]
+        # A timed-out scan is Mail being unreachable, not a verdict on
+        # the message: it belongs in `failed`, never in `not_found`.
+        assert result["failed"] == [9]
+        assert result["not_found"] == []
         assert result["updated"] == []
 
     @pytest.mark.asyncio
@@ -671,7 +674,7 @@ class TestScanFallback:
             result = await set_read_status([1, 2], account="Work")
 
         assert result["updated"] == [1]  # located write survived
-        assert result["not_found"] == [2]  # scan id fell through
+        assert result["failed"] == [2]  # the scan never reached Mail
 
 
 class TestAutoBuildConfig:
@@ -1966,6 +1969,7 @@ class TestReviewFindings:
             r = await set_flag([1, 2], color="red")
 
         assert set(r["not_found"]) == {1, 2}
+        assert r.get("failed", []) == []  # Mail answered; it just missed
         assert r["updated"] == []
         # Ambiguous -> no recovery attempt at all.
         assert not any('"by_header": true' in s for s in calls)
@@ -1993,7 +1997,10 @@ class TestReviewFindings:
 
             r = await set_read_status([1, 2])
 
-        assert set(r["not_found"]) == {1, 2}
+        # Exactly-once bucketing still holds — but a wedged osascript is
+        # a failure, not a missing message.
+        assert set(r["failed"]) == {1, 2}
+        assert r["not_found"] == []
 
     def test_located_write_has_a_bounded_timeout(self):
         from apple_mail_mcp.server import WRITE_TIMEOUT
@@ -2837,7 +2844,8 @@ class TestMessageIdIsAcceptedForWrites:
 
             result = await set_flag("<e@x.com>", color="red")
 
-        assert result["not_found"] == ["<e@x.com>"]
+        assert result["failed"] == ["<e@x.com>"]
+        assert result["not_found"] == []
         # A header write is already keyed on the stable id — there is
         # nothing left for the ROWID recovery path to do.
         mgr.get_rfc822_id.assert_not_called()
@@ -3057,3 +3065,103 @@ class TestReadingByMessageIdIsVerified:
 
             with pytest.raises(ValueError, match="stale"):
                 await _resolve_emlx_path("<a@x.com>")
+
+
+class TestFailedWritesAreNotReportedAsNotFound:
+    """A write that never reached Apple Mail is not a verdict on the mail.
+
+    Reported live by a scheduled triage task: every set_flag call came
+    back `not_found` with a hint blaming the index, while the messages
+    were sitting in the mailbox untouched. Reads kept working because
+    they are served from the index and the .emlx files — only writes
+    need Apple Events, and those were refused.
+    """
+
+    @pytest.mark.asyncio
+    async def test_osascript_failure_lands_in_failed_with_the_real_error(self):
+        mgr = _mock_index(location=("uuid-work", "Junk"))
+        amap = _mock_acct_map()
+
+        async def refused(script, **kw):
+            raise RuntimeError(
+                "execution error: Not authorized to send Apple events "
+                "to Mail. (-1743)"
+            )
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=refused,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            result = await set_flag(12345, color="orange")
+
+        assert result["failed"] == [12345]
+        assert result["not_found"] == []  # never claim the mail is gone
+        assert "-1743" in result["error"]
+        assert "Automation" in result["hint"]
+
+    @pytest.mark.asyncio
+    async def test_genuine_miss_still_reports_not_found(self):
+        """The distinction only helps if a real miss is still a miss."""
+        mgr = _mock_index(location=("uuid-work", "INBOX"))
+        amap = _mock_acct_map()
+
+        async def empty(script, **kw):
+            return {"updated": [], "unchanged": [], "not_found": [999]}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=empty,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_read_status
+
+            result = await set_read_status(999)
+
+        assert result["not_found"] == [999]
+        assert result.get("failed", []) == []
+
+
+class TestJunkIsAWritableLocation:
+    """A message that lives in Junk is a legitimate target.
+
+    The discard-mailbox skip exists so a *recovered* write never lands on
+    the Trash copy of a message that was re-filed. Applying it
+    unconditionally made "flag this junk mail" impossible — exactly what
+    the triage task tried first.
+    """
+
+    def _script(self, prefer):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        return WriteBuilder(
+            groups=[
+                {
+                    "account": "Work",
+                    "headers": ["<a@x.com>"],
+                    "prefer_mailboxes": prefer,
+                    "by_header": True,
+                }
+            ],
+            apply_js="msg.flaggedStatus = true;",
+            needs_change_js="msg.flaggedStatus() === true",
+        ).build()
+
+    def test_discard_mailbox_is_scanned_when_the_index_names_it(self):
+        js = self._script(["Junk"])
+        assert "isDiscard && !isPreferred" in js
+        assert '"prefer_mailboxes": ["Junk"]' in js
+
+    def test_discard_mailbox_is_still_skipped_when_not_expected(self):
+        """Recovery must not flag the Trash copy of a re-filed message."""
+        js = self._script(["Archiv"])
+        assert "isDiscard && !isPreferred" in js
+        assert "DISCARD_MAILBOXES" in js
