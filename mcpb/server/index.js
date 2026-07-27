@@ -36,7 +36,7 @@ const UPDATE_INTERVAL_H = 24;
 // Bump on every bundle release. The stamp records it, so installing a
 // new bundle always re-resolves the server once — otherwise a same-day
 // bundle update would run against a cached, older server build.
-const LAUNCHER_REVISION = "0.10.3";
+const LAUNCHER_REVISION = "0.10.4";
 // A cold `uvx --refresh` clones the repo and builds a wheel; 45s was
 // not enough on a first run, and the timeout then marked the update as
 // done anyway (see refreshCache) — leaving the old server in place for
