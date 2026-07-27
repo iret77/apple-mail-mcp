@@ -33,7 +33,7 @@ config_version = 1
 [index]
 # path = "~/.apple-mail-mcp/index.db"   # FTS5 database location
 # max_emails = 5000             # Per-mailbox ceiling (omit for uncapped)
-# staleness_hours = 24.0        # Hours before re-sync
+# staleness_hours = 24.0        # Age at which `status` calls the index stale
 # exclude_mailboxes = ["Drafts"]   # Mailboxes to skip during indexing
 # exclude_accounts = ["Work PHI"]  # Accounts to hide from the whole server
 
@@ -75,7 +75,7 @@ in CI or in MCP client launch configs.
 | `APPLE_MAIL_DEFAULT_MAILBOX` | `INBOX` | Default mailbox when none specified |
 | `APPLE_MAIL_INDEX_PATH` | `~/.apple-mail-mcp/index.db` | SQLite index database location |
 | `APPLE_MAIL_INDEX_MAX_EMAILS` | _unset_ | Optional per-mailbox ceiling (default: uncapped) |
-| `APPLE_MAIL_INDEX_STALENESS_HOURS` | `24` | Hours before index is considered stale |
+| `APPLE_MAIL_INDEX_STALENESS_HOURS` | `24` | Age at which `apple-mail-mcp status` reports the index as stale. Reporting only — no timed re-sync happens; the server syncs at startup, and `refresh_index()` syncs on demand |
 | `APPLE_MAIL_INDEX_EXCLUDE_MAILBOXES` | `Drafts` | Comma-separated mailboxes to skip in search |
 | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` | _unset_ | Comma-separated account names (exact, case-sensitive) hidden from the entire server: never indexed, filtered from search, invisible to the list/get tools |
 | `APPLE_MAIL_READ_ONLY` | `false` | When `true`, disables any write operations |
