@@ -365,6 +365,11 @@ def get_index_staleness_hours() -> float:
     """
     Get the staleness threshold for the index, in hours.
 
+    Used by ``IndexManager.is_stale()``, which only feeds the
+    ``apple-mail-mcp status`` output. No code path re-syncs on a timer:
+    the server syncs at startup, and ``refresh_index()`` syncs on
+    demand.
+
     Resolution: ``APPLE_MAIL_INDEX_STALENESS_HOURS`` env, then
     ``[index] staleness_hours`` in ``config.toml``, then ``24.0``.
     """
@@ -448,7 +453,9 @@ config_version = 1
 # Env: APPLE_MAIL_INDEX_MAX_EMAILS
 # max_emails = 5000
 
-# Hours before the index is considered stale and should be re-synced.
+# Age at which `apple-mail-mcp status` reports the index as stale.
+# Reporting only: nothing re-syncs on a timer. The server syncs at
+# startup, and the refresh_index tool syncs on demand.
 # Env: APPLE_MAIL_INDEX_STALENESS_HOURS
 # staleness_hours = 24.0
 

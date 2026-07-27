@@ -577,7 +577,7 @@ silently using degraded config.
 | `APPLE_MAIL_DEFAULT_MAILBOX` | `[defaults] mailbox` | `INBOX` | Default mailbox |
 | `APPLE_MAIL_INDEX_PATH` | `[index] path` | `~/.apple-mail-mcp/index.db` | Index database location |
 | `APPLE_MAIL_INDEX_MAX_EMAILS` | `[index] max_emails` | _unset_ | Optional per-mailbox ceiling (default: uncapped) |
-| `APPLE_MAIL_INDEX_STALENESS_HOURS` | `[index] staleness_hours` | `24` | Hours before refresh |
+| `APPLE_MAIL_INDEX_STALENESS_HOURS` | `[index] staleness_hours` | `24` | Age at which `apple-mail-mcp status` calls the index stale (`IndexManager.is_stale()`). **Reporting only** — nothing re-syncs on a timer. The server syncs at startup; use `refresh_index()` in between |
 | `APPLE_MAIL_INDEX_MAX_EMAIL_MB` | `[index] max_email_mb` | `25` | Largest single `.emlx` to parse. Bigger messages are skipped, recorded in the DLQ as `too_large`, and reported by `get_index_status` as `skipped_too_large` — never dropped silently |
 | `APPLE_MAIL_INDEX_AUTO_BUILD` | `[index] auto_build` | `true` | Build the index in the background on first `serve` when none exists (requires Full Disk Access; failure logged, not fatal). Set `false` to require a manual `apple-mail-mcp index` |
 | `APPLE_MAIL_INDEX_EXCLUDE_MAILBOXES` | `[index] exclude_mailboxes` | `["Drafts"]` | Mailboxes to skip during indexing |

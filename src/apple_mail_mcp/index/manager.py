@@ -540,7 +540,12 @@ class IndexManager:
         self._disk_count_cache = None
 
     def is_stale(self) -> bool:
-        """Check if the index needs a sync."""
+        """Whether the last sync is older than the configured threshold.
+
+        Advisory only: this drives the "index is stale" line in
+        ``apple-mail-mcp status``. Nothing re-syncs on a timer — the
+        server syncs at startup, and ``refresh_index()`` on demand.
+        """
         stats = self.get_stats()
         if stats.staleness_hours is None:
             return True
