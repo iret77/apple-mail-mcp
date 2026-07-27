@@ -36,8 +36,12 @@ const UPDATE_INTERVAL_H = 24;
 // Bump on every bundle release. The stamp records it, so installing a
 // new bundle always re-resolves the server once — otherwise a same-day
 // bundle update would run against a cached, older server build.
-const LAUNCHER_REVISION = "0.10.2";
-const UPDATE_TIMEOUT_MS = 45_000; // stay well under the MCP init timeout
+const LAUNCHER_REVISION = "0.10.3";
+// A cold `uvx --refresh` clones the repo and builds a wheel; 45s was
+// not enough on a first run, and the timeout then marked the update as
+// done anyway (see refreshCache) — leaving the old server in place for
+// a full day. Give it room, but stay under the MCP init timeout.
+const UPDATE_TIMEOUT_MS = 120_000;
 
 /** Env values arrive as strings — "false" must not read as truthy. */
 function envFlag(name, fallback = false) {
@@ -138,27 +142,44 @@ function touchStamp() {
  */
 async function refreshCache() {
   process.stderr.write("[apple-mail-mcp] checking for updates...\n");
-  await new Promise((resolve) => {
+  // Only a clean exit means the cache really holds the requested ref.
+  // Stamping unconditionally turned a timed-out update into "already
+  // up to date" and pinned the old server for UPDATE_INTERVAL_H — the
+  // bundle said 0.10.2 while the server still reported the build from
+  // two rounds earlier.
+  const ok = await new Promise((resolve) => {
     const p = spawn(
       uvx,
       ["--refresh", "--from", ref, "apple-mail-mcp", "--version"],
       { stdio: "ignore", env },
     );
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
     const timer = setTimeout(() => {
       p.kill("SIGKILL");
       process.stderr.write(
-        "[apple-mail-mcp] update timed out; using cached build\n",
+        "[apple-mail-mcp] update timed out after " +
+          UPDATE_TIMEOUT_MS / 1000 +
+          "s; running the cached build. It will retry on next start. " +
+          "To do it once by hand, without a timeout:\n" +
+          "  uvx --refresh --from " +
+          ref +
+          " apple-mail-mcp --version\n",
       );
-      resolve();
+      finish(false);
     }, UPDATE_TIMEOUT_MS);
-    const done = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    p.on("error", done);
-    p.on("exit", done);
+    p.on("error", (e) => {
+      process.stderr.write("[apple-mail-mcp] update failed: " + e + "\n");
+      finish(false);
+    });
+    p.on("exit", (code) => finish(code === 0));
   });
-  touchStamp();
+  if (ok) touchStamp();
 }
 
 if (updateIsDue()) await refreshCache();
