@@ -1299,11 +1299,18 @@ class IndexManager:
         Returns:
             List of ``(account, mailbox, message_id)``.
         """
+        # The index stores the header as it appears in the .emlx, i.e.
+        # WITH angle brackets. Callers routinely hold the bare form,
+        # because Apple Mail's messageId property drops them. Match
+        # either, or the lookup silently returns nothing.
+        bare = rfc822_message_id.strip()
+        if bare.startswith("<") and bare.endswith(">"):
+            bare = bare[1:-1]
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT account, mailbox, message_id FROM emails "
-            "WHERE rfc822_message_id = ? ORDER BY indexed_at DESC",
-            (rfc822_message_id,),
+            "WHERE rfc822_message_id IN (?, ?) ORDER BY indexed_at DESC",
+            (f"<{bare}>", bare),
         ).fetchall()
         return [(r["account"], r["mailbox"], r["message_id"]) for r in rows]
 

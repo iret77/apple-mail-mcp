@@ -371,6 +371,17 @@ const notFound = [];
 // Collapsing the two hid a broken account lookup behind a mute
 // "not found" for every id in the batch.
 const failures = [];
+// The .emlx header keeps its angle brackets ("<a@b>"), Apple Mail's
+// messageId property drops them ("a@b"). A strict comparison between
+// the two can never match, which made every Message-ID write report a
+// mute "not found" while the message sat right there. Compare on the
+// bare addr-spec, and always echo back what the caller passed.
+function normHeader(v) {{
+    let s = String(v == null ? "" : v).trim();
+    if (s.charAt(0) === "<") s = s.slice(1);
+    if (s.charAt(s.length - 1) === ">") s = s.slice(0, -1);
+    return s;
+}}
 function fail(targets, reason) {{
     for (const t of targets) failures.push({{target: t, reason: reason}});
 }}
@@ -409,7 +420,9 @@ function applyToMessage(collection, idx, targetId) {{
 function applyByHeader(collection, idx, targetHeader) {{
     const msg = collection[idx];
     try {{
-        if (msg.messageId() !== targetHeader) return "failed";
+        if (normHeader(msg.messageId()) !== normHeader(targetHeader)) {{
+            return "failed";
+        }}
     }} catch (e) {{
         return "failed";
     }}
@@ -480,8 +493,9 @@ for (const g of groups) {{
             }} catch (e) {{
                 continue;  // skip inaccessible mailbox
             }}
+            const normed = headers.map(normHeader);
             for (const target of Array.from(remaining)) {{
-                const idx = headers.indexOf(target);
+                const idx = normed.indexOf(normHeader(target));
                 if (idx === -1) continue;
                 let r = "failed";
                 try {{

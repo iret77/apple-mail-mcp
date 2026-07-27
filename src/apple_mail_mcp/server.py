@@ -417,7 +417,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-27.3"
+SERVER_REVISION = "2026-07-27.4"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -678,6 +678,24 @@ def _index_guidance(
 
 
 # ========== Write-Tool Helpers ==========
+
+
+def _header_key(value: str | None) -> str:
+    """Comparison key for an RFC822 Message-ID.
+
+    The `.emlx` header carries its angle brackets ("<a@b>"); Apple
+    Mail's `messageId` property hands back the bare addr-spec ("a@b").
+    Both name the same message, and a strict comparison between them
+    never matches — which is exactly how every Message-ID lookup came
+    back "not found" while the message was sitting in the mailbox.
+    Compare through this, never on the raw strings.
+    """
+    if not value:
+        return ""
+    key = str(value).strip()
+    if key.startswith("<") and key.endswith(">"):
+        key = key[1:-1]
+    return key
 
 
 MessageRef = int | str
@@ -1653,7 +1671,7 @@ async def _get_email_by_header(
         except Exception as exc:  # try the next known copy
             last_error = exc
             continue
-        if result.get("message_id") == header:
+        if _header_key(result.get("message_id")) == _header_key(header):
             return result
         # Stale row: that ROWID is somebody else's message now.
         logger.debug(
@@ -2019,7 +2037,9 @@ async def _resolve_emlx_path_by_header(
         except Exception as exc:
             logger.debug("Cannot parse candidate %s: %s", path, exc)
             continue
-        if parsed is not None and parsed.message_id_header == header:
+        if parsed is not None and _header_key(
+            parsed.message_id_header
+        ) == _header_key(header):
             return path
 
     raise ValueError(
