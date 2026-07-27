@@ -2650,7 +2650,8 @@ class TestContentIdHeaderCrash:
             b'Content-Type: multipart/mixed; boundary="B"\r\n\r\n--B\r\n'
             b"Content-Type: text/plain\r\n\r\nbody\r\n--B\r\n"
             b"Content-Type: application/pdf\r\n"
-            b'Content-Disposition: attachment; filename="H\xe4ndler.pdf"\r\n\r\n'
+            b"Content-Disposition: attachment; "
+            b'filename="H\xe4ndler.pdf"\r\n\r\n'
             b"XX\r\n--B--\r\n"
         )
         parsed = parse_emlx(self._emlx(tmp_path, mime))
