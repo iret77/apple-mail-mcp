@@ -39,6 +39,30 @@ Add to your MCP client:
 see [`mcpb/README.md`](mcpb/README.md). Build it with
 `./scripts/build-mcpb.sh`.
 
+### Permissions: who needs Full Disk Access?
+
+Building the index reads `~/Library/Mail`, which macOS protects. TCC
+grants that access to the **process that launches the server**, not to
+this package — the single most common setup mistake:
+
+| Index built by | Grant Full Disk Access to |
+|---|---|
+| The server, automatically | **the app that starts it** (e.g. Claude Desktop) |
+| You, via `apple-mail-mcp index` | **the terminal app** you run it in |
+
+Granting it to your terminal does *not* help when an MCP client spawns
+the server — the client is the responsible app then.
+
+If you'd rather not grant your MCP client full disk access, use the
+manual route: set `APPLE_MAIL_INDEX_AUTO_BUILD=false`, build the index
+from a terminal that has access, and the server will read it from
+`~/.apple-mail-mcp/index.db` (not a protected path). Search and the
+write tools keep working; only live disk reads fall back to a slower
+path.
+
+Call the `get_index_status()` tool at any time — it reports which setup
+is active and what to do next.
+
 ### Build the Search Index (Recommended)
 
 ```bash
@@ -68,10 +92,31 @@ for the full schema and precedence rules.
 | `list_mailboxes(account?)` | List mailboxes |
 | `get_emails(filter?, limit?)` | Get emails — all, unread, flagged, today, last_7_days |
 | `get_email(message_id)` | Get single email with full content + attachments |
+| — | *Every tool above takes either the numeric id or the RFC822 `Message-ID` header. Prefer the header: the numeric id is a per-mailbox ROWID and stops resolving as soon as another device files the mail elsewhere.* |
 | `search(query, scope?, before?, after?, highlight?)` | Search — all, subject, sender, body, attachments |
 | `get_email_links(message_id)` | Extract links from an email |
 | `get_email_attachment(message_id, filename)` | Extract attachment content |
 | `get_attachment(message_id, filename)` | *Deprecated* — use `get_email_attachment()` |
+| `set_flag(message_ids, color?)` | **Write** — flag/unflag one email or a batch, optionally by color (red, orange, yellow, green, blue, purple, gray) |
+| `set_read_status(message_ids, read?)` | **Write** — mark one email or a batch read (seen) or unread (unseen) |
+| `get_index_status()` | Index health and setup diagnostics — build state, progress, and whether Full Disk Access is missing |
+| `refresh_index(full?)` | Update the index on demand — the index otherwise syncs only at server start |
+
+### Write operations
+
+`set_flag` and `set_read_status` take a single message id or a list, and
+return per-id outcome buckets (`updated`, `unchanged`, `not_found`,
+`skipped_hidden`) so partial success is always visible. Messages that
+already hold the requested state are reported as `unchanged` and never
+re-written — each write is a server round-trip on IMAP/Exchange. Both are refused when the server runs
+read-only (`APPLE_MAIL_READ_ONLY=true`, `[server] read_only = true`, or
+`apple-mail-mcp serve -r`). Message ids are located via the search index;
+when it can't place an id, the tools fall back to an `account`+`mailbox`
+hint and then to a bounded mailbox scan, so they work even before the index
+exists. If a message has been moved in the meantime — by your phone, another
+mail client, or a server-side rule — its id is dead; the tools then re-find it
+by its RFC822 `Message-ID`, which survives moves, and report that in `hint`. The index is built automatically on first run (see
+`APPLE_MAIL_INDEX_AUTO_BUILD`), so no manual setup is required.
 
 ## Performance
 

@@ -15,13 +15,15 @@ Thread Safety:
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from ..config import (
     get_index_max_emails,
@@ -43,6 +45,93 @@ if TYPE_CHECKING:
     from .watcher import IndexWatcher
 
 logger = logging.getLogger(__name__)
+
+# How many lifecycle events to keep in memory for the status tool.
+MAX_EVENTS = 50
+
+
+class WriteLock:
+    """Serializes index writes across threads AND processes.
+
+    A ``threading.Lock`` is not enough: Claude Desktop starts a second
+    instance of every MCP server (upstream #106), so two processes hold
+    connections to the same SQLite file. SQLite allows one writer, and a
+    rebuild holds its transaction for minutes — the other process then
+    dies on "database is locked" after busy_timeout, which is exactly
+    how a rebuild failed in practice.
+
+    The file lock (``flock``) is advisory but process-wide, and the OS
+    releases it if a process dies, so a crash cannot wedge the index
+    permanently. The thread lock still guards threads inside one
+    process, where flock would not: the same file description is shared.
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._thread_lock = threading.Lock()
+        self._fd: int | None = None
+
+    def acquire(self, blocking: bool = False, timeout: float = 0.0) -> bool:
+        """Take both locks, or neither. Returns False if unavailable."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        thread_timeout = timeout if (blocking or timeout) else -1
+        if not self._thread_lock.acquire(
+            blocking=blocking or bool(timeout), timeout=thread_timeout
+        ):
+            return False
+        try:
+            while True:
+                if self._acquire_file_lock():
+                    return True
+                if time.monotonic() >= deadline:
+                    self._thread_lock.release()
+                    return False
+                time.sleep(0.2)
+        except BaseException:
+            self._thread_lock.release()
+            raise
+
+    def _acquire_file_lock(self) -> bool:
+        import fcntl
+
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            # Cannot create a lock file (read-only home?). Degrade to
+            # thread-only rather than blocking all writes forever.
+            logger.debug("Lock file unavailable at %s", self._path)
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._fd = fd
+        return True
+
+    def release(self) -> None:
+        import fcntl
+
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        self._thread_lock.release()
+
+    def locked(self) -> bool:
+        """True when this process holds it."""
+        return self._thread_lock.locked()
+
+
+class IndexBusyError(RuntimeError):
+    """A build or sync is already running.
+
+    Distinct from a failure: nothing is wrong, the caller simply must
+    not present the skipped work as completed.
+    """
 
 
 @dataclass
@@ -97,8 +186,15 @@ class IndexManager:
             db_path: Custom database path (uses config default if None)
         """
         self._db_path = db_path or get_index_path()
-        self._conn: sqlite3.Connection | None = None
+        # One connection per thread (see _get_conn): a shared connection
+        # would make every query wait behind a running build or sync.
+        self._local = threading.local()
+        self._open_conns: list[sqlite3.Connection] = []
         self._conn_lock = threading.Lock()
+        # SQLite allows a single writer. A build and a sync running at
+        # once fight over it: one wipes rows the other just wrote, and
+        # the loser dies on "database is locked". Both take this lock.
+        self._write_lock = WriteLock(self._db_path.with_suffix(".lock"))
         self._watcher: IndexWatcher | None = None
         self._watcher_callback: Callable[[int, int], None] | None = None
         # (count, expiry_monotonic) — None until first successful read.
@@ -107,6 +203,140 @@ class IndexManager:
         # (build/sync/watcher). Lets JXA-free paths like the disk
         # email count honor exclusions without their own JXA call.
         self._exclude_account_uuids: set[str] = set()
+        # Observability for the status tool: a build runs in a daemon
+        # thread, so "is it working or wedged?" is otherwise invisible
+        # to the caller. Both are process-local by design — they
+        # describe *this* server's activity.
+        self._building = False
+        self._last_error: str | None = None
+        # Build heartbeat. Records the phase, how much has been read
+        # and written, and when that last changed. The phase matters:
+        # a build spends its first minutes reading Apple's metadata
+        # before a single row is written, and without naming that
+        # phase, "warming up" and "wedged" look identical — both show
+        # zero indexed messages.
+        self._build_progress: dict | None = None
+        # Ring of recent lifecycle events. The server's stderr is not
+        # visible to a user running it as a desktop extension, so this
+        # is the only channel through which "what just happened?" can
+        # be answered — the status tool reads it.
+        self._events: deque[dict] = deque(maxlen=MAX_EVENTS)
+        self._events_lock = threading.Lock()
+
+    def write_lock_held(self) -> bool:
+        """True while a build or sync holds the single-writer lock."""
+        return self._write_lock.locked()
+
+    def record_event(self, level: str, message: str, **fields) -> None:
+        """Record a lifecycle event and mirror it to the logger.
+
+        Two audiences: the log file for a post-mortem after a restart,
+        and this ring for "what is happening right now", which the
+        status tool surfaces. Never raises — diagnostics must not be
+        able to break the operation they describe.
+        """
+        try:
+            event = {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "level": level,
+                "message": message,
+                # Coerce: these go straight into an MCP response, and a
+                # non-serializable value would break the whole status
+                # reply rather than this one event.
+                **{k: str(v) for k, v in fields.items()},
+            }
+            with self._events_lock:
+                self._events.append(event)
+            logger.log(
+                logging.ERROR if level == "error" else logging.INFO,
+                "%s%s",
+                message,
+                f" {fields}" if fields else "",
+            )
+        except Exception:  # pragma: no cover - diagnostics only
+            pass
+
+    def recent_events(self, limit: int = 20) -> list[dict]:
+        """Most recent lifecycle events, newest first."""
+        with self._events_lock:
+            events = list(self._events)
+        return list(reversed(events[-limit:]))
+
+    def is_building(self) -> bool:
+        """True while a full index build is running in this process."""
+        return self._building
+
+    # Reading Apple's metadata for a large mailbox legitimately takes
+    # minutes with nothing to show, so it gets a longer grace period
+    # than the indexing loop, which should tick every few seconds.
+    _STALL_SECONDS: ClassVar[dict[str, float]] = {
+        "clearing": 120.0,
+        "reading_metadata": 600.0,
+        "indexing": 120.0,
+    }
+
+    def build_progress(self) -> dict | None:
+        """Heartbeat of the running build, or None if none is running.
+
+        Returns ``phase`` ("reading_metadata" or "indexing"),
+        ``emails_done``, ``files_seen``, ``seconds_since_progress`` and
+        ``appears_stalled``. The phase is what makes zero progress
+        interpretable: during metadata reading, zero is expected.
+        """
+        progress = self._build_progress
+        if progress is None:
+            return None
+        phase = progress["phase"]
+        idle = max(0.0, time.monotonic() - progress["ts"])
+        return {
+            "phase": phase,
+            "emails_done": progress["done"],
+            "files_seen": progress["seen"],
+            "seconds_since_progress": round(idle, 1),
+            "appears_stalled": idle > self._STALL_SECONDS.get(phase, 120.0),
+        }
+
+    def _mark_progress(
+        self, phase: str, *, done: int = 0, seen: int = 0
+    ) -> None:
+        """Stamp the build heartbeat."""
+        self._build_progress = {
+            "phase": phase,
+            "done": done,
+            "seen": seen,
+            "ts": time.monotonic(),
+        }
+
+    @property
+    def last_error(self) -> str | None:
+        """Most recent build/sync failure message, or None.
+
+        Cleared on the next successful build/sync so a transient
+        failure (e.g. Full Disk Access granted mid-session) doesn't
+        stick around misreporting a healthy index.
+        """
+        return self._last_error
+
+    def indexed_email_count(self) -> int:
+        """Cheap COUNT(*) over the emails table (no disk walk).
+
+        Distinguishes "DB file exists" from "DB has content" — an
+        interrupted or permission-denied first build leaves an empty
+        database behind, which must not be mistaken for a usable index.
+        """
+        try:
+            row = (
+                self._get_conn()
+                .execute("SELECT COUNT(*) AS n FROM emails")
+                .fetchone()
+            )
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def has_usable_index(self) -> bool:
+        """True when an index exists *and* holds at least one email."""
+        return self.has_index() and self.indexed_email_count() > 0
 
     def _resolve_exclusions(self) -> set[str]:
         """Resolve configured account exclusions to UUIDs and remember
@@ -131,17 +361,45 @@ class IndexManager:
         return self._db_path
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Get or create the database connection (thread-safe)."""
-        with self._conn_lock:
-            if self._conn is None:
-                self._conn = init_database(self._db_path)
-            return self._conn
+        """Get this thread's database connection, opening it if needed.
+
+        Connections are **per thread**, not shared. A single shared
+        connection serializes every statement behind whatever long
+        operation currently holds it: a full rebuild or a disk sync runs
+        for minutes, and any status or search query issued meanwhile
+        would block for that entire time — the server looks hung. SQLite
+        in WAL mode is built for the opposite: one writer plus any
+        number of concurrent readers, each on its own connection, with
+        readers served from a consistent snapshot instead of waiting.
+
+        ``init_database`` is idempotent — after the first call it only
+        reads the schema version — so per-thread setup stays cheap.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            # Serialize first-time setup: concurrent threads must not
+            # race on creating the schema or running a migration.
+            with self._conn_lock:
+                conn = init_database(self._db_path)
+            self._local.conn = conn
+            with self._conn_lock:
+                self._open_conns.append(conn)
+        return conn
 
     def close(self) -> None:
-        """Close the database connection."""
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        """Close every connection this manager has opened.
+
+        Called by tests and on explicit teardown. Threads that later ask
+        for a connection get a fresh one.
+        """
+        with self._conn_lock:
+            for conn in self._open_conns:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self._open_conns.clear()
+        self._local = threading.local()
 
     def has_index(self) -> bool:
         """Check if an index database exists."""
@@ -264,6 +522,17 @@ class IndexManager:
         self._disk_count_cache = (count, now + self._DISK_COUNT_TTL_SEC)
         return count
 
+    def cached_disk_count(self) -> int | None:
+        """Last known on-disk email count, without walking the disk.
+
+        Lets the status tool show build progress while a build is
+        running: the fresh walk would compete with the build for I/O,
+        but a value from before it started is a perfectly good
+        denominator.
+        """
+        cache = self._disk_count_cache
+        return cache[0] if cache is not None else None
+
     def invalidate_disk_count_cache(self) -> None:
         """Drop the cached disk email count. Call after a sync or
         rebuild that materially changes on-disk state.
@@ -280,6 +549,7 @@ class IndexManager:
     def build_from_disk(
         self,
         progress_callback: Callable[[int, int | None, str], None] | None = None,
+        on_started: Callable[[], None] | None = None,
     ) -> int:
         """
         Build the index by reading .emlx files directly from disk.
@@ -297,43 +567,120 @@ class IndexManager:
             PermissionError: If Full Disk Access is not granted
             FileNotFoundError: If Mail directory not found
         """
-        from .disk import find_mail_directory, scan_all_emails
+        from .disk import (
+            _infer_account_mailbox,
+            find_mail_directory,
+            scan_all_emails,
+        )
 
-        # Verify we can access the mail directory
-        mail_dir = find_mail_directory()
+        # Mark the build as running before the first thing that can
+        # fail, so the status tool can distinguish "never started",
+        # "running" and "failed with this error".
+        # Only one build or sync may touch the database at a time.
+        # SQLite gives us a single writer; two concurrent rebuilds would
+        # each DELETE the other's rows. Acquired non-blocking so a
+        # second caller is told "already running" instead of queueing.
+        if not self._write_lock.acquire(blocking=False):
+            raise IndexBusyError(
+                "An index build or sync is already running; "
+                "wait for it to finish."
+            )
 
-        # Resolve excluded account names -> UUIDs (one JXA call, only
-        # when exclusions are configured) so the JXA-free disk walk can
-        # skip whole accounts. Excluded accounts never enter the index.
-        exclude_account_uuids = self._resolve_exclusions()
+        # Everything below runs inside try/finally: the flag, the
+        # dropped triggers and the emptied tables must be restored on
+        # EVERY exit path. A failure between here and the bulk loop used
+        # to leave `_building` stuck True (the server then reported
+        # "building" forever) and the FTS triggers permanently dropped
+        # (new mail silently stopped entering the search index).
+        self._building = True
+        # Phases are reported so a slow preparation step is never
+        # mistaken for a hang.
+        self._mark_progress("clearing")
+        # Only now has the build truly begun: the lock is held and the
+        # state is visible. Callers use this to distinguish a started
+        # build from one refused on the first line.
+        self.record_event("info", "Index build started")
+        if on_started is not None:
+            on_started()
 
-        conn = self._get_conn()
-        max_per_mailbox = get_index_max_emails()
-
-        # Track counts per mailbox to enforce limits
-        mailbox_counts: dict[tuple[str, str], int] = {}
-        capped_mailboxes: set[tuple[str, str]] = set()
-        total_indexed = 0
-
-        # Clear existing data for rebuild
-        conn.execute("DELETE FROM attachments")
-        conn.execute("DELETE FROM emails")
-        conn.execute("DELETE FROM sync_state")
-
-        # Disable triggers during bulk insert for performance
-        conn.execute("DROP TRIGGER IF EXISTS emails_ai")
-        conn.execute("DROP TRIGGER IF EXISTS emails_ad")
-        conn.execute("DROP TRIGGER IF EXISTS emails_au")
-
+        conn = None
+        # Set when a swallowed error in the cleanup path means the
+        # index is NOT actually complete — e.g. the FTS rebuild failed,
+        # leaving rows in `emails` that body search can never find.
+        finalize_error: str | None = None
         batch: list[tuple] = []
         # Deferred attachment rows: (email_tuple_index, attachments)
         batch_attachments: list[tuple[int, list]] = []
         batch_size = 500
+        mailbox_counts: dict[tuple[str, str], int] = {}
+        capped_mailboxes: set[tuple[str, str]] = set()
+        total_indexed = 0
 
         try:
+            # Verify we can access the mail directory
+            try:
+                mail_dir = find_mail_directory()
+            except Exception as e:
+                self._last_error = f"{type(e).__name__}: {e}"
+                raise
+
+            # Resolve excluded account names -> UUIDs (one JXA call,
+            # only when exclusions are configured) so the JXA-free disk
+            # walk can skip whole accounts. Excluded accounts never
+            # enter the index.
+            exclude_account_uuids = self._resolve_exclusions()
+
+            conn = self._get_conn()
+            max_per_mailbox = get_index_max_emails()
+
+            # Drop the FTS triggers BEFORE clearing, not after. With
+            # `emails_ad` still attached, `DELETE FROM emails` fires one
+            # FTS5 delete per row — on a 60k index that is minutes of
+            # work during which nothing is written, and it is entirely
+            # wasted: the FTS content is rebuilt from scratch below.
+            conn.execute("DROP TRIGGER IF EXISTS emails_ai")
+            conn.execute("DROP TRIGGER IF EXISTS emails_ad")
+            conn.execute("DROP TRIGGER IF EXISTS emails_au")
+
+            # Clear existing data for rebuild
+            conn.execute("DELETE FROM attachments")
+            conn.execute("DELETE FROM emails")
+            conn.execute("DELETE FROM sync_state")
+            # Empty the FTS index in a single operation instead of the
+            # per-row deletes the trigger would have done.
+            conn.execute(
+                "INSERT INTO emails_fts(emails_fts) VALUES('delete-all')"
+            )
+
+            def _record_skip(path: Path, reason: str) -> None:
+                """Never drop a message without a trace: a skipped file
+                goes into the DLQ so the status tool can explain the
+                gap between disk and index counts."""
+                try:
+                    acct, mbox = _infer_account_mailbox(path, mail_dir)
+                    from .schema import RECORD_PARSE_FAILURE_SQL, skip_row
+
+                    conn.execute(
+                        RECORD_PARSE_FAILURE_SQL,
+                        skip_row(str(path), acct, mbox, reason),
+                    )
+                except Exception:
+                    logger.debug("Could not record skip for %s", path)
+
+            files_seen = 0
+            self._mark_progress("reading_metadata")
             for email_data in scan_all_emails(
-                mail_dir, exclude_account_uuids=exclude_account_uuids
+                mail_dir,
+                exclude_account_uuids=exclude_account_uuids,
+                on_skip=_record_skip,
             ):
+                files_seen += 1
+                # Tick well before the first batch commits, so a build
+                # that is parsing steadily never looks frozen.
+                if files_seen % 100 == 0:
+                    self._mark_progress(
+                        "indexing", done=total_indexed, seen=files_seen
+                    )
                 key = (email_data["account"], email_data["mailbox"])
                 count = mailbox_counts.get(key, 0)
 
@@ -354,6 +701,7 @@ class IndexManager:
                         email_data.get("content", ""),
                         email_data.get("date_received", ""),
                         email_data.get("emlx_path", ""),
+                        email_data.get("message_id_header") or None,
                         len(attachments),
                     )
                 )
@@ -362,6 +710,11 @@ class IndexManager:
 
                 if len(batch) >= batch_size:
                     self._flush_batch(conn, batch, batch_attachments)
+                    self._mark_progress(
+                        "indexing",
+                        done=total_indexed + len(batch),
+                        seen=files_seen,
+                    )
                     total_indexed += len(batch)
 
                     if progress_callback:
@@ -371,94 +724,166 @@ class IndexManager:
                     batch = []
                     batch_attachments = []
 
+        except BaseException as exc:
+            # Record EVERY failure. Only the unreadable-mail-directory
+            # case used to set _last_error, so any other exception left
+            # the status cheerfully reporting "no errors" while the
+            # build was dead.
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self.record_event(
+                "error", "Index build failed", error=self._last_error
+            )
+            # Abandon whatever the failed run had open, so the write
+            # lock is not held for the rest of the process lifetime.
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    logger.debug("rollback after failed build failed")
+            raise
         finally:
-            # Flush any remaining partial batch (crash-safe)
-            if batch:
-                self._flush_batch(conn, batch, batch_attachments)
-                total_indexed += len(batch)
+            # The build is no longer running, however it ended. Set
+            # before the flush so a failure in cleanup can't leave the
+            # status tool reporting a phantom in-progress build.
+            self._building = False
+            self._build_progress = None
 
-            # Update sync state for whatever we managed to index
-            if mailbox_counts:
-                now = datetime.now().isoformat()
-                for (account, mailbox), count in mailbox_counts.items():
-                    conn.execute(
-                        """INSERT OR REPLACE INTO sync_state
-                           (account, mailbox, last_sync, message_count)
-                           VALUES (?, ?, ?, ?)""",
-                        (account, mailbox, now, count),
+            # NOTE: the write lock is released at the very END of this
+            # block. Everything below still writes — the final flush and
+            # the FTS rebuild are the heaviest writes in the program —
+            # and releasing early let a waiting sync grab the lock, whose
+            # open transaction then made these writes fail with
+            # "database is locked" from inside this `finally`.
+
+            # Nothing was opened (e.g. Mail unreadable): no schema
+            # state to restore. Guarded with a conditional rather than
+            # an early return — returning from `finally` would swallow
+            # the exception that brought us here.
+            if conn is not None:
+                # Restore the triggers FIRST. DROP TRIGGER is DDL and
+                # autocommits, so a rollback does not bring them back:
+                # if anything below throws before this runs, the
+                # triggers are gone from the database file permanently
+                # and new mail silently stops entering the search
+                # index. Nothing may precede this.
+                self._recreate_fts_triggers(conn)
+
+                # Best-effort from here: losing the tail of a build is
+                # recoverable, breaking the schema is not.
+                try:
+                    # Flush any remaining partial batch (crash-safe)
+                    if batch:
+                        self._flush_batch(conn, batch, batch_attachments)
+                        total_indexed += len(batch)
+
+                    # Update sync state for whatever we managed to index
+                    if mailbox_counts:
+                        now = datetime.now().isoformat()
+                        for (acct_, mbox_), count in mailbox_counts.items():
+                            conn.execute(
+                                """INSERT OR REPLACE INTO sync_state
+                                 (account, mailbox, last_sync, message_count)
+                                 VALUES (?, ?, ?, ?)""",
+                                (acct_, mbox_, now, count),
+                            )
+                        conn.commit()
+                except sqlite3.Error as exc:
+                    finalize_error = f"{type(exc).__name__}: {exc}"
+                    logger.exception("Could not finalize index build")
+
+                # Rebuild FTS index (must run even if scan crashed
+                # mid-iteration, otherwise emails table has rows
+                # but FTS5 is empty)
+                if total_indexed > 0:
+                    if progress_callback:
+                        msg = "Building search index..."
+                        progress_callback(total_indexed, total_indexed, msg)
+
+                    try:
+                        rebuild_fts_index(conn)
+                        optimize_fts_index(conn)
+                    except sqlite3.Error as exc:
+                        finalize_error = f"{type(exc).__name__}: {exc}"
+                        logger.exception("FTS rebuild failed")
+
+                # Log cap warnings (aggregate summary)
+                if capped_mailboxes:
+                    logger.warning(
+                        "%d mailbox(es) hit the per-mailbox cap (%d). "
+                        "Increase APPLE_MAIL_INDEX_MAX_EMAILS to index more.",
+                        len(capped_mailboxes),
+                        max_per_mailbox,
                     )
-                conn.commit()
+                    if progress_callback:
+                        msg = (
+                            f"Warning: {len(capped_mailboxes)} mailbox(es) "
+                            f"hit cap ({max_per_mailbox})"
+                        )
+                        progress_callback(total_indexed, total_indexed, msg)
 
-            # Re-enable triggers BEFORE rebuilding FTS to close the
-            # watcher race condition: if the file watcher (or any other
-            # writer) inserts a row after the bulk loop ends but before
-            # the FTS rebuild — or between rebuild and trigger
-            # recreation in the original ordering — that row would land
-            # in `emails` but never enter `emails_fts`. By recreating
-            # triggers first, any concurrent INSERT after this point
-            # fires the trigger normally; the subsequent FTS rebuild
-            # then re-syncs everything in `emails`, double-covering rows
-            # added during the rebuild call itself.
-            conn.executescript("""
-                CREATE TRIGGER IF NOT EXISTS emails_ai
-                AFTER INSERT ON emails BEGIN
-                    INSERT INTO emails_fts(rowid, subject, sender, content)
-                    VALUES (new.rowid, new.subject, new.sender, new.content);
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS emails_ad
-                AFTER DELETE ON emails BEGIN
-                    INSERT INTO emails_fts(
-                        emails_fts, rowid, subject, sender, content
-                    ) VALUES(
-                        'delete', old.rowid, old.subject,
-                        old.sender, old.content
-                    );
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS emails_au
-                AFTER UPDATE ON emails BEGIN
-                    INSERT INTO emails_fts(
-                        emails_fts, rowid, subject, sender, content
-                    ) VALUES(
-                        'delete', old.rowid, old.subject,
-                        old.sender, old.content
-                    );
-                    INSERT INTO emails_fts(rowid, subject, sender, content)
-                    VALUES (new.rowid, new.subject, new.sender, new.content);
-                END;
-            """)
-
-            # Rebuild FTS index (must run even if scan crashed
-            # mid-iteration, otherwise emails table has rows
-            # but FTS5 is empty)
-            if total_indexed > 0:
-                if progress_callback:
-                    msg = "Building search index..."
-                    progress_callback(total_indexed, total_indexed, msg)
-
-                rebuild_fts_index(conn)
-                optimize_fts_index(conn)
-
-            # Log cap warnings (aggregate summary)
-            if capped_mailboxes:
-                logger.warning(
-                    "%d mailbox(es) hit the per-mailbox cap (%d). "
-                    "Increase APPLE_MAIL_INDEX_MAX_EMAILS to index more.",
-                    len(capped_mailboxes),
-                    max_per_mailbox,
-                )
-                if progress_callback:
-                    msg = (
-                        f"Warning: {len(capped_mailboxes)} mailbox(es) "
-                        f"hit cap ({max_per_mailbox})"
-                    )
-                    progress_callback(total_indexed, total_indexed, msg)
+            # Released last: every write above must be protected.
+            self._write_lock.release()
 
         # Disk inventory just changed — drop the cache so the next
         # status call reflects truth.
         self.invalidate_disk_count_cache()
+        if finalize_error:
+            # Rows exist but the index is not usable as promised — a
+            # failed FTS rebuild leaves body search permanently empty.
+            # Reporting success here is how that stays invisible.
+            self._last_error = finalize_error
+            self.record_event(
+                "error",
+                "Index build finished with errors; search may be incomplete",
+                error=finalize_error,
+                emails=total_indexed,
+            )
+        else:
+            self._last_error = None  # a clean build clears prior failures
+            self.record_event(
+                "info", "Index build finished", emails=total_indexed
+            )
         return total_indexed
+
+    @staticmethod
+    def _recreate_fts_triggers(conn: sqlite3.Connection) -> None:
+        """Restore the FTS sync triggers.
+
+        `DROP TRIGGER` is DDL and autocommits, so a rollback never
+        brings them back. If a build ends without running this, the
+        triggers are gone from the database FILE — surviving restarts —
+        and every later insert lands in `emails` but never in
+        `emails_fts`: body search silently stops seeing new mail.
+        """
+        conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS emails_ai
+            AFTER INSERT ON emails BEGIN
+                INSERT INTO emails_fts(rowid, subject, sender, content)
+                VALUES (new.rowid, new.subject, new.sender, new.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS emails_ad
+            AFTER DELETE ON emails BEGIN
+                INSERT INTO emails_fts(
+                    emails_fts, rowid, subject, sender, content
+                ) VALUES(
+                    'delete', old.rowid, old.subject,
+                    old.sender, old.content
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS emails_au
+            AFTER UPDATE ON emails BEGIN
+                INSERT INTO emails_fts(
+                    emails_fts, rowid, subject, sender, content
+                ) VALUES(
+                    'delete', old.rowid, old.subject,
+                    old.sender, old.content
+                );
+                INSERT INTO emails_fts(rowid, subject, sender, content)
+                VALUES (new.rowid, new.subject, new.sender, new.content);
+            END;
+        """)
 
     @staticmethod
     def _flush_batch(
@@ -509,6 +934,46 @@ class IndexManager:
         Returns:
             Number of changes (added + deleted + moved)
         """
+        if not self._write_lock.acquire(blocking=False):
+            # Distinguishable from "0 changes": the caller must not
+            # report a sync that never ran as a successful no-op.
+            self.record_event("info", "Sync skipped: index busy")
+            raise IndexBusyError("An index build or sync is already running.")
+
+        self.record_event("info", "Sync started")
+        self._last_error = None  # this run's verdict, not a previous one
+        try:
+            changes = self._sync_updates_locked(progress_callback)
+        except BaseException as exc:
+            # sync_from_disk commits only at the very end and never
+            # rolls back. A failure mid-way therefore left an OPEN write
+            # transaction on this thread's connection, which blocked
+            # every later write in this process with "database is
+            # locked" until it was restarted.
+            try:
+                self._get_conn().rollback()
+            except sqlite3.Error:
+                logger.debug("rollback after failed sync failed")
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self.record_event("error", "Sync failed", error=self._last_error)
+            raise
+        finally:
+            self._write_lock.release()
+        if self._last_error:
+            # The Full-Disk-Access path reports a soft failure by
+            # returning 0 rather than raising. Announcing "finished"
+            # then puts a success at the top of the ring the model is
+            # told to quote from — the exact lie this ring exists to
+            # prevent.
+            self.record_event(
+                "error", "Sync did not run", error=self._last_error
+            )
+        else:
+            self.record_event("info", "Sync finished", changes=changes)
+        return changes
+
+    def _sync_updates_locked(self, progress_callback=None) -> int:
+        """Body of :meth:`sync_updates`, holding the write lock."""
         from .disk import find_mail_directory
         from .sync import sync_from_disk
 
@@ -516,6 +981,16 @@ class IndexManager:
             mail_dir = find_mail_directory()
         except (FileNotFoundError, PermissionError) as e:
             logger.warning("Cannot access mail directory for sync: %s", e)
+            # Record it, but keep returning 0 (callers rely on that).
+            # 0 alone is indistinguishable from "no changes", which is
+            # why the caller must consult `last_error` before claiming
+            # the index is up to date.
+            self._last_error = f"{type(e).__name__}: {e}"
+            self.record_event(
+                "error",
+                "Sync could not read Mail (Full Disk Access?)",
+                error=self._last_error,
+            )
             return 0
 
         exclude_account_uuids = self._resolve_exclusions()
@@ -529,6 +1004,7 @@ class IndexManager:
         # Disk inventory just changed (or was just verified) — drop
         # the get_stats cache so the next status call reflects truth.
         self.invalidate_disk_count_cache()
+        self._last_error = None  # a successful sync clears prior failures
         return result.total_changes
 
     def search(
@@ -689,6 +1165,142 @@ class IndexManager:
         if row:
             return (row["account"], row["mailbox"])
         return None
+
+    def get_rfc822_id(
+        self,
+        message_id: int,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> str | None:
+        """Return the stable RFC822 Message-ID for a Mail.app ROWID.
+
+        The ROWID is per-mailbox and changes when a message is filed
+        elsewhere — routinely, since most accounts are open on several
+        devices. The header survives that, so it is the handle to fall
+        back on once a ROWID stops resolving.
+
+        Scope with ``account``/``mailbox`` whenever the caller knows
+        them: ``message_id`` is unique only within a mailbox, so an
+        unscoped lookup can return a *different* message's header — and
+        the caller would then go and modify that unrelated message.
+
+        Returns None when unknown (row absent, or indexed before schema
+        v6 and not yet re-indexed).
+        """
+        conn = self._get_conn()
+        where = ["message_id = ?"]
+        params: list = [message_id]
+        if account:
+            where.append("account = ?")
+            params.append(account)
+        if mailbox:
+            where.append("mailbox = ?")
+            params.append(mailbox)
+
+        sql = (
+            "SELECT rfc822_message_id FROM emails WHERE "
+            + " AND ".join(where)
+            + " AND rfc822_message_id IS NOT NULL LIMIT 1"
+        )
+        row = conn.execute(sql, params).fetchone()
+        return row["rfc822_message_id"] if row else None
+
+    def count_without_stable_id(self) -> int:
+        """Rows lacking an RFC822 Message-ID (indexed before schema v6).
+
+        Those messages cannot be recovered once another device moves
+        them, because there is no stable handle on record. A full
+        rebuild backfills them.
+        """
+        try:
+            row = (
+                self._get_conn()
+                .execute(
+                    "SELECT COUNT(*) AS n FROM emails "
+                    "WHERE rfc822_message_id IS NULL"
+                )
+                .fetchone()
+            )
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def count_skipped_too_large(self) -> int:
+        """Messages skipped for exceeding the size ceiling.
+
+        Explains part of any gap between `disk_email_count` and
+        `email_count` — a gap that would otherwise look like data loss.
+        """
+        try:
+            row = (
+                self._get_conn()
+                .execute(
+                    "SELECT COUNT(*) AS n FROM failed_index_jobs "
+                    "WHERE error_message = 'too_large'"
+                )
+                .fetchone()
+            )
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def get_rfc822_ids(
+        self, keys: list[tuple[str, str, int]]
+    ) -> dict[tuple[str, str, int], str]:
+        """Batch form of :meth:`get_rfc822_id`, fully scoped.
+
+        Takes ``(account, mailbox, message_id)`` triples and returns the
+        stable header for the ones the index knows. One statement for
+        the whole page instead of a query per row — the listing paths
+        call this for every result they return.
+        """
+        if not keys:
+            return {}
+        out: dict[tuple[str, str, int], str] = {}
+        conn = self._get_conn()
+        # Chunked to stay well under SQLite's variable limit (999).
+        chunk = 300
+        for start in range(0, len(keys), chunk):
+            batch = keys[start : start + chunk]
+            clause = " OR ".join(
+                ["(account = ? AND mailbox = ? AND message_id = ?)"]
+                * len(batch)
+            )
+            params: list = []
+            for acct, mbox, mid in batch:
+                params += [acct, mbox, mid]
+            rows = conn.execute(
+                "SELECT account, mailbox, message_id, rfc822_message_id "
+                f"FROM emails WHERE ({clause}) "
+                "AND rfc822_message_id IS NOT NULL",
+                params,
+            ).fetchall()
+            for r in rows:
+                out[(r["account"], r["mailbox"], r["message_id"])] = r[
+                    "rfc822_message_id"
+                ]
+        return out
+
+    def find_by_rfc822(
+        self, rfc822_message_id: str
+    ) -> list[tuple[str, str, int]]:
+        """Locate every indexed copy of a message by its stable header.
+
+        A message can legitimately exist more than once (the same mail
+        in INBOX and in an archive, or across accounts), so this returns
+        all matches rather than guessing. Newest first, so the most
+        recently indexed location is tried first.
+
+        Returns:
+            List of ``(account, mailbox, message_id)``.
+        """
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT account, mailbox, message_id FROM emails "
+            "WHERE rfc822_message_id = ? ORDER BY indexed_at DESC",
+            (rfc822_message_id,),
+        ).fetchall()
+        return [(r["account"], r["mailbox"], r["message_id"]) for r in rows]
 
     def find_email_path(
         self,
@@ -924,6 +1536,7 @@ class IndexManager:
             db_path=self._db_path,
             on_update=on_update,
             exclude_account_uuids=self._resolve_exclusions(),
+            write_lock=self._write_lock,
         )
 
         return self._watcher.start()

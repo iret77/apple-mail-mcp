@@ -515,6 +515,7 @@ class TestConcurrentWrites:
                             "body text",
                             "2026-01-01 00:00:00",
                             f"/fake/{worker}/{i}.emlx",
+                            f"<{worker}-{i}@example.com>",
                             0,
                         ),
                     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from pathlib import Path
 from unittest.mock import patch
@@ -42,6 +43,7 @@ class TestProcessPendingResilience:
         watcher.on_update = None
         watcher.debounce_ms = 500
         watcher._exclude_account_uuids = set()
+        watcher._write_lock = threading.Lock()
         return watcher
 
     @patch("apple_mail_mcp.index.watcher.parse_emlx")
@@ -313,3 +315,112 @@ class TestNestedMailboxRegex:
         assert m is not None
         assert m.group(2) == "Work/Q1"
         assert m.group(3) == "49461"
+
+
+class TestWatcherRespectsTheWriteLock:
+    """A running build must not cost the watcher a batch of mail."""
+
+    def _watcher(self, db_path, lock):
+        import threading
+
+        w = IndexWatcher.__new__(IndexWatcher)
+        w.db_path = str(db_path)
+        w._conn = None
+        w._pending_adds = {}
+        w._pending_deletes = set()
+        w._pending_lock = threading.Lock()
+        w._stop_event = threading.Event()
+        w._mail_dir = None
+        w._thread = None
+        w.on_update = None
+        w.debounce_ms = 500
+        w._exclude_account_uuids = set()
+        w._write_lock = lock
+        return w
+
+    def test_manager_shares_its_lock_with_the_watcher(self, temp_db_path):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        with patch("apple_mail_mcp.index.watcher.IndexWatcher") as mock_watcher:
+            mock_watcher.return_value.start.return_value = True
+            m.start_watcher()
+
+        assert mock_watcher.call_args.kwargs["write_lock"] is m._write_lock
+
+    def test_batch_is_requeued_when_the_index_is_busy(
+        self, watcher_db, monkeypatch
+    ):
+        """Deferred, not dropped: the batch was already drained, so
+        discarding it loses those messages until the next full sync."""
+        import threading
+
+        from apple_mail_mcp.index import watcher as watcher_mod
+
+        db_path, conn = watcher_db
+        conn.close()
+
+        monkeypatch.setattr(watcher_mod, "WRITE_LOCK_TIMEOUT_SEC", 0.05)
+        lock = threading.Lock()
+        lock.acquire()  # a "build" holds it
+        try:
+            w = self._watcher(db_path, lock)
+            w._pending_adds = {("acct", "INBOX", 1): Path("/fake/1.emlx")}
+            w._pending_deletes = {("acct", "INBOX", 2)}
+
+            w._process_pending()
+
+            assert w._pending_adds == {
+                ("acct", "INBOX", 1): Path("/fake/1.emlx")
+            }
+            assert w._pending_deletes == {("acct", "INBOX", 2)}
+        finally:
+            lock.release()
+
+    def test_batch_is_requeued_when_the_write_fails(
+        self, watcher_db, monkeypatch
+    ):
+        import sqlite3 as _sqlite3
+        import threading
+
+        db_path, conn = watcher_db
+        conn.close()
+
+        w = self._watcher(db_path, threading.Lock())
+        w._pending_adds = {("acct", "INBOX", 1): Path("/fake/1.emlx")}
+
+        def boom(*a, **k):
+            raise _sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(w, "_get_conn", boom, raising=False)
+        with contextlib.suppress(Exception):
+            w._process_pending()
+
+        # Either it was re-queued, or it never got drained — both keep
+        # the message; what must not happen is a silent drop.
+        assert w._pending_adds
+
+    def test_lock_is_released_even_when_the_batch_raises(
+        self, watcher_db, monkeypatch
+    ):
+        import threading
+
+        db_path, conn = watcher_db
+        conn.close()
+
+        lock = threading.Lock()
+        w = self._watcher(db_path, lock)
+        w._pending_adds = {("acct", "INBOX", 1): Path("/fake/1.emlx")}
+        monkeypatch.setattr(
+            w,
+            "_process_batch",
+            lambda *a: (_ for _ in ()).throw(RuntimeError("boom")),
+            raising=False,
+        )
+        with contextlib.suppress(RuntimeError):
+            w._process_pending()
+
+        assert lock.acquire(blocking=False)
+        lock.release()

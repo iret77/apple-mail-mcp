@@ -17,7 +17,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Current schema version for migrations
-SCHEMA_VERSION = 5  # Bumped for failed_index_jobs (DLQ) support
+SCHEMA_VERSION = 6  # Bumped for rfc822_message_id (stable identity)
 
 # Default PRAGMAs for all connections (centralized to avoid drift)
 DEFAULT_PRAGMAS = {
@@ -31,8 +31,8 @@ DEFAULT_PRAGMAS = {
 # Uses INSERT OR REPLACE for idempotent upserts on composite key
 INSERT_EMAIL_SQL = """INSERT OR REPLACE INTO emails
     (message_id, account, mailbox, subject, sender, content, date_received,
-     emlx_path, attachment_count)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+     emlx_path, rfc822_message_id, attachment_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 
 # SQL for inserting attachment metadata
 INSERT_ATTACHMENT_SQL = """INSERT INTO attachments
@@ -74,6 +74,22 @@ def parse_failure_row(
     )
 
 
+SKIP_REASON_TOO_LARGE = "too_large"
+
+
+def skip_row(
+    emlx_path: str, account: str, mailbox: str, reason: str
+) -> tuple[str, str, str, str, str]:
+    """Build the DLQ tuple for a deliberately skipped file.
+
+    A skip is not an error, but it must be recorded the same way: a
+    message that is silently absent from the index is indistinguishable
+    from data loss. `reason` lands in `error_message`, which is what
+    `count_skipped_too_large()` matches on.
+    """
+    return (emlx_path, account, mailbox, "Skipped", reason)
+
+
 def insert_attachments(
     conn: sqlite3.Connection,
     email_rowid: int,
@@ -109,7 +125,7 @@ def email_to_row(
     mailbox: str,
     emlx_path: str | None = None,
     attachment_count: int = 0,
-) -> tuple[int, str, str, str, str, str, str, str | None, int]:
+) -> tuple[int, str, str, str, str, str, str, str | None, str | None, int]:
     """
     Convert an email dict to a database row tuple.
 
@@ -137,6 +153,7 @@ def email_to_row(
         email.get("content", ""),
         email.get("date_received", ""),
         emlx_path,
+        email.get("message_id_header") or None,
         attachment_count,
     )
 
@@ -185,6 +202,11 @@ CREATE TABLE IF NOT EXISTS emails (
     content TEXT,                    -- Body text
     date_received TEXT,
     emlx_path TEXT,                  -- Path to .emlx file (for disk-first sync)
+    -- RFC822 Message-ID header. Globally unique and stable across
+    -- moves, unlike message_id (a per-mailbox ROWID that changes when
+    -- another device files the message elsewhere). Used to re-find a
+    -- message whose ROWID went stale.
+    rfc822_message_id TEXT,
     attachment_count INTEGER DEFAULT 0,
     indexed_at TEXT DEFAULT (datetime('now')),
     UNIQUE(account, mailbox, message_id)  -- Composite uniqueness
@@ -199,6 +221,8 @@ CREATE INDEX IF NOT EXISTS idx_emails_message_id
     ON emails(message_id);
 CREATE INDEX IF NOT EXISTS idx_emails_path
     ON emails(emlx_path);
+CREATE INDEX IF NOT EXISTS idx_emails_rfc822
+    ON emails(rfc822_message_id);
 
 -- FTS5 index (external content - shares storage with emails table)
 -- Uses porter stemmer for English + unicode61 for international text
@@ -439,6 +463,25 @@ def _run_migrations(
                 ON failed_index_jobs(account, mailbox);
         """)
         logger.info("Migration v4→v5 complete.")
+
+    if from_version < 6:
+        # Migration v5→v6: add the RFC822 Message-ID column. Existing
+        # rows keep NULL until they are re-indexed; every lookup treats
+        # NULL as "unknown" and falls back to the ROWID path, so a
+        # partially migrated index stays correct — just less able to
+        # recover messages that other devices have moved.
+        logger.info("Migrating schema v5→v6: adding rfc822_message_id")
+        cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(emails)").fetchall()
+        }
+        if "rfc822_message_id" not in cols:
+            conn.execute("ALTER TABLE emails ADD COLUMN rfc822_message_id TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_emails_rfc822 "
+            "ON emails(rfc822_message_id)"
+        )
+        logger.info("Migration v5→v6 complete.")
 
     conn.execute("UPDATE schema_version SET version = ?", (to_version,))
     conn.commit()

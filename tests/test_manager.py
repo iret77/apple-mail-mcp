@@ -11,6 +11,7 @@ Tests the central orchestration class for the FTS5 search index:
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -235,15 +236,19 @@ class TestClose:
         IndexManager._instance = None
 
     def test_close_is_idempotent(self, temp_db_path):
-        """close() closes the connection and can be called repeatedly."""
+        """close() releases every connection and can be repeated."""
         manager = IndexManager(db_path=temp_db_path)
         manager._get_conn()
+        assert manager._open_conns
 
         manager.close()
-        assert manager._conn is None
+        assert manager._open_conns == []
 
         manager.close()  # Should not raise
-        assert manager._conn is None
+        assert manager._open_conns == []
+
+        # A later caller simply gets a fresh connection.
+        assert manager._get_conn() is not None
 
 
 class TestGetIndexedMessageIds:
@@ -906,3 +911,472 @@ class TestWatcher:
         assert manager.watcher_running is False
         manager.stop_watcher()  # Should not raise
         assert manager.watcher_running is False
+
+
+class TestPerThreadConnections:
+    """A long write must not block reads — the cause of a hung server."""
+
+    def test_each_thread_gets_its_own_connection(self, temp_db_path):
+        import threading
+
+        manager = IndexManager(db_path=temp_db_path)
+        main_conn = manager._get_conn()
+        other: list = []
+
+        def worker() -> None:
+            other.append(manager._get_conn())
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        assert other[0] is not main_conn
+        assert len(manager._open_conns) == 2
+
+    def test_same_thread_reuses_its_connection(self, temp_db_path):
+        manager = IndexManager(db_path=temp_db_path)
+        assert manager._get_conn() is manager._get_conn()
+
+    def test_read_is_not_blocked_by_an_open_write(self, temp_db_path):
+        """The regression: a reader must answer while a writer holds a
+        transaction open, instead of waiting for it to finish."""
+        import threading
+
+        manager = IndexManager(db_path=temp_db_path)
+        manager._get_conn()  # create schema first
+
+        writing = threading.Event()
+        release = threading.Event()
+        failed: list = []
+
+        def writer() -> None:
+            conn = manager._get_conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO emails (message_id, account, mailbox) "
+                    "VALUES (1, 'a', 'INBOX')"
+                )
+                writing.set()
+                release.wait(timeout=10)
+                conn.commit()
+            except Exception as e:  # pragma: no cover - diagnostic
+                failed.append(e)
+                writing.set()
+
+        t = threading.Thread(target=writer)
+        t.start()
+        assert writing.wait(timeout=10)
+
+        # Reader on another connection, while the write txn is open.
+        try:
+            count = manager.indexed_email_count()
+        finally:
+            release.set()
+            t.join()
+
+        assert failed == []
+        # Sees the pre-write snapshot rather than blocking on the writer.
+        assert count == 0
+
+
+class TestRebuildClearsCheaply:
+    """Clearing must not fire the FTS trigger once per row."""
+
+    def test_triggers_are_dropped_before_the_delete(self):
+        """Regression: with emails_ad attached, DELETE FROM emails costs
+        one FTS5 delete per row — minutes on a large index, and wasted,
+        since the FTS content is rebuilt at the end."""
+        import inspect
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        src = inspect.getsource(IndexManager.build_from_disk)
+        drop_ad = src.index("DROP TRIGGER IF EXISTS emails_ad")
+        delete_emails = src.index('conn.execute("DELETE FROM emails")')
+        assert drop_ad < delete_emails, (
+            "FTS triggers must be dropped before rows are deleted"
+        )
+
+    def test_fts_is_emptied_in_one_statement(self):
+        import inspect
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        src = inspect.getsource(IndexManager.build_from_disk)
+        assert "VALUES('delete-all')" in src
+
+    def test_clearing_a_populated_index_is_fast(self, temp_db_path):
+        """End-to-end: emptying a populated index must not crawl."""
+        import time as _time
+
+        from apple_mail_mcp.index.manager import IndexManager
+        from apple_mail_mcp.index.schema import INSERT_EMAIL_SQL, email_to_row
+
+        m = IndexManager(db_path=temp_db_path)
+        conn = m._get_conn()
+        for i in range(2000):
+            conn.execute(
+                INSERT_EMAIL_SQL,
+                email_to_row(
+                    {
+                        "id": i,
+                        "subject": f"subject {i}",
+                        "content": "body " * 50,
+                        "message_id_header": f"<{i}@x>",
+                    },
+                    "acct",
+                    "INBOX",
+                ),
+            )
+        conn.commit()
+
+        # Same order the rebuild uses: triggers first, then delete.
+        start = _time.monotonic()
+        conn.execute("DROP TRIGGER IF EXISTS emails_ai")
+        conn.execute("DROP TRIGGER IF EXISTS emails_ad")
+        conn.execute("DROP TRIGGER IF EXISTS emails_au")
+        conn.execute("DELETE FROM emails")
+        conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('delete-all')")
+        conn.commit()
+        elapsed = _time.monotonic() - start
+
+        assert m.indexed_email_count() == 0
+        assert elapsed < 2.0, f"clearing took {elapsed:.1f}s"
+
+
+class TestBuildSyncMutualExclusion:
+    """A build and a sync must never run against the DB at once."""
+
+    def test_second_build_is_refused_while_one_holds_the_lock(
+        self, temp_db_path
+    ):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        assert m._write_lock.acquire(blocking=False)
+        try:
+            from apple_mail_mcp.index.manager import IndexBusyError
+
+            with pytest.raises(IndexBusyError, match="already running"):
+                m.build_from_disk()
+        finally:
+            m._write_lock.release()
+
+    def test_sync_signals_busy_rather_than_faking_success(self, temp_db_path):
+        """Returning 0 was indistinguishable from "no changes", so the
+        tool reported a sync that never ran as up to date."""
+        from apple_mail_mcp.index.manager import IndexBusyError, IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        assert m._write_lock.acquire(blocking=False)
+        try:
+            with pytest.raises(IndexBusyError):
+                m.sync_updates()
+        finally:
+            m._write_lock.release()
+
+    def test_lock_is_released_when_the_build_fails(self, temp_db_path):
+        """A failure used to leave _building stuck True forever, so the
+        server reported 'building' until restart."""
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        with patch(
+            "apple_mail_mcp.index.disk.find_mail_directory",
+            side_effect=PermissionError("no FDA"),
+        ):
+            with pytest.raises(PermissionError):
+                m.build_from_disk()
+
+        assert m.is_building() is False
+        assert m.build_progress() is None
+        assert m._write_lock.acquire(blocking=False)
+        m._write_lock.release()
+
+    def test_failed_build_leaves_the_fts_triggers_intact(
+        self, temp_db_path, tmp_path
+    ):
+        """Triggers are dropped before the tables are cleared; if that
+        window is unprotected, a failure permanently stops new mail from
+        entering the search index."""
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        conn = m._get_conn()
+
+        def triggers() -> set:
+            return {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+
+        assert {"emails_ai", "emails_ad", "emails_au"} <= triggers()
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                side_effect=RuntimeError("boom mid-scan"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            m.build_from_disk()
+
+        assert {"emails_ai", "emails_ad", "emails_au"} <= triggers()
+
+
+class TestBuildFinallyIsRobust:
+    """The cleanup path must restore schema state come what may."""
+
+    def test_triggers_restored_even_when_the_final_flush_fails(
+        self, temp_db_path, tmp_path
+    ):
+        """The earlier test only failed before anything was batched, so
+        it never exercised the flush path. A flush error must not skip
+        trigger restoration — DROP TRIGGER autocommits, so the triggers
+        would be gone from the file permanently."""
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        conn = m._get_conn()
+
+        def triggers() -> set:
+            return {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+
+        emails = [
+            {
+                "id": i,
+                "account": "acct",
+                "mailbox": "INBOX",
+                "subject": "s",
+                "sender": "a@b",
+                "content": "c",
+                "date_received": "2026-01-01",
+                "emlx_path": f"/p/{i}.emlx",
+                "message_id_header": f"<{i}@x>",
+                "attachments": [],
+            }
+            for i in range(3)
+        ]
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                return_value=iter(emails),
+            ),
+            patch.object(
+                IndexManager,
+                "_flush_batch",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ),
+        ):
+            # The flush failure is contained, not propagated...
+            m.build_from_disk()
+
+        # ...and the schema is intact.
+        assert {"emails_ai", "emails_ad", "emails_au"} <= triggers()
+        assert m.is_building() is False
+        assert m._write_lock.acquire(blocking=False)
+        m._write_lock.release()
+
+    def test_lock_is_held_until_the_last_write(self):
+        """Releasing before the flush/FTS rebuild let a waiting sync
+        grab the lock and make those writes fail."""
+        import inspect
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        src = inspect.getsource(IndexManager.build_from_disk)
+        release = src.rindex("_write_lock.release()")
+        for later in ("_recreate_fts_triggers", "rebuild_fts_index"):
+            assert src.index(later) < release, later
+
+    def test_triggers_are_restored_before_any_other_cleanup(self):
+        import inspect
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        src = inspect.getsource(IndexManager.build_from_disk)
+        finally_at = src.rindex("finally:")
+        tail = src[finally_at:]
+        assert tail.index("_recreate_fts_triggers") < tail.index("_flush_batch")
+
+
+class TestWriteLockIsCrossProcess:
+    """Claude Desktop starts a second server instance (upstream #106),
+    so a threading.Lock cannot prevent "database is locked"."""
+
+    def test_second_process_cannot_take_the_lock(self, tmp_path):
+        import subprocess
+        import sys
+        import textwrap
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock_path = tmp_path / "index.lock"
+        held = WriteLock(lock_path)
+        assert held.acquire()
+        try:
+            probe = textwrap.dedent(f"""
+                import sys
+                sys.path.insert(0, {str(Path("src").resolve())!r})
+                from pathlib import Path
+                from apple_mail_mcp.index.manager import WriteLock
+                got = WriteLock(Path({str(lock_path)!r})).acquire()
+                print("ACQUIRED" if got else "REFUSED")
+            """)
+            out = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert "REFUSED" in out.stdout, (out.stdout, out.stderr)
+        finally:
+            held.release()
+
+    def test_lock_is_available_again_after_release(self, tmp_path):
+        import subprocess
+        import sys
+        import textwrap
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock_path = tmp_path / "index.lock"
+        lock = WriteLock(lock_path)
+        assert lock.acquire()
+        lock.release()
+
+        probe = textwrap.dedent(f"""
+            import sys
+            sys.path.insert(0, {str(Path("src").resolve())!r})
+            from pathlib import Path
+            from apple_mail_mcp.index.manager import WriteLock
+            print("ACQUIRED" if WriteLock(Path({str(lock_path)!r})).acquire()
+                  else "REFUSED")
+        """)
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert "ACQUIRED" in out.stdout, (out.stdout, out.stderr)
+
+    def test_a_dead_holder_does_not_wedge_the_index(self, tmp_path):
+        """The OS drops flock when a process dies — a crashed instance
+        must not lock the index out permanently."""
+        import subprocess
+        import sys
+        import textwrap
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock_path = tmp_path / "index.lock"
+        grabber = textwrap.dedent(f"""
+            import sys
+            sys.path.insert(0, {str(Path("src").resolve())!r})
+            from pathlib import Path
+            from apple_mail_mcp.index.manager import WriteLock
+            WriteLock(Path({str(lock_path)!r})).acquire()
+            # exit without releasing
+        """)
+        subprocess.run(
+            [sys.executable, "-c", grabber],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        lock = WriteLock(lock_path)
+        assert lock.acquire(), "dead process still holds the lock"
+        lock.release()
+
+    def test_threads_in_one_process_are_still_serialized(self, tmp_path):
+        """flock is per-file-description, so it would NOT stop a second
+        thread here — the thread lock must still do that."""
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock = WriteLock(tmp_path / "index.lock")
+        assert lock.acquire()
+        try:
+            assert lock.acquire() is False
+        finally:
+            lock.release()
+
+    def test_manager_lock_lives_next_to_the_database(self, temp_db_path):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        assert m._write_lock._path == temp_db_path.with_suffix(".lock")
+
+
+class TestFailedSyncDoesNotPoisonTheConnection:
+    """sync_from_disk commits once, at the end, and never rolls back.
+    A failure mid-way left an open write transaction that blocked every
+    later write in the process with "database is locked"."""
+
+    def test_write_still_possible_after_a_failed_sync(
+        self, temp_db_path, tmp_path
+    ):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import sync as sync_mod
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        conn = m._get_conn()
+
+        def poison(conn_, *a, **k):
+            # Open a write transaction, then die — exactly what a
+            # mid-way failure in sync_from_disk does.
+            conn_.execute(
+                "INSERT INTO emails (message_id, account, mailbox) "
+                "VALUES (999, 'a', 'INBOX')"
+            )
+            raise RuntimeError("sync exploded")
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch.object(sync_mod, "sync_from_disk", poison),
+            pytest.raises(RuntimeError),
+        ):
+            m.sync_updates()
+
+        # The poisoned row must be gone and the DB writable again.
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM emails WHERE message_id = 999"
+            ).fetchone()[0]
+            == 0
+        )
+        conn.execute(
+            "INSERT INTO emails (message_id, account, mailbox) "
+            "VALUES (1, 'a', 'INBOX')"
+        )
+        conn.commit()
+        assert m.indexed_email_count() == 1

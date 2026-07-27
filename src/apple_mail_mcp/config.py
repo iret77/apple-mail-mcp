@@ -13,6 +13,7 @@ from pathlib import Path
 
 # Default index location
 DEFAULT_INDEX_PATH = Path.home() / ".apple-mail-mcp" / "index.db"
+DEFAULT_LOG_PATH = Path.home() / ".apple-mail-mcp" / "server.log"
 CONFIG_FILE_PATH = Path.home() / ".apple-mail-mcp" / "config.toml"
 
 CONFIG_SCHEMA_VERSION = 1
@@ -32,6 +33,8 @@ CONFIG_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "exclude_mailboxes": (list,),
         "exclude_accounts": (list,),
         "include_mailboxes": (list,),
+        "auto_build": (bool,),
+        "max_email_mb": (int, float),
     },
     "server": {
         "read_only": (bool,),
@@ -147,6 +150,12 @@ def _validate(data: dict, path: Path) -> None:
         raise ConfigError(
             f"{path}: `[index] max_emails` must be >= 0, "
             f"got {index['max_emails']}."
+        )
+    if "max_email_mb" in index and index["max_email_mb"] <= 0:
+        raise ConfigError(
+            f"{path}: `[index] max_email_mb` must be > 0, "
+            f"got {index['max_email_mb']}. A value of 0 would skip every "
+            f"message; omit the key to use the default."
         )
     if "staleness_hours" in index and index["staleness_hours"] < 0:
         raise ConfigError(
@@ -286,6 +295,72 @@ def get_index_exclude_accounts() -> set[str]:
     return set()
 
 
+def get_index_max_email_mb() -> float:
+    """
+    Largest ``.emlx`` file the indexer will parse, in megabytes.
+
+    Resolution: ``APPLE_MAIL_INDEX_MAX_EMAIL_MB`` env, then
+    ``[index] max_email_mb`` in ``config.toml``, then ``25``.
+
+    The cap exists so one malformed or enormous message cannot exhaust
+    memory. Messages above it are recorded as skipped (visible in
+    ``get_index_status``) rather than silently dropped; raise it if you
+    need very large mail to be searchable.
+    """
+    env = os.environ.get("APPLE_MAIL_INDEX_MAX_EMAIL_MB")
+    if env is not None and env != "":
+        try:
+            parsed = float(env)
+        except ValueError:
+            parsed = 0.0
+        # A non-positive ceiling would skip every message and flood the
+        # dead letter queue; treat it as "unset" rather than obey it.
+        if parsed > 0:
+            return parsed
+    val = _from_toml("index", "max_email_mb")
+    if val is not None and float(val) > 0:
+        return float(val)
+    return 25.0
+
+
+def get_log_path() -> Path | None:
+    """Where the server writes its own log.
+
+    The server's stderr is not reachable when it runs as a desktop
+    extension, so without a file of our own a crash leaves no trace at
+    all — the in-memory event ring dies with the process. Set
+    ``APPLE_MAIL_LOG_PATH`` to relocate it, or to an empty string to
+    disable file logging.
+    """
+    env = os.environ.get("APPLE_MAIL_LOG_PATH")
+    if env is not None:
+        # Explicit None for "disabled": Path("") normalizes to ".",
+        # which is a truthy directory — the guard never fired and the
+        # handler tried to open the current directory as a file.
+        return Path(env).expanduser() if env else None
+    return DEFAULT_LOG_PATH
+
+
+def get_index_auto_build() -> bool:
+    """
+    Whether the server builds the index on first run when none exists.
+
+    Resolution: ``APPLE_MAIL_INDEX_AUTO_BUILD`` env, then ``[index]
+    auto_build`` in ``config.toml``, then ``True``. When enabled and no
+    index is present at ``serve`` startup, the server kicks off a
+    background ``build_from_disk`` so a fresh install is usable (search,
+    write id-resolution) without a manual ``apple-mail-mcp index`` call.
+    Requires Full Disk Access; a failed build is logged, not fatal.
+    """
+    env = os.environ.get("APPLE_MAIL_INDEX_AUTO_BUILD")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    val = _from_toml("index", "auto_build")
+    if val is not None:
+        return bool(val)
+    return True
+
+
 def get_index_staleness_hours() -> float:
     """
     Get the staleness threshold for the index, in hours.
@@ -376,6 +451,18 @@ config_version = 1
 # Hours before the index is considered stale and should be re-synced.
 # Env: APPLE_MAIL_INDEX_STALENESS_HOURS
 # staleness_hours = 24.0
+
+# Largest single email to parse, in MB. Bigger messages are skipped and
+# reported in the index status. Raise it to make very large mail
+# searchable, at the cost of more memory during indexing.
+# Env: APPLE_MAIL_INDEX_MAX_EMAIL_MB
+# max_email_mb = 25
+
+# Build the index automatically on first run when none exists (background;
+# requires Full Disk Access). Set false to require a manual
+# `apple-mail-mcp index` instead.
+# Env: APPLE_MAIL_INDEX_AUTO_BUILD
+# auto_build = true
 
 # Mailboxes to skip during indexing.
 # Empty list ([]) explicitly disables all exclusions.

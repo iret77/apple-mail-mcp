@@ -17,13 +17,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..config import get_index_max_emails
+from .disk import emlx_too_large
 from .schema import (
     CLEAR_PARSE_FAILURE_SQL,
     INSERT_EMAIL_SQL,
     RECORD_PARSE_FAILURE_SQL,
+    SKIP_REASON_TOO_LARGE,
     email_to_row,
     insert_attachments,
     parse_failure_row,
+    skip_row,
 )
 
 if TYPE_CHECKING:
@@ -256,6 +259,21 @@ def sync_from_disk(
             continue
 
         try:
+            # Oversized files are skipped by parse_emlx with a bare
+            # None; check first so the skip is recorded instead of
+            # vanishing (the build path does the same).
+            if emlx_too_large(Path(path)):
+                conn.execute(
+                    RECORD_PARSE_FAILURE_SQL,
+                    skip_row(path, account, mailbox, SKIP_REASON_TOO_LARGE),
+                )
+                skipped_per_mailbox[mb_key] = (
+                    skipped_per_mailbox.get(mb_key, 0) + 1
+                )
+                continue
+            # One unparseable message must never abort the whole sync:
+            # a single mail with an undecodable header stopped every
+            # later message from being indexed for a full day.
             parsed = parse_emlx(Path(path))
             if parsed:
                 attachments = parsed.attachments or []
@@ -266,6 +284,7 @@ def sync_from_disk(
                         "sender": parsed.sender,
                         "content": parsed.content,
                         "date_received": parsed.date_received,
+                        "message_id_header": parsed.message_id_header,
                     },
                     account,
                     mailbox,
@@ -283,8 +302,15 @@ def sync_from_disk(
 
                 added += 1
                 mailbox_counts[mb_key] = current_count + 1
-        except (OSError, ValueError, UnicodeDecodeError) as e:
-            logger.debug("Failed to parse %s: %s", path, e)
+        except Exception as e:
+            # Deliberately broad. This guard exists so ONE unusable
+            # message cannot stop the rest from being indexed, and a
+            # narrow tuple defeats that: an AttributeError from an
+            # undecodable header escaped it and aborted every sync for
+            # a day, silently leaving 158 messages unindexed. Anything
+            # a single file can throw belongs in the DLQ, not in the
+            # caller's face.
+            logger.debug("Failed to parse %s: %s", path, e, exc_info=True)
             errors += 1
             # Record into the DLQ for visibility / future retry.
             try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -302,3 +303,60 @@ class TestSyncFromDisk:
             sync_from_disk(sync_db, mail_dir)
 
         assert "hit cap" in caplog.text
+
+
+class TestOneBadMessageCannotAbortTheSync:
+    """A single unusable message must land in the DLQ, not abort the
+    run: an undecodable header stopped every sync for a full day."""
+
+    def test_attribute_error_from_one_file_is_isolated(
+        self, temp_db, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import sync as sync_mod
+
+        good = tmp_path / "1.emlx"
+        bad = tmp_path / "2.emlx"
+        for f in (good, bad):
+            f.write_bytes(b"x")
+
+        # iter_disk_inventory yields flat rows for the temp table.
+        inventory = [
+            ("acct", "INBOX", 1, str(good)),
+            ("acct", "INBOX", 2, str(bad)),
+        ]
+
+        def fake_parse(path):
+            if str(path) == str(bad):
+                # Exactly what an undecodable header did.
+                raise AttributeError("'Header' object has no attribute 'strip'")
+            return SimpleNamespace(
+                id=1,
+                subject="ok",
+                sender="a@b",
+                content="c",
+                date_received="2026-01-01",
+                message_id_header="<1@x>",
+                attachments=[],
+            )
+
+        with (
+            # iter_disk_inventory and parse_emlx are imported inside the
+            # function, so they must be patched at their source module.
+            patch(
+                "apple_mail_mcp.index.disk.iter_disk_inventory",
+                return_value=iter(inventory),
+            ),
+            patch("apple_mail_mcp.index.disk.parse_emlx", fake_parse),
+            patch.object(sync_mod, "emlx_too_large", lambda p: False),
+        ):
+            result = sync_mod.sync_from_disk(temp_db, tmp_path)
+
+        # The good one is indexed, the bad one is recorded, no raise.
+        assert result.added == 1
+        row = temp_db.execute(
+            "SELECT error_type FROM failed_index_jobs WHERE emlx_path = ?",
+            (str(bad),),
+        ).fetchone()
+        assert row is not None and row[0] == "AttributeError"

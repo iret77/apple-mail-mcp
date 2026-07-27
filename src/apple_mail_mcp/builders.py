@@ -34,6 +34,11 @@ PROPERTY_SETS = {
         "date_received",
         "read",
         "flagged",
+        # The stable handle. batchFetch costs one IPC call per
+        # property, so carrying it everywhere is cheap — and without it
+        # every JXA-served listing hands out ids that stop resolving
+        # the moment another device files the message elsewhere.
+        "message_id",
     ],
     "full": [
         "id",
@@ -240,6 +245,321 @@ class AccountsQueryBuilder:
         return f"""
 const account = MailCore.getAccount({account_json});
 JSON.stringify(MailCore.listMailboxes(account));
+"""
+
+
+# Apple Mail flag-color name → `flag index` value. Setting `flagIndex`
+# to one of these also flags the message; `flaggedStatus = false`
+# clears it (resetting the index to -1). "default" (a plain flag with
+# no forced color) and "none" (unflag) are handled by the caller, not
+# by this map.
+FLAG_COLOR_INDEX = {
+    "red": 0,
+    "orange": 1,
+    "yellow": 2,
+    "green": 3,
+    "blue": 4,
+    "purple": 5,
+    "gray": 6,
+}
+
+
+@dataclass
+class WriteBuilder:
+    """Builder for batch property writes (read/flag) over located messages.
+
+    Applies a single property change to a batch of messages grouped by
+    ``(account, mailbox)`` in ONE osascript invocation. Each group opens
+    its mailbox once and batch-fetches the id array (``mb.messages.id()``)
+    rather than doing per-message IPC — the same 87x optimization the read
+    path uses.
+
+    The mutating JS statement (``apply_js``) is derived solely from the
+    operation and a validated int/bool — never from caller-supplied
+    strings. Account/mailbox names and message ids cross into JXA only
+    through ``json.dumps`` of ``groups``, so nothing untrusted is
+    interpolated into executable JS.
+
+    Two group shapes are accepted:
+
+    - **Located** — ``{"account", "mailbox", "ids"}``: open that mailbox
+      once and apply. Fast; used when the index (or an explicit hint)
+      knows where an id lives.
+    - **Scan** — ``{"account", "ids", "scan": true}`` (no mailbox):
+      iterate the account's mailboxes (bounded by ``max_scan_mailboxes``)
+      looking for each id and apply on match. The index-free fallback,
+      mirroring ``get_email``'s all-mailbox scan.
+
+    Construct via the :meth:`set_read` / :meth:`set_flag` factories.
+
+    Args:
+        groups: list of located and/or scan group dicts (see above).
+        apply_js: JS run per located message, with ``msg`` in scope.
+        max_scan_mailboxes: cap on mailboxes visited per scan group.
+    """
+
+    groups: list[dict]
+    apply_js: str
+    max_scan_mailboxes: int = 50
+    needs_change_js: str = "true"
+
+    @classmethod
+    def set_read(
+        cls, groups: list[dict], read: bool, max_scan_mailboxes: int = 50
+    ) -> "WriteBuilder":
+        """Build a read/unread (seen/unseen) writer."""
+        want = "true" if read else "false"
+        return cls(
+            groups,
+            f"msg.readStatus = {want};",
+            max_scan_mailboxes,
+            needs_change_js=f"msg.readStatus() !== {want}",
+        )
+
+    @classmethod
+    def set_flag(
+        cls,
+        groups: list[dict],
+        flagged: bool,
+        flag_index: int | None = None,
+        max_scan_mailboxes: int = 50,
+    ) -> "WriteBuilder":
+        """Build a flag/unflag writer.
+
+        Args:
+            flagged: ``False`` clears the flag (color reset to -1).
+            flag_index: When ``flagged`` and this is 0-6, force that flag
+                color; ``None`` flags without forcing a color.
+        """
+        if not flagged:
+            apply_js = "msg.flaggedStatus = false;"
+            needs = "msg.flaggedStatus() !== false"
+        elif flag_index is None:
+            apply_js = "msg.flaggedStatus = true;"
+            needs = "msg.flaggedStatus() !== true"
+        else:
+            idx = int(flag_index)
+            apply_js = f"msg.flaggedStatus = true; msg.flagIndex = {idx};"
+            needs = f"msg.flaggedStatus() !== true || msg.flagIndex() !== {idx}"
+        return cls(groups, apply_js, max_scan_mailboxes, needs_change_js=needs)
+
+    def build(self) -> str:
+        """Generate the JXA script string.
+
+        Returns a script that ends in ``JSON.stringify({updated, not_found})``
+        where both are arrays of message ids. Ids present in a group but
+        absent from the mailbox (moved/deleted since indexing) land in
+        ``not_found`` rather than failing the whole batch.
+        """
+        groups_json = json.dumps(self.groups)
+        max_scan = int(self.max_scan_mailboxes)
+        return f"""
+const groups = {groups_json};
+const MAX_SCAN = {max_scan};
+// Never apply a recovered write in a discard mailbox.
+const DISCARD_MAILBOXES = [
+    "trash", "deleted items", "deleted messages", "bin",
+    "junk", "junk email", "spam",
+];
+const updated = [];
+const unchanged = [];
+const notFound = [];
+
+// Apply the change to the message at `idx`, but only after confirming
+// it really is `targetId`. The id list is a snapshot: if the mailbox
+// changes between fetching it and writing (mail arrives, a message is
+// moved or deleted), positions shift and the same index would point at
+// a different message — silently modifying the wrong mail. On a
+// mismatch, re-resolve by id and skip if that fails.
+function applyToMessage(collection, idx, targetId) {{
+    let msg = collection[idx];
+    try {{
+        if (msg.id() !== targetId) {{
+            msg = collection.byId(targetId);
+            if (msg.id() !== targetId) return "failed";
+        }}
+    }} catch (e) {{
+        return "failed";
+    }}
+    // Skip messages that already hold the requested state. Read live
+    // from Mail — never from an index, which can be stale. Every write
+    // is a server round-trip for IMAP/Exchange accounts (and rotates
+    // the Exchange ItemId), so a no-op write is not free.
+    try {{
+        if (!({self.needs_change_js})) return "unchanged";
+    }} catch (e) {{
+        // Current state unreadable — write rather than silently skip.
+    }}
+    {self.apply_js}
+    return "updated";
+}}
+
+// Same contract, but identity is the RFC822 Message-ID (used by the
+// recovery path, where the ROWID is no longer valid).
+function applyByHeader(collection, idx, targetHeader) {{
+    const msg = collection[idx];
+    try {{
+        if (msg.messageId() !== targetHeader) return "failed";
+    }} catch (e) {{
+        return "failed";
+    }}
+    try {{
+        if (!({self.needs_change_js})) return "unchanged";
+    }} catch (e) {{
+        // Current state unreadable — write rather than silently skip.
+    }}
+    {self.apply_js}
+    return "updated";
+}}
+
+for (const g of groups) {{
+    let account;
+    try {{
+        account = MailCore.getAccount(g.account);
+    }} catch (e) {{
+        // Group shapes differ: located/scan carry `ids`, recovery
+        // carries `headers`. Reading the wrong one throws INSIDE a
+        // catch, which escapes and kills the whole batch.
+        for (const t of (g.ids || g.headers || [])) notFound.push(t);
+        continue;
+    }}
+
+    if (g.by_header) {{
+        // Recovery path: the ROWIDs are gone (another device filed the
+        // message elsewhere), so match on the RFC822 Message-ID, which
+        // survives moves. Batch-fetch headers per mailbox — one IPC
+        // call each, never per message.
+        let mailboxes;
+        try {{
+            mailboxes = account.mailboxes();
+        }} catch (e) {{
+            for (const h of g.headers) notFound.push(h);
+            continue;
+        }}
+        const remaining = new Set(g.headers);
+        // Prefer the mailboxes the index already associates with these
+        // messages, and never write into a discard mailbox: the same
+        // message often still exists in Trash after being re-filed, and
+        // flagging that copy leaves the visible one untouched.
+        const preferred = g.prefer_mailboxes || [];
+        const ordered = [];
+        const rest = [];
+        for (let m = 0; m < mailboxes.length; m++) {{
+            let nm = "";
+            try {{ nm = String(mailboxes[m].name()); }} catch (e) {{}}
+            if (DISCARD_MAILBOXES.indexOf(nm.toLowerCase()) !== -1) continue;
+            if (preferred.indexOf(nm) !== -1) ordered.push(mailboxes[m]);
+            else rest.push(mailboxes[m]);
+        }}
+        const candidates = ordered.concat(rest);
+        const limit = Math.min(candidates.length, MAX_SCAN);
+        for (let m = 0; m < limit && remaining.size > 0; m++) {{
+            let headers;
+            try {{
+                headers = candidates[m].messages.messageId();
+            }} catch (e) {{
+                continue;  // skip inaccessible mailbox
+            }}
+            for (const target of Array.from(remaining)) {{
+                const idx = headers.indexOf(target);
+                if (idx === -1) continue;
+                let r = "failed";
+                try {{
+                    r = applyByHeader(candidates[m].messages, idx, target);
+                }} catch (e) {{
+                    r = "failed";
+                }}
+                // Only retire the header once it actually landed;
+                // otherwise a later mailbox may still hold a good copy.
+                if (r === "updated") {{
+                    remaining.delete(target);
+                    updated.push(target);
+                }} else if (r === "unchanged") {{
+                    remaining.delete(target);
+                    unchanged.push(target);
+                }}
+            }}
+        }}
+        for (const h of remaining) notFound.push(h);
+        continue;
+    }}
+
+    if (g.scan) {{
+        // No known mailbox: scan the account's mailboxes for each id.
+        let mailboxes;
+        try {{
+            mailboxes = account.mailboxes();
+        }} catch (e) {{
+            for (const id of g.ids) notFound.push(id);
+            continue;
+        }}
+        const remaining = new Set(g.ids);
+        const limit = Math.min(mailboxes.length, MAX_SCAN);
+        for (let m = 0; m < limit && remaining.size > 0; m++) {{
+            let ids;
+            try {{
+                ids = mailboxes[m].messages.id();
+            }} catch (e) {{
+                continue;  // skip inaccessible mailbox (Junk/Drafts -1728)
+            }}
+            for (const targetId of Array.from(remaining)) {{
+                const idx = ids.indexOf(targetId);
+                if (idx === -1) continue;
+                remaining.delete(targetId);
+                try {{
+                    const r = applyToMessage(
+                        mailboxes[m].messages, idx, targetId);
+                    if (r === "updated") updated.push(targetId);
+                    else if (r === "unchanged") unchanged.push(targetId);
+                    else notFound.push(targetId);
+                }} catch (e) {{
+                    notFound.push(targetId);
+                }}
+            }}
+        }}
+        for (const id of remaining) notFound.push(id);
+        continue;
+    }}
+
+    // Located group: open the known mailbox directly.
+    let mailbox;
+    try {{
+        mailbox = MailCore.getMailbox(account, g.mailbox);
+    }} catch (e) {{
+        for (const id of g.ids) notFound.push(id);
+        continue;
+    }}
+
+    let ids;
+    try {{
+        ids = mailbox.messages.id();
+    }} catch (e) {{
+        for (const id of g.ids) notFound.push(id);
+        continue;
+    }}
+
+    for (const targetId of g.ids) {{
+        const idx = ids.indexOf(targetId);
+        if (idx === -1) {{
+            notFound.push(targetId);
+            continue;
+        }}
+        try {{
+            const r = applyToMessage(mailbox.messages, idx, targetId);
+            if (r === "updated") updated.push(targetId);
+            else if (r === "unchanged") unchanged.push(targetId);
+            else notFound.push(targetId);
+        }} catch (e) {{
+            notFound.push(targetId);
+        }}
+    }}
+}}
+
+JSON.stringify({{
+    updated: updated,
+    unchanged: unchanged,
+    not_found: notFound,
+}});
 """
 
 

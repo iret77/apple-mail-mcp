@@ -16,7 +16,7 @@ src/apple_mail_mcp/
 ├── executor.py         # run_jxa(), execute_with_core(), execute_query()
 ├── index/              # FTS5 search index module
 │   ├── __init__.py     # Exports IndexManager
-│   ├── schema.py       # SQLite schema v5 (DLQ + attachments)
+│   ├── schema.py       # SQLite schema v6 (stable ids, DLQ, attachments)
 │   ├── manager.py      # IndexManager class (disk-based sync)
 │   ├── disk.py         # .emlx reading + get_disk_inventory()
 │   ├── sync.py         # Disk-based state reconciliation
@@ -27,18 +27,97 @@ src/apple_mail_mcp/
     └── mail_core.js    # Shared JXA utilities (MailCore object)
 ```
 
-## MCP Tools (8 total)
+## MCP Tools (12 total)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
 | `list_accounts()` | List email accounts | - |
 | `list_mailboxes(account?)` | List mailboxes | account (optional) |
 | `get_emails(...)` | Unified listing | filter: all/unread/flagged/today/last_7_days |
-| `get_email(id)` | Full email content + attachments | message_id |
+| `get_email(ref)` | Full email content + attachments | message_id (numeric id **or** RFC822 header) |
 | `search(query, ...)` | Unified search | scope, before, after, offset, highlight |
-| `get_email_links(id)` | Extract links from an email | message_id |
-| `get_email_attachment(id, filename)` | Extract attachment content | message_id, filename |
-| `get_attachment(id, filename)` | *Deprecated* — use `get_email_attachment()` | message_id, filename |
+| `get_email_links(ref)` | Extract links from an email | message_id (id or header) |
+| `get_email_attachment(ref, filename)` | Extract attachment content | message_id (id or header), filename |
+| `get_attachment(ref, filename)` | *Deprecated* — use `get_email_attachment()` | message_id, filename |
+| `set_flag(ids, color?)` | *Write* — flag/unflag single or batch, optional color | message_ids, color, account?, mailbox? |
+| `set_read_status(ids, read?)` | *Write* — mark read (seen) / unread (unseen) | message_ids, read, account?, mailbox? |
+| `get_index_status()` | Index health + setup diagnostics (state, progress, Full Disk Access) | - |
+| `refresh_index(full?)` | Sync the index on demand (full=True rebuilds in background) | full |
+
+### Write tools (`set_flag`, `set_read_status`)
+
+First mutating tools. Both accept a single id or a list and return
+per-id buckets `{updated, not_found, skipped_hidden}` (+ optional
+`hint`) — a batch never fails whole. Design notes:
+
+- **Read-only gate:** `_ensure_writable()` first line (regression test
+  `TestWriteImplyingToolsHaveGuard` enforces this for every `set_`/
+  `flag_`/`mark_`/… tool name).
+- **Stable identity is the primary handle, not a fallback.** Mail.app
+  ids are per-mailbox ROWIDs that die the moment *any* device files a
+  message elsewhere — the normal case with phones and tablets on one
+  account. So the RFC822 `Message-ID` header is now a first-class
+  reference end to end. See "Message identity" below.
+- **ID resolution:** Mail.app ids are per-mailbox ROWIDs — not globally
+  addressable. `_resolve_write_targets()` reuses the index location
+  resolver (`find_email_location`), groups ids by `(account, mailbox)`,
+  and runs a `WriteBuilder` `osascript` batch. Ids the index can't place
+  fall back to an explicit `account` + `mailbox` hint, then to a bounded
+  all-mailbox **scan** of a visible account (`{"scan": true}` group,
+  mirroring `get_email` Strategy 3) — so writes work with no index at
+  all. `_apply_write` runs located and scan groups in *separate*
+  osascript calls (bounded timeout on the scan) so a slow scan can't
+  discard the fast located writes.
+- **Excluded-account boundary (#90):** ids resolving into a hidden
+  account go to `skipped_hidden`, never to JXA; an explicitly-named
+  hidden `account` skips the whole batch.
+- **Flag colors** (`msg.flagIndex`): red 0, orange 1, yellow 2, green 3,
+  blue 4, purple 5, gray 6; `color="none"` unflags, `"default"` flags
+  without forcing a color. No index write needed — read/flag state is
+  served live from the Envelope Index / `.emlx` footer, not cached.
+
+## Message identity (read this before touching any tool that takes an id)
+
+A Mail.app message id is a **per-mailbox ROWID**. It is exact while the
+message stays put and *dead* the moment it is filed elsewhere — which
+happens routinely, since most accounts are open on a phone and a tablet
+as well. The RFC822 `Message-ID` header survives that. Therefore:
+
+- **Every read path hands out both.** `get_email` returns `id` and
+  `message_id`; `search()` and `get_emails()` carry `message_id` in
+  every result (FTS from the `rfc822_message_id` column, the Envelope
+  Index fast path via one batched `IndexManager.get_rfc822_ids()`
+  lookup, the JXA paths from `messageId` in `PROPERTY_SETS["standard"]`).
+  Their docstrings tell the model to prefer it.
+- **Every tool that takes a message accepts both** — `get_email`,
+  `get_email_links`, `get_email_attachment`, `get_attachment`,
+  `set_flag`, `set_read_status`. `_normalize_message_ids()` validates
+  ints and header strings alike.
+- **A header is never translated back into a ROWID and then trusted.**
+  That is the whole point: an index row can be stale, and its ROWID may
+  by then belong to a *different* message.
+  - Writes: `_resolve_write_targets()` uses the index only to pick the
+    account and to order the mailbox scan (`prefer_mailboxes`). The
+    write itself matches `msg.messageId()` in JXA
+    (`WriteBuilder.applyByHeader`), so a stale row can misdirect the
+    scan but can never write the wrong message. Header groups run in
+    their own `osascript` call and are echoed back as headers.
+  - Reads: `_get_email_by_header()` / `_resolve_emlx_path_by_header()`
+    fetch each candidate the index offers and **verify** the header on
+    what came back, moving to the next candidate on a mismatch and
+    raising rather than returning a stranger's mail.
+- **`_retry_by_stable_id()` remains** for callers who only have an int:
+  a `not_found` ROWID is looked up in the index and retried by header,
+  reporting the move via `hint`. It only works while the old row still
+  exists, which is exactly why the header is the better handle.
+- **Rows indexed before schema v6** have NULL; `get_index_status`
+  surfaces the count as `without_stable_id` and points at
+  `refresh_index(full=True)`.
+- **`MailCore.batchFetch` degrades per property.** Carrying `messageId`
+  everywhere means one more bulk IPC call per listing; a property Mail
+  refuses is padded with nulls instead of taking the whole listing
+  down. It still raises when *no* property could be read, so an
+  unreadable mailbox never reads as "0 messages".
 
 ## MCP Resources (1 total)
 
@@ -67,6 +146,9 @@ search("pdf", scope="attachments")         # By attachment filename (SQL)
 search("invoice", after="2025-01-01")      # Date-range filtering
 search("meeting", highlight=True)          # Highlighted results
 search("meeting", limit=20, offset=20)    # Page 2 of results
+
+# Every result carries `message_id` (the RFC822 header). Pass THAT to
+# get_email / set_flag / set_read_status — see "Message identity".
 ```
 
 ## Architecture
@@ -164,14 +246,14 @@ reply_to, message_id from MIME headers.
 | Pattern | Location | Purpose |
 |---------|----------|---------|
 | **Builder** | `QueryBuilder` | Safe JXA script construction, prevents injection |
-| **Singleton** | `IndexManager` | Single SQLite writer, one file watcher |
+| **Singleton** | `IndexManager` | One file watcher; per-thread SQLite connections |
 | **Facade** | `MailCore` JS | Clean API over verbose Apple Events |
 | **Factory** | `create_connection()` | Consistent DB configuration |
 | **State Reconciliation** | `sync_from_disk()` | Fast diff-based sync |
 
 ## FTS5 Search Index
 
-### Database Schema (v5)
+### Database Schema (v6)
 
 ```sql
 -- Email content cache
@@ -185,6 +267,7 @@ CREATE TABLE emails (
     content TEXT,                    -- Body text
     date_received TEXT,
     emlx_path TEXT,                  -- Path for sync
+    rfc822_message_id TEXT,          -- Stable identity (v6), survives moves
     attachment_count INTEGER DEFAULT 0,
     indexed_at TEXT DEFAULT (datetime('now')),
     UNIQUE(account, mailbox, message_id)
@@ -495,6 +578,8 @@ silently using degraded config.
 | `APPLE_MAIL_INDEX_PATH` | `[index] path` | `~/.apple-mail-mcp/index.db` | Index database location |
 | `APPLE_MAIL_INDEX_MAX_EMAILS` | `[index] max_emails` | _unset_ | Optional per-mailbox ceiling (default: uncapped) |
 | `APPLE_MAIL_INDEX_STALENESS_HOURS` | `[index] staleness_hours` | `24` | Hours before refresh |
+| `APPLE_MAIL_INDEX_MAX_EMAIL_MB` | `[index] max_email_mb` | `25` | Largest single `.emlx` to parse. Bigger messages are skipped, recorded in the DLQ as `too_large`, and reported by `get_index_status` as `skipped_too_large` — never dropped silently |
+| `APPLE_MAIL_INDEX_AUTO_BUILD` | `[index] auto_build` | `true` | Build the index in the background on first `serve` when none exists (requires Full Disk Access; failure logged, not fatal). Set `false` to require a manual `apple-mail-mcp index` |
 | `APPLE_MAIL_INDEX_EXCLUDE_MAILBOXES` | `[index] exclude_mailboxes` | `["Drafts"]` | Mailboxes to skip during indexing |
 | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` | `[index] exclude_accounts` | _unset_ | Accounts (by display name, exact/case-sensitive) hidden from the whole server: never indexed, filtered from search, invisible to list/get tools (#90) |
 | `APPLE_MAIL_READ_ONLY` | `[server] read_only` | `false` | Disable write operations (enforced via `_ensure_writable()` in `server.py`, #80) |
@@ -553,4 +638,5 @@ Chart PNGs are committed (they ARE the results). JSON and HTML in `benchmarks/re
 | **Path Traversal** | Path validation in file watcher | watcher.py |
 | **Data Exposure** | Database and attachment cache files created with 0o600 permissions | schema.py, server.py |
 | **Unbounded Memory** | Pending changes limit in watcher | watcher.py |
-| **Excluded-Account Exposure** | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` boundary (#90). Every NEW tool/read path must gate: `_hidden_account()` at tool entry, `exclude_accounts` in SQL search, `_path_in_excluded_account()` before disk reads, `_resolve_visible_account()` before any JXA call that defaults to `Mail.accounts()[0]` | server.py, index/search.py |
+| **Excluded-Account Exposure** | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` boundary (#90). Every NEW tool/read path must gate: `_hidden_account()` at tool entry, `exclude_accounts` in SQL search, `_path_in_excluded_account()` before disk reads, `_resolve_visible_account()` before any JXA call that defaults to `Mail.accounts()[0]`. Write tools gate via `_resolve_write_targets()` (skips ids resolving into a hidden account, never dispatched to JXA) | server.py, index/search.py |
+| **Unauthorized Writes** | `_ensure_writable()` refuses every mutating tool under read-only mode (#80); regression test scans for write-implying tool names | server.py |

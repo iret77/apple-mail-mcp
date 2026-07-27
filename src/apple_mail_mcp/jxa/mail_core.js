@@ -121,8 +121,30 @@ const MailCore = {
      */
     batchFetch(msgs, props) {
         const result = {};
+        const failed = [];
+        let len = -1;
         for (const prop of props) {
-            result[prop] = msgs[prop]();
+            try {
+                result[prop] = msgs[prop]();
+                if (len < 0 && result[prop]) len = result[prop].length;
+            } catch (e) {
+                // One property Mail refuses to report in bulk must not
+                // take the whole listing down with it — pad it instead,
+                // so the caller's per-index arithmetic still lines up.
+                failed.push(prop);
+            }
+        }
+        if (len < 0) {
+            // Nothing came back at all: this is a real failure (bad
+            // mailbox, no access) and must surface, not read as "0
+            // messages".
+            throw new Error(
+                "batchFetch: no property could be read (" +
+                props.join(", ") + ")"
+            );
+        }
+        for (const prop of failed) {
+            result[prop] = new Array(len).fill(null);
         }
         return result;
     },

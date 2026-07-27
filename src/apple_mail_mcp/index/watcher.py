@@ -21,21 +21,27 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .disk import find_mail_directory, parse_emlx
+from .disk import emlx_too_large, find_mail_directory, parse_emlx
 from .schema import (
     CLEAR_PARSE_FAILURE_SQL,
     INSERT_EMAIL_SQL,
     RECORD_PARSE_FAILURE_SQL,
+    SKIP_REASON_TOO_LARGE,
     create_connection,
     email_to_row,
     insert_attachments,
     parse_failure_row,
+    skip_row,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
+
+# How long a watcher batch waits for a running build or sync before
+# giving up and re-queueing itself.
+WRITE_LOCK_TIMEOUT_SEC = 30.0
 
 # Regex to extract account/mailbox from path
 # ~/Library/Mail/V10/[AccountUUID]/[Mailbox].mbox/.../*.emlx
@@ -67,6 +73,7 @@ class IndexWatcher:
         on_update: Callable[[int, int], None] | None = None,
         debounce_ms: int = 500,
         exclude_account_uuids: set[str] | None = None,
+        write_lock: threading.Lock | None = None,
     ):
         """
         Initialize the watcher.
@@ -75,6 +82,9 @@ class IndexWatcher:
             db_path: Path to the index database
             on_update: Optional callback(added, removed) after processing
             debounce_ms: Milliseconds to wait before processing changes
+            write_lock: IndexManager's single-writer lock. Shared so
+                watcher writes wait for a running build instead of
+                failing on a locked database.
             exclude_account_uuids: Account UUIDs whose new files must
                 not be indexed. Paths carry the account UUID directly
                 (see `_parse_path`), so no JXA is needed in the watcher
@@ -84,6 +94,10 @@ class IndexWatcher:
         self.on_update = on_update
         self.debounce_ms = debounce_ms
         self._exclude_account_uuids = exclude_account_uuids or set()
+        # The single-writer lock shared with IndexManager. Without it a
+        # rebuild's open transaction makes every watcher write fail with
+        # "database is locked" for the whole build.
+        self._write_lock = write_lock or threading.Lock()
 
         self._mail_dir: Path | None = None
         self._stop_event = threading.Event()
@@ -248,6 +262,23 @@ class IndexWatcher:
 
         return account_name, mailbox_name, message_id
 
+    def _requeue(self, adds: dict, deletes: set) -> None:
+        """Put a failed batch back on the queue.
+
+        The batch is drained before the database work starts, so
+        discarding it on error silently loses those messages until the
+        next full sync. Re-queue instead, respecting the cap.
+        """
+        with self._pending_lock:
+            for key, value in adds.items():
+                if len(self._pending_adds) >= MAX_PENDING_CHANGES:
+                    break
+                self._pending_adds.setdefault(key, value)
+            for key in deletes:
+                if len(self._pending_deletes) >= MAX_PENDING_CHANGES:
+                    break
+                self._pending_deletes.add(key)
+
     def _process_pending(self) -> None:
         """Process pending adds and deletes."""
         with self._pending_lock:
@@ -259,6 +290,25 @@ class IndexWatcher:
         if not adds and not deletes:
             return
 
+        # Wait for any running build/sync rather than failing against
+        # its open transaction. Bounded so a wedged build cannot stall
+        # the watcher thread forever; the batch is re-queued instead.
+        if not self._write_lock.acquire(timeout=WRITE_LOCK_TIMEOUT_SEC):
+            logger.info(
+                "Index busy; deferring %d add(s) and %d delete(s)",
+                len(adds),
+                len(deletes),
+            )
+            self._requeue(adds, deletes)
+            return
+        try:
+            self._process_batch(adds, deletes)
+        finally:
+            self._write_lock.release()
+
+    def _process_batch(self, adds: dict, deletes: set) -> None:
+        """Apply one drained batch to the index."""
+
         added_count = 0
         deleted_count = 0
 
@@ -266,6 +316,9 @@ class IndexWatcher:
             conn = self._get_conn()
         except sqlite3.Error as e:
             logger.error("Database error in watcher: %s", e)
+            # The batch was already drained; keep it for the next pass
+            # instead of losing those messages until a full sync.
+            self._requeue(adds, deletes)
             return
 
         # Deletes and adds commit as separate transactions. sqlite3
@@ -300,6 +353,23 @@ class IndexWatcher:
                 # via the live watcher.
                 if account in self._exclude_account_uuids:
                     continue
+                # Oversized files never parse; record the skip instead
+                # of retrying three times and dropping them silently.
+                if emlx_too_large(path):
+                    try:
+                        conn.execute(
+                            RECORD_PARSE_FAILURE_SQL,
+                            skip_row(
+                                str(path),
+                                account,
+                                mailbox,
+                                SKIP_REASON_TOO_LARGE,
+                            ),
+                        )
+                    except sqlite3.Error:
+                        logger.debug("Could not record skip for %s", path)
+                    continue
+
                 email = None
                 last_error: BaseException | None = None
 
@@ -374,6 +444,7 @@ class IndexWatcher:
                                 "sender": email.sender,
                                 "content": email.content,
                                 "date_received": email.date_received,
+                                "message_id_header": email.message_id_header,
                             },
                             account,
                             mailbox,
@@ -400,6 +471,10 @@ class IndexWatcher:
             added_count = 0
             with contextlib.suppress(sqlite3.Error):
                 conn.rollback()
+            # Nothing was committed, so these are not indexed. Keeping
+            # them queued is the difference between a retry and silent
+            # data loss.
+            self._requeue(adds, set())
 
         # Notify callback
         if self.on_update and (added_count or deleted_count):

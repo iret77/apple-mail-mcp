@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 # Mail.app version folder (V10 for macOS Catalina+)
 # Deprecated: use find_mail_directory() which auto-detects.
@@ -101,8 +101,37 @@ def extract_message_id(path: Path) -> int:
     return int(path.name.split(".")[0])
 
 
-# Maximum email file size to prevent OOM from malformed/huge files (25 MB)
+# Default ceiling on a single .emlx, guarding against OOM from a
+# malformed or enormous message. Configurable — see
+# `max_emlx_size()` and APPLE_MAIL_INDEX_MAX_EMAIL_MB.
 MAX_EMLX_SIZE = 25 * 1024 * 1024
+
+
+class EmailTooLargeError(ValueError):
+    """An `.emlx` exceeds the configured size ceiling.
+
+    Raised only where a caller can record it. Skipping such a file is a
+    deliberate trade-off, but it must never be invisible: a silently
+    dropped message is simply missing from search with no explanation.
+    """
+
+
+def max_emlx_size() -> int:
+    """Current size ceiling in bytes (config, default 25 MB)."""
+    try:
+        from ..config import get_index_max_email_mb
+
+        return int(get_index_max_email_mb() * 1024 * 1024)
+    except Exception:
+        return MAX_EMLX_SIZE
+
+
+def emlx_too_large(path: Path) -> bool:
+    """True when `path` exceeds the configured ceiling."""
+    try:
+        return path.stat().st_size > max_emlx_size()
+    except OSError:
+        return False
 
 
 @dataclass
@@ -322,6 +351,54 @@ def _format_timestamp(timestamp: float | int | None) -> str:
         return ""
 
 
+def _filename_text(part) -> str:
+    """Attachment filename as plain text.
+
+    ``get_filename()`` is header-derived and can hand back a ``Header``
+    for the same reason every other header can, so it must not be used
+    raw either.
+    """
+    try:
+        raw = part.get_filename()
+    except Exception:
+        return ""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    try:
+        return str(make_header(decode_header(str(raw))))
+    except Exception:
+        return str(raw)
+
+
+def header_text(message, name: str, default: str = "") -> str:
+    """Return a header as plain, decoded text — always a real ``str``.
+
+    Python's email parser returns a ``Header`` object instead of a
+    string whenever a header carries bytes it cannot decode, which real
+    mail does regularly (a non-ASCII relay name in `Received`, a broken
+    charset in `Subject`). Every string operation then fails with
+    AttributeError: 'Header' object has no attribute 'rfind' / 'strip'
+    / 'lower' — and one such message aborted the entire sync, so all
+    later mail stopped being indexed.
+
+    Callers must never touch a raw header value; go through here.
+    """
+    raw = message.get(name)
+    if raw is None:
+        return default
+    if isinstance(raw, str):
+        return raw
+    try:
+        return str(make_header(decode_header(str(raw))))
+    except Exception:
+        try:
+            return str(raw)
+        except Exception:
+            return default
+
+
 def parse_emlx(path: Path) -> EmlxEmail | None:
     """
     Parse a single .emlx file.
@@ -338,8 +415,10 @@ def parse_emlx(path: Path) -> EmlxEmail | None:
         EmlxEmail with parsed content, or None if parsing fails
     """
     try:
-        # Check file size to prevent OOM from huge/malformed files
-        if path.stat().st_size > MAX_EMLX_SIZE:
+        # Check file size to prevent OOM from huge/malformed files.
+        # Callers that can report the skip should test `emlx_too_large`
+        # first; returning None here keeps the parser total.
+        if path.stat().st_size > max_emlx_size():
             return None
 
         content = path.read_bytes()
@@ -364,14 +443,15 @@ def parse_emlx(path: Path) -> EmlxEmail | None:
 
         # Extract subject with proper decoding
         subject = ""
-        if msg["Subject"]:
+        raw_subject = header_text(msg, "Subject")
+        if raw_subject:
             try:
-                subject = str(make_header(decode_header(msg["Subject"])))
+                subject = str(make_header(decode_header(raw_subject)))
             except (UnicodeDecodeError, LookupError):
-                subject = msg["Subject"] or ""
+                subject = raw_subject
 
         # Extract sender
-        sender = msg["From"] or ""
+        sender = header_text(msg, "From")
         if sender:
             try:
                 sender = str(make_header(decode_header(sender)))
@@ -381,7 +461,7 @@ def parse_emlx(path: Path) -> EmlxEmail | None:
         # Extract received date from Received header (delivery time)
         # Falls back to Date header if no Received header exists
         date_received = ""
-        received_header = msg["Received"]
+        received_header = header_text(msg, "Received")
         if received_header:
             try:
                 from email.utils import parsedate_to_datetime
@@ -394,14 +474,15 @@ def parse_emlx(path: Path) -> EmlxEmail | None:
                     date_received = dt.isoformat()
             except (ValueError, TypeError):
                 pass
-        if not date_received and msg["Date"]:
+        raw_date = header_text(msg, "Date")
+        if not date_received and raw_date:
             try:
                 from email.utils import parsedate_to_datetime
 
-                dt = parsedate_to_datetime(msg["Date"])
+                dt = parsedate_to_datetime(raw_date)
                 date_received = dt.isoformat()
             except (ValueError, TypeError):
-                date_received = msg["Date"]
+                date_received = raw_date
 
         # Extract body text
         body = _extract_body_text(msg)
@@ -414,23 +495,24 @@ def parse_emlx(path: Path) -> EmlxEmail | None:
 
         # Extract sent date from Date header (composition time)
         date_sent = ""
-        if msg["Date"]:
+        if raw_date:
             try:
                 from email.utils import parsedate_to_datetime
 
-                dt = parsedate_to_datetime(msg["Date"])
+                dt = parsedate_to_datetime(raw_date)
                 date_sent = dt.isoformat()
             except (ValueError, TypeError):
-                date_sent = msg["Date"]
+                date_sent = raw_date
 
         reply_to = ""
-        if msg["Reply-To"]:
+        raw_reply_to = header_text(msg, "Reply-To")
+        if raw_reply_to:
             try:
-                reply_to = str(make_header(decode_header(msg["Reply-To"])))
+                reply_to = str(make_header(decode_header(raw_reply_to)))
             except (UnicodeDecodeError, LookupError):
-                reply_to = msg["Reply-To"] or ""
+                reply_to = raw_reply_to
 
-        message_id_header = msg.get("Message-ID", "") or ""
+        message_id_header = header_text(msg, "Message-ID")
 
         # Extract read/flagged from plist footer flags bitmask
         read = None
@@ -597,7 +679,7 @@ def _estimate_attachment_size(part: email.message.Message) -> int:
     if not raw or not isinstance(raw, str):
         return 0
 
-    encoding = (part.get("Content-Transfer-Encoding") or "").lower().strip()
+    encoding = header_text(part, "Content-Transfer-Encoding").lower().strip()
 
     if encoding == "base64":
         # Compute clean length without intermediate copies. (#81)
@@ -774,7 +856,7 @@ def _extract_attachments(
 
     for part in msg.walk():
         content_type = part.get_content_type()
-        disposition = str(part.get("Content-Disposition") or "")
+        disposition = header_text(part, "Content-Disposition")
 
         # Skip multipart containers and plain text/html body
         if part.get_content_maintype() == "multipart":
@@ -784,12 +866,12 @@ def _extract_attachments(
         ):
             continue
 
-        content_id = part.get("Content-ID")
+        content_id = header_text(part, "Content-ID")
         if content_id:
             # Strip angle brackets: <cid123> → cid123
             content_id = content_id.strip("<>")
 
-        filename = part.get_filename() or ""
+        filename = _filename_text(part)
         if not filename:
             if "attachment" not in disposition.lower() and not content_id:
                 continue
@@ -848,7 +930,7 @@ def get_attachment_content(
     try:
         if not emlx_path.exists():
             return None
-        if emlx_path.stat().st_size > MAX_EMLX_SIZE:
+        if emlx_path.stat().st_size > max_emlx_size():
             return None
 
         content = emlx_path.read_bytes()
@@ -866,7 +948,7 @@ def get_attachment_content(
         part_numbers = _mime_part_numbers(msg)
         for part in msg.walk():
             ct = part.get_content_type()
-            disp = str(part.get("Content-Disposition") or "")
+            disp = header_text(part, "Content-Disposition")
 
             if part.get_content_maintype() == "multipart":
                 continue
@@ -875,11 +957,11 @@ def get_attachment_content(
             ):
                 continue
 
-            cid = part.get("Content-ID")
+            cid = header_text(part, "Content-ID")
             if cid:
                 cid = cid.strip("<>")
 
-            fname = part.get_filename() or ""
+            fname = _filename_text(part)
             if not fname:
                 if "attachment" not in disp.lower() and not cid:
                     continue
@@ -1118,6 +1200,7 @@ def scan_emlx_files(
 def scan_all_emails(
     mail_dir: Path,
     exclude_account_uuids: set[str] | None = None,
+    on_skip: Callable[[Path, str], None] | None = None,
 ) -> Iterator[dict]:
     """
     Scan all emails from the Mail directory.
@@ -1144,12 +1227,22 @@ def scan_all_emails(
     for emlx_path in scan_emlx_files(
         mail_dir, exclude_account_uuids=exclude_account_uuids
     ):
+        # Test the ceiling before parsing so the reason for a skip is
+        # known and can be reported, instead of surfacing as a bare None.
+        if emlx_too_large(emlx_path):
+            if on_skip is not None:
+                on_skip(emlx_path, "too_large")
+            continue
         try:
             parsed = parse_emlx(emlx_path)
         except Exception as e:
             logger.warning("Skipping corrupt file %s: %s", emlx_path, e)
+            if on_skip is not None:
+                on_skip(emlx_path, f"{type(e).__name__}: {e}")
             continue
         if not parsed:
+            if on_skip is not None:
+                on_skip(emlx_path, "unparseable")
             continue
 
         msg_id = parsed.id
@@ -1171,6 +1264,7 @@ def scan_all_emails(
             "content": parsed.content,
             "date_received": meta.get("date_received") or parsed.date_received,
             "emlx_path": str(emlx_path),
+            "message_id_header": parsed.message_id_header,
             "attachments": parsed.attachments or [],
         }
 

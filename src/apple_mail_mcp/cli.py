@@ -86,11 +86,62 @@ def _progress_bar(current: int, total: int | None, width: int = 40) -> str:
     return f"[{bar}] {pct * 100:.0f}%"
 
 
+def _setup_file_logging() -> Path | None:
+    """Send this process's logs to a file we control.
+
+    Desktop extensions get no reachable stderr, so a build that dies
+    leaves nothing behind without this. Rotating and small: diagnostics
+    must not grow without bound. Returns the active path, or None.
+    """
+    import logging
+    import os as _os
+    from logging.handlers import RotatingFileHandler
+
+    from .config import get_log_path
+
+    class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
+        """Rotating handler that recreates the file 0600 every time.
+
+        A one-shot chmod cannot hold this: on rollover the handler
+        reopens the path with plain open(), i.e. 0644 under the usual
+        umask, and the live log — which carries mail paths and, via
+        account resolution, excluded-account names — would silently
+        become world-readable from the first rotation onward.
+        """
+
+        def _open(self):
+            fd = _os.open(
+                self.baseFilename,
+                _os.O_APPEND | _os.O_CREAT | _os.O_WRONLY,
+                0o600,
+            )
+            return _os.fdopen(fd, self.mode, encoding=self.encoding)
+
+    path = get_log_path()
+    if path is None:
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = _OwnerOnlyRotatingFileHandler(
+            path, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        root = logging.getLogger("apple_mail_mcp")
+        root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        return path
+    except OSError as e:
+        print(f"Warning: could not open log file: {e}", file=sys.stderr)
+        return None
+
+
 def _run_serve(watch: bool = False, read_only: bool = False) -> None:
     """Internal function to run the MCP server."""
     import threading
 
-    from .config import set_read_only_mode
+    from .config import get_index_auto_build, set_read_only_mode
     from .index import IndexManager
     from .server import mcp
 
@@ -98,7 +149,17 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
         set_read_only_mode(True)
         print("Read-only mode enabled", file=sys.stderr)
 
+    log_path = _setup_file_logging()
+
     manager = IndexManager.get_instance()
+    # Unconditional: this is the only entry that anchors "this process
+    # started at T", and it must exist precisely when diagnostics are
+    # already degraded.
+    manager.record_event(
+        "info",
+        "Server started",
+        log=str(log_path) if log_path else "file logging unavailable",
+    )
 
     # Clean up old attachment files
     try:
@@ -108,14 +169,45 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
     except Exception:
         pass
 
-    if manager.has_index():
+    def _start_watcher() -> None:
+        """Start the real-time file watcher (only with --watch)."""
+        if not watch:
+            return
+        try:
+
+            def on_update(added: int, removed: int) -> None:
+                if added or removed:
+                    print(
+                        f"Index updated: +{added} -{removed}",
+                        file=sys.stderr,
+                    )
+
+            if manager.start_watcher(on_update=on_update):
+                print("File watcher started", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: File watcher failed: {e}", file=sys.stderr)
+
+    # An index *file* can exist while holding nothing — an interrupted
+    # or permission-denied first build leaves an empty database behind.
+    # Syncing that forever would never populate it, so treat it as
+    # "needs building".
+    if manager.has_usable_index():
 
         def _background_sync() -> None:
             try:
                 start = time.time()
                 count = manager.sync_updates()
                 elapsed = time.time() - start
-                if count > 0:
+                if manager.last_error:
+                    # sync_updates returns 0 both for "no changes" and
+                    # for "couldn't read Mail" — don't claim success.
+                    print(
+                        f"Warning: index sync could not read Mail "
+                        f"({manager.last_error}). Grant Full Disk Access "
+                        f"to this app and restart it.",
+                        file=sys.stderr,
+                    )
+                elif count > 0:
                     print(
                         f"Background sync: {count} changes "
                         f"({_format_time(elapsed)})",
@@ -132,29 +224,58 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
                     file=sys.stderr,
                 )
 
-            # Start watcher only after sync completes
-            if watch:
-                try:
-
-                    def on_update(added: int, removed: int) -> None:
-                        if added or removed:
-                            print(
-                                f"Index updated: +{added} -{removed}",
-                                file=sys.stderr,
-                            )
-
-                    if manager.start_watcher(on_update=on_update):
-                        print("File watcher started", file=sys.stderr)
-                except Exception as e:
-                    print(
-                        f"Warning: File watcher failed: {e}",
-                        file=sys.stderr,
-                    )
+            _start_watcher()  # only after sync completes
 
         sync_thread = threading.Thread(target=_background_sync, daemon=True)
         sync_thread.start()
         print(
             "Syncing index in background...",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    elif get_index_auto_build():
+        # No index yet: build it on first run so a fresh install is
+        # usable (search + write id-resolution) without a manual step.
+        # Background + daemon so the MCP server responds immediately;
+        # requires Full Disk Access — a failure is logged, not fatal.
+        def _background_build() -> None:
+            try:
+                start = time.time()
+                count = manager.build_from_disk()
+                elapsed = time.time() - start
+                print(
+                    f"Index built: {count} emails ({_format_time(elapsed)})",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                print(
+                    f"Warning: automatic index build failed: {e}. "
+                    f"Grant Full Disk Access, or run 'apple-mail-mcp "
+                    f"index'. Set APPLE_MAIL_INDEX_AUTO_BUILD=false to "
+                    f"disable this.",
+                    file=sys.stderr,
+                )
+                return
+            _start_watcher()
+
+        build_thread = threading.Thread(target=_background_build, daemon=True)
+        build_thread.start()
+        print(
+            "No index yet — building in the background (first run; "
+            "requires Full Disk Access)...",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    else:
+        # Manual mode: auto-build is off and there's no usable index.
+        # Say so — silence here looks like a broken search later.
+        print(
+            "No search index, and automatic building is disabled. "
+            "Run 'apple-mail-mcp index --verbose' in a terminal with "
+            "Full Disk Access to build it. Body search stays "
+            "unavailable until then; flag/read tools work regardless.",
             file=sys.stderr,
             flush=True,
         )

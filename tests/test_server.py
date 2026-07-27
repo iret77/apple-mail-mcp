@@ -1020,6 +1020,7 @@ class TestSearchAttachments:
                 "subject": "Invoice attached",
                 "sender": "billing@co.com",
                 "date_received": "2024-01-15",
+                "rfc822_message_id": "<inv-1@co.com>",
                 "filename": "invoice.pdf",
             }
         ]
