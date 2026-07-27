@@ -2,232 +2,205 @@
 
 Stand: 2026-07-27. Basis geprüft: `git merge-base upstream/main feat/write-ops-flag-read`
 == `upstream/main` HEAD (`ee655d4`). **Upstream ist uns 0 Commits voraus**, wir sind 30
-voraus. Kein Rebase nötig, keine Konflikte zu erwarten.
+voraus (22 Dateien, +7025/−217). Kein Rebase nötig.
 
-Umfang gesamt: 22 Dateien, +7025/−217.
+## Leitgedanke
+
+Der Maintainer bekommt **kein Alles-oder-nichts-Paket**. Jede Einheit ist so
+geschnitten, dass er sie einzeln mergen, in Ruhe reviewen, umbauen oder ablehnen kann,
+ohne dass die anderen dadurch fallen. Wo eine Abhängigkeit technisch unvermeidbar ist,
+steht sie unten ausdrücklich dabei — samt Zusage, dass wir bei Ablehnung eines Stücks
+den Rest darauf umbauen.
 
 ## Vorgaben aus dem Upstream-CONTRIBUTING.md
 
 - „Keep the diff focused — avoid unrelated changes in the same PR."
-- „PRs are typically squash-merged into `main`." → unsere Commit-Historie landet
-  nicht im Upstream; **entscheidend ist der Diff pro PR**, nicht unsere Reihenfolge.
-- Pflicht vor jedem PR: `ruff check src/`, `ruff format --check src/`, `pytest`.
-- Tests gehören dazu; die meisten mocken JXA und laufen ohne Mail.app.
-- Lizenz: GPL-3.0, Beiträge werden darunter lizenziert.
+- „PRs are typically squash-merged into `main`." → unsere Commit-Historie landet nicht
+  drüben; **es zählt der Diff pro PR**, nicht unsere Reihenfolge.
+- Pflicht: `ruff check src/`, `ruff format --check src/`, `pytest`.
+- Lizenz GPL-3.0.
 
 ## Was Upstream schon hat (geprüft, nicht vermutet)
 
-- `_ensure_writable()` + `APPLE_MAIL_READ_ONLY` (#80) — **das Gate existiert, aber
-  bewacht bisher nichts.** Starkes Argument für den Write-PR.
-- Die Resource `index://status`.
+- `_ensure_writable()` + `APPLE_MAIL_READ_ONLY` (#80) — **das Gate existiert, bewacht
+  aber nichts.** Aufhänger für Track C.
+- Die Resource `index://status` — dort können Zählwerte andocken, ohne ein neues Tool.
 - 8 Tools.
 
-## Was NICHT upstream gehen darf
+## Was nicht upstream geht
 
 | Sache | Wo | Grund |
 |---|---|---|
-| `mcpb/`, `scripts/build-mcpb.sh`, `dist/` | eigener Branch | Fork-Distribution |
-| `install_mode` / `source_ref` / `APPLE_MAIL_MCP_LAUNCHER` / `APPLE_MAIL_MCP_REF` | server.py:478–498, 2724 | beschreibt unseren Bundle-Launcher |
+| `mcpb/`, `scripts/build-mcpb.sh`, `dist/`, diese Datei | Fork-Branches | Fork-Distribution |
+| `install_mode`, `source_ref`, `APPLE_MAIL_MCP_LAUNCHER`, `APPLE_MAIL_MCP_REF` | server.py:478–498, 2724 | beschreibt unseren Bundle-Launcher |
 | `SERVER_REVISION` | server.py:418 | unser Build-Stempel |
-| README-Absatz zum `.mcpb`-Bundle | README.md | Fork-spezifisch |
-| CLAUDE.md-Passagen mit Fork-Bezug | CLAUDE.md | prüfen, Rest ist gute Doku |
-
-## Struktureller Aufwand, der vor dem ersten PR zu leisten ist
-
-1. **Tests umverteilen.** Alles Neue liegt in `tests/test_write_ops.py` (3059 Zeilen) —
-   ein Sammelbecken, benannt nach unserem Branch. Upstream erwartet die Tests in der
-   jeweils passenden Datei: `test_disk.py`, `test_manager.py`, `test_server.py`,
-   `test_sync.py`, `test_watcher.py`, `test_config.py`. Nur die echten Write-Tool-Tests
-   bleiben in einer neuen `test_write_ops.py`.
-2. **Branches neu schneiden, nicht cherry-picken.** Unsere Historie verschränkt Themen
-   (mehrere „fix: N defects found by review"-Commits korrigieren jeweils frühere).
-   Jeder Upstream-Branch wird von `upstream/main` aus mit dem **Endzustand** der
-   betroffenen Dateien gebaut, nicht durch Nachspielen der Commits.
-3. **Fork-Spezifika ausbauen** (Tabelle oben), bevor der Diff entsteht.
+| `.mcpb`-Absatz im README | README.md | Fork-spezifisch |
 
 ---
 
-# Die PR-Kette
+# Die Einheiten
 
-Reihenfolge = Abhängigkeit. PR 1–3 sind untereinander unabhängig und können parallel
-laufen; ab PR 4 baut jeder auf dem vorigen auf.
+`⊘` = kann ohne Auswirkung auf alle anderen abgelehnt werden.
+`↑` = baut auf der genannten Einheit auf (textuell, nicht inhaltlich — bei Ablehnung
+bauen wir um).
 
-## PR 1 — `.emlx`-Parsing: unlesbare Header und übergroße Dateien
+## Track A — Fehlerbehebungen, keine API-Änderung
 
-**Branch:** `fix/emlx-parsing-robustness` · **Basis:** `upstream/main`
-**Dateien:** `index/disk.py`, `index/sync.py`, `index/schema.py`, `config.py`
-**Quelle:** `887c7e2`, Header-Teil von `439afa8`, `1343067`
+Acht Stück, alle klein und für sich prüfbar. Keine erweitert die Tool-Oberfläche, alle
+reparieren nachweislich kaputtes Verhalten.
 
-Ein einziger nicht-ASCII-Header (`Subject`, `Received`, `Content-ID`, Dateiname eines
-Anhangs) ließ Pythons `email`-Modul ein `Header`-Objekt statt `str` liefern; der erste
-`.strip()` warf `AttributeError` und **jeder Sync brach ab** — bei uns einen Tag lang,
-unbemerkt, weil der Fehler nur auf stderr ging. Dazu: übergroße `.emlx` verschwanden
-still.
+| # | Branch | Diff | Abh. |
+|---|---|---|---|
+| A1 | `fix/emlx-header-decoding` | `disk.py`, `sync.py` | ⊘ |
+| A2 | `fix/oversized-emails-visible` | `disk.py`, `config.py`, `schema.py`, `server.py` (nur Resource) | ⊘ |
+| A3 | `fix/stale-emlx-flags` | `server.py`, `envelope_direct.py` | ⊘ |
+| A4 | `fix/local-timestamps` | `server.py` | ⊘ |
+| A5 | `fix/sync-transaction-rollback` | `manager.py` | ⊘ |
+| A6 | `fix/per-thread-connections` | `manager.py` | ↑ A5 |
+| A7 | `perf/rebuild-fts-delete-all` | `manager.py` | ↑ A6 |
+| A8 | `fix/cross-process-write-lock` | `manager.py`, `watcher.py` | ↑ A6 |
 
-- `header_text()` / `_filename_text()` — jeder Headerzugriff im Parser liefert
-  garantiert dekodierten `str`. Ein Guard-Test stellt sicher, dass im Parser kein
-  roher `msg["…"]`-Zugriff zurückkehrt.
-- Der Per-Message-Guard im Sync fängt `Exception` statt nur `(OSError, ValueError,
-  UnicodeDecodeError)` — eine kaputte Mail darf nie den ganzen Lauf killen.
-- Übergroße Mails landen als `too_large` in der DLQ statt im Nichts;
-  `APPLE_MAIL_INDEX_MAX_EMAIL_MB` (Default 25) macht die Grenze konfigurierbar.
-- Zählwerte (`failed_jobs_count`, `skipped_too_large`) über die **bestehende**
-  Resource `index://status` sichtbar — kein neues Tool nötig.
+**A1 — unlesbare Header.** Ein nicht-ASCII-`Subject`, `Received`, `Content-ID` oder
+Anhangs-Dateiname lässt Pythons `email`-Modul ein `Header`-Objekt statt `str` liefern;
+der erste `.strip()` wirft `AttributeError` und **der komplette Sync bricht ab** — bei
+uns einen Tag lang unbemerkt, weil der Fehler nur auf stderr ging. `header_text()` /
+`_filename_text()` garantieren dekodierten `str`; ein Guard-Test verhindert die Rückkehr
+roher Headerzugriffe. Dazu: der Per-Message-Guard im Sync fängt `Exception` statt nur
+drei Typen — eine kaputte Mail darf nie den ganzen Lauf killen.
+*Der wichtigste Einzel-PR der Reihe.*
 
-**Risiko:** gering, rein defensiv. **Warum zuerst:** heilt einen Totalausfall und
-hängt an nichts.
+**A2 — übergroße Mails.** Verschwanden still. Jetzt als `too_large` in der DLQ, Grenze
+über `APPLE_MAIL_INDEX_MAX_EMAIL_MB` (Default 25) konfigurierbar, Zählwerte über die
+**bestehende** Resource `index://status` sichtbar — kein neues Tool.
 
-## PR 2 — Index-Schreibzugriffe: Nebenläufigkeit und Transaktionen
+**A3 — veralteter Gelesen-/Markiert-Status.** `get_email()` las beides aus dem
+Plist-Footer der `.emlx`, den Mail nicht zuverlässig neu schreibt. Overlay aus Apples
+Envelope Index (ein Read-only-Select).
 
-**Branch:** `fix/index-write-durability` · **Basis:** `upstream/main`
-**Dateien:** `index/manager.py`, `index/watcher.py`
-**Quelle:** `42f454f`, `29fa029`, `e422543`, `4a07445`, `f1a1048`
+**A4 — Zeitzone.** Alle Zeitstempel gingen als UTC raus, Mail.app zeigt Ortszeit (bei
+uns 12:54 statt 14:54). `to_local_iso()` konvertiert an jeder Ausgabegrenze über die
+**System**-Zone, DST-korrekt, nie über eine fest verdrahtete. Speicherung bleibt UTC.
 
-Vier reale „database is locked"-Ursachen, nacheinander gefunden:
+**A5–A8 — vier Ursachen von „database is locked".** Nacheinander gefunden, deshalb
+einzeln schneidbar; sie liegen aber alle in `manager.py` und stapeln daher textuell:
 
-- **Verbindungen pro Thread** (`threading.local`) — ein Rebuild im Hintergrund-Thread
-  legte sonst den Server lahm.
-- **Rollback bei fehlgeschlagenem Sync** — eine abgebrochene Transaktion blieb offen
-  und blockierte danach *jeden* Schreibzugriff.
-- **Cross-Prozess-Lock** (`fcntl.flock` auf `<index>.lock`). Ein `threading.Lock`
-  reicht nicht: Claude Desktop startet den Server **zweimal** (Upstream-Issue #106).
-  Fällt auf Thread-Lock zurück, wenn die Lockdatei nicht anlegbar ist.
-- **FTS-Trigger vor dem `DELETE` fallen lassen**, Leeren per einmaligem
+- **A5 Rollback** — eine abgebrochene Transaktion blieb offen und blockierte danach
+  *jeden* Schreibzugriff.
+- **A6 Verbindungen pro Thread** (`threading.local`) — ein Hintergrund-Rebuild legte
+  sonst den Server lahm.
+- **A7 FTS-Trigger** vor dem `DELETE` fallen lassen, einmaliges
   `INSERT INTO emails_fts(emails_fts) VALUES('delete-all')`, Trigger als **erste**
-  Aktion im `finally` wiederherstellen. DDL committet implizit — ein Rollback holt
-  sie nicht zurück, ein Fehler hätte den Index dauerhaft ohne Trigger hinterlassen.
-- Der Watcher benutzt dasselbe Lock und verliert beim Draining keinen Batch mehr.
+  Aktion im `finally` zurück. DDL committet implizit — ein Rollback holt sie nicht
+  wieder, ein Fehler hätte den Index dauerhaft ohne Trigger hinterlassen.
+- **A8 Cross-Prozess-Lock** (`fcntl.flock`). Ein `threading.Lock` reicht nicht: Claude
+  Desktop startet den Server **zweimal** — das ist deren offenes Issue **#106**. Fällt
+  auf Thread-Lock zurück, wenn die Lockdatei nicht anlegbar ist.
 
-**Risiko:** mittel — betrifft den Kern. Vollständig durch `test_manager.py` /
-`test_watcher.py` abgedeckt. **Für Upstream besonders relevant**, weil #106 (zwei
-Instanzen) dort offen ist.
+## Track B — Diagnose (additiv, Tool-Oberfläche wächst)
 
-## PR 3 — Gelesen/Markiert live statt aus dem `.emlx`-Footer; lokale Zeitstempel
+Anlass: **stderr eines MCP-Servers erreicht niemanden.** Unter einem Desktop-Client ist
+der Server eine Blackbox — der Nutzer sieht „geht nicht", der Agent hat keinen Kanal.
 
-**Branch:** `fix/live-flags-and-local-time` · **Basis:** `upstream/main`
-**Dateien:** `server.py`, `index/envelope_direct.py`
-**Quelle:** `88c49f2`, Zeitzonen-Teil von `439afa8`
+| # | Branch | Diff | Abh. |
+|---|---|---|---|
+| B1 | `feat/build-progress-and-phases` | `manager.py` | ↑ A6 |
+| B2 | `feat/index-status-tool` | `server.py`, `manager.py` | ↑ B1 |
+| B3 | `feat/refresh-index-tool` | `server.py` | ⊘ |
+| B4 | `feat/server-log-file` | `cli.py`, `config.py` | ⊘ |
+| B5 | `feat/optional-auto-build` | `cli.py`, `config.py` | ⊘ |
 
-- `get_email()` las Gelesen-/Markiert-Status aus dem Plist-Footer der `.emlx`. Den
-  schreibt Mail nicht zuverlässig neu — nach einer Änderung in Mail.app lieferte
-  Strategy 0 veraltete Werte. `_overlay_live_flags()` überlagert sie aus Apples
-  Envelope Index (ein Read-only-Select, `fetch_message_flags`).
-- Alle Zeitstempel gingen als UTC raus, Mail.app zeigt Ortszeit — bei uns 12:54 statt
-  14:54. `to_local_iso()` konvertiert an jeder Ausgabegrenze über die **System**-Zone
-  (`astimezone()`, DST-korrekt), nie über eine fest verdrahtete. Speicherung bleibt UTC.
+**B1** liefert das Innenleben ohne neue Tools: Build-Phase, Fortschritt, Zeit seit
+letztem Fortschritt, Stall-Erkennung, Ereignis-Ring (letzte 50). Nützt schon der
+bestehenden Resource `index://status`. Wer B2 nicht will, kann B1 trotzdem nehmen.
 
-**Risiko:** gering. Sichtbarste Korrektur für Endnutzer. Guter Einstiegs-PR, um beim
-Maintainer Vertrauen aufzubauen, bevor die großen kommen.
+**B2** `get_index_status()` — Zustand, Fortschritt, Erreichbarkeit von
+`~/Library/Mail` (= Full Disk Access), DLQ-Zahlen, handlungsfähige `next_steps`.
+*Vor dem PR zu entfernen: `install_mode`, `source_ref`, `SERVER_REVISION`.*
 
-## PR 4 — Diagnose: `get_index_status()` und `refresh_index()`
+**B3** `refresh_index(full=False)` — Sync auf Zuruf, `full=True` baut im Hintergrund
+neu; meldet ehrlich `already_running`/`failed` statt blind „started". Der Docstring
+beansprucht bewusst „rebuild / neu aufbauen" **und** stellt klar, dass es nicht Apples
+Envelope Index ist — sonst schickt das Modell den Nutzer zu „Postfach › Neu aufbauen"
+in Mail.app. Live passiert.
 
-**Branch:** `feat/index-diagnostics` · **Basis:** PR 2
-**Dateien:** `server.py`, `cli.py`, `config.py`, `index/manager.py`
-**Quelle:** `7463cee`, `9fce22e`, `f3946fa`, `3b09fbc`, `b8e2d07`, `faedf7c`, `823690d`
+**B4** Datei-Logging mit `0600` auch nach Rotation.
 
-Der Anlass ist konkret: **stderr eines MCP-Servers erreicht niemanden.** Läuft der
-Server unter einem Desktop-Client, ist er eine Blackbox — der Nutzer sieht „geht nicht"
-und der Agent hat keinen Kanal.
+**B5 — Auto-Build, ausdrücklich als Opt-in mit Default `false`.** Baut den Index beim
+ersten Start im Hintergrund, wenn keiner existiert. Wir schlagen den konservativen
+Default vor, weil das eine Produktentscheidung des Maintainers ist und keine
+Fehlerbehebung: der Server liefe sonst beim ersten Start ungefragt über
+`~/Library/Mail`. Unser Bundle setzt die Variable ohnehin explizit, der Code-Default
+kostet uns also nichts. Ein Satz gehört in den PR: *„Wenn du den Default umdrehen
+willst, ist das eine Zeile — wir haben ihn bewusst konservativ gelassen."*
 
-- `get_index_status()` — Zustand (`building`/`ready`/`empty`/`absent`), Build-Phase,
-  Fortschritt, Sekunden seit letztem Fortschritt, Stall-Erkennung, laufender Sync,
-  Erreichbarkeit von `~/Library/Mail` (= Full Disk Access), DLQ-Zahlen, Ereignis-Ring
-  (letzte 50), Pfad zum Logfile, plus handlungsfähige `next_steps`.
-- `refresh_index(full=False)` — Sync auf Zuruf, `full=True` baut im Hintergrund neu.
-  Meldet ehrlich `already_running` / `failed` statt blind „started" (via `on_started`-
-  Callback mit begrenztem Warten).
-- Datei-Logging mit `0600` auch nach Rotation (`_OwnerOnlyRotatingFileHandler`).
-- Der Docstring von `refresh_index` beansprucht bewusst „rebuild / re-index / neu
-  aufbauen" **und** stellt klar, dass es *nicht* Apples Envelope Index ist — sonst
-  schickt das Modell den Nutzer zu „Postfach › Neu aufbauen" in Mail.app. Das ist uns
-  live passiert.
+## Track C — Schreiben und stabile Identität
 
-**Vor dem PR zu entfernen:** `install_mode`, `source_ref`, `SERVER_REVISION`
-(Bundle-Launcher-Erkennung). Entweder streichen oder als neutrales
-„wie wurde ich gestartet" verallgemeinern — **Entscheidung offen**.
+| # | Branch | Diff | Abh. |
+|---|---|---|---|
+| C1 | `feat/stable-identity-schema` | `schema.py`, `manager.py`, `sync.py`, `disk.py`, `watcher.py` | ⊘ |
+| C2 | `feat/expose-message-id-in-reads` | `search.py`, `server.py`, `builders.py`, `mail_core.js` | ↑ C1 |
+| C3 | `feat/write-tools` | `builders.py`, `server.py` | ⊘ |
+| C4 | `feat/message-id-as-write-reference` | `server.py`, `builders.py` | ↑ C2, C3 |
 
-**Risiko:** gering im Code, aber **API-Erweiterung**: 8 → 10 Tools. Der Maintainer
-muss die Tool-Oberfläche wollen. Kandidat für ein vorheriges Issue.
+**C1** Schema v6: Spalte `rfc822_message_id` + Index, Migration v5→v6 als
+In-place-`ALTER`. Reine Datenhaltung, ändert kein Verhalten — schafft nur die
+Voraussetzung.
 
-## PR 5 — Schreib-Tools: `set_flag` (mit Farben) und `set_read_status`
+**C2** Alle Lesewege geben den Header aus: `search()` (FTS und Anhänge), `get_emails()`
+(Envelope-Schnellpfad per gebündeltem `get_rfc822_ids()`, JXA-Pfade über `messageId` im
+Standard-Property-Set), `get_email()`. **Nützt für sich allein**, auch ohne jedes
+Schreib-Tool: ein Client, der eine Mail über einen Aufruf hinaus festhalten will, hat
+bisher nur eine ROWID, die beim nächsten Verschieben tot ist. Enthält die Härtung von
+`MailCore.batchFetch` — eine verweigerte Property wird mit `null` aufgefüllt statt die
+ganze Auflistung mitzureißen; wirft weiterhin, wenn **gar nichts** lesbar war, denn
+eine unlesbare Mailbox darf nie als „0 Mails" durchgehen.
 
-**Branch:** `feat/write-tools` · **Basis:** PR 4
-**Dateien:** `builders.py`, `server.py`
-**Quelle:** `5e3b38f`, `4fd819f`, `75861ac`, Teile von `b8d8857`
+**C3** `set_flag(ids, color?)` mit allen sieben Apple-Farben (`msg.flagIndex`: rot 0 …
+grau 6) und `set_read_status(ids, read?)`. Einzeln oder Batch (max. 500), Rückgabe in
+Eimern `{updated, unchanged, not_found, skipped_hidden}` — **ein Batch scheitert nie als
+Ganzes**. `applyToMessage()` verifiziert `msg.id() === targetId` vor dem Schreiben;
+No-Ops werden übersprungen; aufgelöste und gescannte Gruppen laufen in getrennten
+`osascript`-Aufrufen; ausgeschlossene Konten (#90) gehen nie an JXA. Ein
+Regressionstest erzwingt das Read-only-Gate für jeden künftigen
+`set_`/`flag_`/`mark_`-Tool-Namen.
+*Aufhänger: euer `APPLE_MAIL_READ_ONLY` aus #80 bewacht damit endlich etwas.*
 
-**Aufhänger für den Maintainer:** `_ensure_writable()` und `APPLE_MAIL_READ_ONLY`
-existieren upstream bereits (#80) — bisher bewachen sie nichts. Diese PR liefert das
-Erste, was sie zu bewachen haben.
-
-- `set_flag(ids, color?)` mit allen sieben Apple-Farben (`msg.flagIndex`: rot 0 …
-  grau 6), `"none"` entmarkiert, `"default"` markiert ohne Farbe.
-- `set_read_status(ids, read?)`.
-- Einzeln oder als Batch (max. 500); Rückgabe in Eimern
-  `{updated, unchanged, not_found, skipped_hidden}` — **ein Batch scheitert nie als
-  Ganzes**, jede ID landet in genau einem Eimer.
-- `applyToMessage()` verifiziert `msg.id() === targetId` **vor** dem Schreiben.
-- No-Ops werden übersprungen (`needs_change_js`) — schon markierte Mails erzeugen
-  keinen Schreibzugriff.
-- Aufgelöste und gescannte Gruppen laufen in **getrennten** `osascript`-Aufrufen, damit
-  ein langsamer Scan die schnellen, präzisen Writes nicht mitreißt.
-- Ausgeschlossene Konten (#90): IDs, die dorthin auflösen, gehen nach
-  `skipped_hidden` und **nie** an JXA.
-- Regressionstest `TestWriteImplyingToolsHaveGuard` erzwingt das Read-only-Gate für
-  jeden künftigen Tool-Namen mit `set_`/`flag_`/`mark_`-Präfix.
-
-**Risiko:** hoch für den Maintainer — es sind die ersten mutierenden Tools des
-Projekts. **Deshalb vorher ein Issue**, nicht direkt ein PR über 1500 Zeilen.
-
-## PR 6 — Stabile Identität: die RFC822-Message-ID als Referenz
-
-**Branch:** `feat/stable-message-identity` · **Basis:** PR 5
-**Dateien:** `index/schema.py`, `index/manager.py`, `index/search.py`, `index/disk.py`,
-`index/sync.py`, `index/watcher.py`, `builders.py`, `server.py`, `jxa/mail_core.js`
-**Quelle:** `94ec9d0`, `13d694d`
-
-Der inhaltlich stärkste Teil und der, der Upstream am meisten bringt — er repariert
-eine Annahme, die im ganzen Projekt steckt: **eine Mail.app-ID ist eine ROWID pro
-Mailbox.** Sie stirbt, sobald irgendein Gerät die Nachricht ablegt (Normalfall bei
-Handy + Tablet am selben Konto), und die Nummer gehört danach womöglich einer anderen
-Nachricht in derselben Mailbox.
-
-- Schema v6: Spalte `rfc822_message_id` + Index, Migration v5→v6 als In-place-`ALTER`.
-- Alle Lesewege geben den Header aus: `search()` (FTS und Anhänge), `get_emails()`
-  (Envelope-Schnellpfad per gebündeltem `get_rfc822_ids()`, JXA-Pfade über `messageId`
-  im Standard-Property-Set), `get_email()`.
-- Alle Tools nehmen beide Formen an: `get_email`, `get_email_links`,
-  `get_email_attachment`, `get_attachment`, `set_flag`, `set_read_status`.
-- **Kein Header wird je in eine ROWID zurückübersetzt und dann geglaubt.** Beim
-  Schreiben wählt der Index nur Konto und Scan-Reihenfolge; verglichen wird in JXA
-  gegen `msg.messageId()`. Beim Lesen wird jeder Fundort geholt und der Header geprüft;
-  bei Abweichung geht es zum nächsten, am Ende ein Fehler statt fremder Post.
-- `MailCore.batchFetch` fällt pro Property weich (eine verweigerte Property wird mit
-  `null` aufgefüllt), wirft aber weiterhin, wenn **gar nichts** lesbar war — eine
-  unlesbare Mailbox darf nie als „0 Mails" durchgehen.
-- Zeilen von vor v6 haben NULL; `get_index_status` meldet das als `without_stable_id`.
-
-**Risiko:** mittel. Schema-Migration + Verhalten der Lese-Tools. Voll getestet.
-Ohne PR 5 nur zur Hälfte begründbar — die Schreibseite ist der Grund, warum es zählt.
+**C4** Die Tools nehmen den Header als Referenz an. **Kein Header wird je in eine ROWID
+zurückübersetzt und dann geglaubt** — beim Schreiben wählt der Index nur Konto und
+Scan-Reihenfolge, verglichen wird in JXA gegen `msg.messageId()`; beim Lesen wird jeder
+Fundort geholt und der Header geprüft, bei Abweichung der nächste versucht, am Ende ein
+Fehler statt fremder Post.
 
 ---
 
-# Empfohlenes Vorgehen
+# Vorgehen
 
-1. **PR 3 zuerst** (klein, sichtbar, unstrittig) — dann PR 1, dann PR 2. Drei Bugfix-PRs
-   ohne API-Änderung, die zeigen, dass wir das Projekt verstanden haben.
-2. **Danach ein Issue** zu Schreib-Tools + Diagnose, mit Verweis auf das bereits
-   vorhandene, aber leere `APPLE_MAIL_READ_ONLY`-Gate. Erst nach Rückmeldung des
-   Maintainers PR 4 → 5 → 6.
+Nicht alle 17 auf einmal aufmachen — das ist für einen einzelnen Maintainer eine Lawine
+und erreicht das Gegenteil von „detailliert entscheiden können".
 
-# Offene Entscheidungen (brauchen Deine Ansage)
+1. **Erste Welle: A1, A3, A4.** Drei kleine, risikoarme Fehlerbehebungen, in Minuten
+   prüfbar. Zeigt, dass wir das Projekt verstanden haben und sauber arbeiten.
+2. **Zweite Welle nach erstem Feedback: A2, A5–A8.** Der `manager.py`-Stapel, mit
+   Hinweis auf ihr offenes #106.
+3. **Dann ein Sammel-Issue** („Fork von X: was wir gebaut haben und in welchen Stücken
+   wir es anbieten") mit der Tabelle aus diesem Dokument. Der Maintainer sagt, was er
+   sehen will — PRs aus Track B und C entstehen erst danach.
 
-1. **Auto-Build des Index beim ersten Start** (`b8d8857`, `APPLE_MAIL_INDEX_AUTO_BUILD`,
-   Default `true`) — meinungsstarke Verhaltensänderung. Eigener kleiner PR, mit
-   Default `false` anbieten, oder ganz im Fork behalten?
-2. **`install_mode` / `source_ref` / `SERVER_REVISION`** in `get_index_status` —
-   streichen oder verallgemeinern?
-3. **CLAUDE.md**: unsere Fassung ist stark gewachsen (+104 Zeilen). Anteilig pro PR
-   mitliefern oder in einem Doku-PR am Ende?
-4. **Deine stehende Regel „keine PRs/Issues in fremden Repos"** steht dem hier
-   entgegen. Diese Vorbereitung folgt Deiner ausdrücklichen Anweisung von heute —
-   bestätige bitte, bevor irgendetwas Richtung `imdinu` rausgeht.
+# Vorarbeiten vor dem ersten Diff
+
+1. **Tests umverteilen.** Alles Neue liegt in `tests/test_write_ops.py` (3059 Zeilen),
+   benannt nach unserem Branch. Upstream erwartet Tests bei ihrem Code: `test_disk.py`,
+   `test_manager.py`, `test_server.py`, `test_sync.py`, `test_watcher.py`,
+   `test_config.py`.
+2. **Branches vom Endzustand neu schneiden, nicht cherry-picken.** Unsere Historie
+   verschränkt Themen (mehrere „fix: N defects found by review" korrigieren jeweils
+   Früheres). Jeder Branch entsteht von `upstream/main` aus mit dem Endzustand der
+   betroffenen Stellen.
+3. **Fork-Spezifika ausbauen** (Tabelle oben).
+4. **CLAUDE.md anteilig aufteilen** — unsere Fassung ist um 104 Zeilen gewachsen; jeder
+   PR bringt seinen Doku-Anteil mit, statt am Ende einen Doku-Klotz.
+
+# Freigabe
+
+Nichts geht Richtung `imdinu`, bevor Christian es ausdrücklich freigibt — weder PR noch
+Issue noch Push.
