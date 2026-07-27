@@ -39,6 +39,23 @@ Add to your MCP client:
 see [`mcpb/README.md`](mcpb/README.md). Build it with
 `./scripts/build-mcpb.sh`.
 
+### Three things worth knowing before you start
+
+1. **The first start builds a search index in the background.** It takes
+   minutes on a large mailbox and shows nothing while it runs. That is
+   normal, not a hang — the server answers the whole time.
+2. **It needs Full Disk Access, granted to the app that launches it** —
+   Claude Desktop, not this package, and not your terminal. That single
+   point is the most common reason nothing gets indexed.
+3. **When anything looks wrong, ask your assistant for the index
+   status** rather than digging yourself. It reports the running build,
+   what the index is doing, whether `~/Library/Mail` is readable, and
+   what to do next — in plain language, and that report is what makes a
+   bug report useful:
+
+   > Ask the Apple Mail integration for its index status and show me the
+   > result.
+
 ### Permissions: who needs Full Disk Access?
 
 Building the index reads `~/Library/Mail`, which macOS protects. TCC

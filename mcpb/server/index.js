@@ -30,8 +30,12 @@ import {
 import { join } from "node:path";
 import { homedir } from "node:os";
 
+// Pinned to a TAG, not a branch. Following a moving branch meant every
+// installation silently swapped its server within UPDATE_INTERVAL_H of
+// any push — testers would report against a build nobody could name.
+// A new server reaches them only through a new bundle.
 const DEFAULT_REF =
-  "git+https://github.com/iret77/apple-mail-mcp@feat/write-ops-flag-read";
+  "git+https://github.com/iret77/apple-mail-mcp@server-v0.11.0";
 const UPDATE_INTERVAL_H = 24;
 // Bump on every bundle release. The stamp records it, so installing a
 // new bundle always re-resolves the server once — otherwise a same-day

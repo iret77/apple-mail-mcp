@@ -7,8 +7,12 @@
 # platform-independent .mcpb you double-click to install in Claude
 # Desktop.
 #
+# The file name carries the version, so a downloaded bundle says which
+# one it is without being opened — an unversioned name cost a full
+# debugging round when a stale download looked like the current build.
+#
 # Usage:
-#   ./scripts/build-mcpb.sh                 # -> dist/apple-mail-mcp.mcpb
+#   ./scripts/build-mcpb.sh            # -> dist/apple-mail-mcp-<version>.mcpb
 #   ./scripts/build-mcpb.sh path/to/out.mcpb
 #
 # Requires Node 18+ (for the `mcpb` CLI). Uses a global `mcpb` if present,
@@ -16,7 +20,8 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="${1:-$REPO/dist/apple-mail-mcp.mcpb}"
+VERSION="$(node -p "require('$REPO/mcpb/manifest.json').version")"
+OUT="${1:-$REPO/dist/apple-mail-mcp-$VERSION.mcpb}"
 mkdir -p "$(dirname "$OUT")"
 
 if command -v mcpb >/dev/null 2>&1; then
@@ -28,4 +33,4 @@ fi
 "${MCPB[@]}" validate "$REPO/mcpb/manifest.json"
 "${MCPB[@]}" pack "$REPO/mcpb" "$OUT"
 
-echo "[build] bundle ready at $OUT"
+echo "[build] bundle ready at $OUT (version $VERSION)"
