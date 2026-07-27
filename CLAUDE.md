@@ -34,7 +34,7 @@ src/apple_mail_mcp/
 | `list_accounts()` | List email accounts | - |
 | `list_mailboxes(account?)` | List mailboxes | account (optional) |
 | `get_emails(...)` | Unified listing | filter: all/unread/flagged/today/last_7_days |
-| `get_email(ref)` | Full email content + attachments | message_id (numeric id **or** RFC822 header) |
+| `get_email(ref)` | Full email content + attachments + current `account`/`mailbox` | message_id (numeric id **or** RFC822 header) |
 | `search(query, ...)` | Unified search | scope, before, after, offset, highlight |
 | `get_email_links(ref)` | Extract links from an email | message_id (id or header) |
 | `get_email_attachment(ref, filename)` | Extract attachment content | message_id (id or header), filename |
@@ -110,6 +110,16 @@ as well. The RFC822 `Message-ID` header survives that. Therefore:
   a `not_found` ROWID is looked up in the index and retried by header,
   reporting the move via `hint`. It only works while the old row still
   exists, which is exactly why the header is the better handle.
+- **Angle brackets are not part of the identity.** The `.emlx` header
+  keeps them (`<a@b>`), Apple Mail's `messageId` property drops them
+  (`a@b`). Every comparison goes through `_header_key()` (Python) or
+  `normHeader()` (JXA); `find_by_rfc822` matches either stored form.
+  Strict comparison made every Message-ID write and the whole
+  move-recovery path report a mute `not_found` — nothing threw, so
+  nothing was logged. A test forbids the raw comparison returning.
+- **`get_email` reports the current location** (`account`, `mailbox`).
+  Addressing a message by its stable id makes where it lives the one
+  thing the caller cannot derive — and after a move the most useful.
 - **Rows indexed before schema v6** have NULL; `get_index_status`
   surfaces the count as `without_stable_id` and points at
   `refresh_index(full=True)`.
@@ -638,5 +648,6 @@ Chart PNGs are committed (they ARE the results). JSON and HTML in `benchmarks/re
 | **Path Traversal** | Path validation in file watcher | watcher.py |
 | **Data Exposure** | Database and attachment cache files created with 0o600 permissions | schema.py, server.py |
 | **Unbounded Memory** | Pending changes limit in watcher | watcher.py |
+| **Silent write failure** | `not_found` means only "Mail was reachable and the message was not there". Anything else — no such account, mailbox unreadable, Apple Events refused — goes to `failed` with `error` and a cause-specific hint. The JXA script reports a reason per target instead of pushing everything into `notFound` | server.py, builders.py |
 | **Excluded-Account Exposure** | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` boundary (#90). Every NEW tool/read path must gate: `_hidden_account()` at tool entry, `exclude_accounts` in SQL search, `_path_in_excluded_account()` before disk reads, `_resolve_visible_account()` before any JXA call that defaults to `Mail.accounts()[0]`. Write tools gate via `_resolve_write_targets()` (skips ids resolving into a hidden account, never dispatched to JXA) | server.py, index/search.py |
 | **Unauthorized Writes** | `_ensure_writable()` refuses every mutating tool under read-only mode (#80); regression test scans for write-implying tool names | server.py |

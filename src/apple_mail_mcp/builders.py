@@ -357,9 +357,21 @@ class WriteBuilder:
 const groups = {groups_json};
 const MAX_SCAN = {max_scan};
 // Never apply a recovered write in a discard mailbox.
+// Localized too: on a German install the trash is "Papierkorb" and the
+// junk folder is "Werbung". Knowing only the English names would let a
+// recovered write land in a discard mailbox on every non-English Mail.
 const DISCARD_MAILBOXES = [
     "trash", "deleted items", "deleted messages", "bin",
-    "junk", "junk email", "spam",
+    "junk", "junk email", "junk e-mail", "spam",
+    "papierkorb", "gelöschte objekte", "werbung",
+    "unerwünschte werbung",
+    "corbeille", "indésirables",
+    "papelera", "correo no deseado",
+    "cestino", "posta indesiderata",
+    "lixeira", "prullenmand", "ongewenst",
+    "papperskorg", "skräppost", "papirkurv", "søppelpost",
+    "roskakori", "roskaposti", "kosz", "niechciane",
+    "корзина", "спам",
 ];
 const updated = [];
 const unchanged = [];

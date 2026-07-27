@@ -49,32 +49,50 @@ const MailCore = {
 
         // Alias groups: names that refer to the same logical
         // mailbox across different providers/locales
+        // Mail.app shows these names in the system language, so a
+        // German install has no "INBOX" at all — it has "Posteingang".
+        // Without the localized names the default mailbox simply does
+        // not resolve, and every JXA path fails with a bare -1728.
         const aliases = [
-            ["INBOX", "Inbox"],
             [
-                "Sent",
-                "Sent Items",
-                "Sent Messages",
-                "Sent Mail",
+                "INBOX", "Inbox",
+                "Posteingang", "Boîte de réception", "Bandeja de entrada",
+                "Posta in arrivo", "Caixa de entrada", "Postvak IN",
+                "Inkorg", "Innboks", "Indbakke", "Saapuneet",
+                "Skrzynka odbiorcza", "Doručená pošta", "Входящие",
             ],
             [
-                "Trash",
-                "Deleted Items",
-                "Deleted Messages",
-                "Bin",
+                "Sent", "Sent Items", "Sent Messages", "Sent Mail",
+                "Gesendet", "Gesendete Objekte", "Gesendete E-Mails",
+                "Envoyés", "Messages envoyés", "Enviados",
+                "Posta inviata", "Verzonden", "Skickat", "Sendt",
+                "Wysłane", "Отправленные",
             ],
             [
-                "Drafts",
-                "Draft",
+                "Trash", "Deleted Items", "Deleted Messages", "Bin",
+                "Papierkorb", "Gelöschte Objekte", "Corbeille",
+                "Papelera", "Cestino", "Lixeira", "Prullenmand",
+                "Papperskorg", "Papirkurv", "Roskakori", "Kosz",
+                "Корзина",
             ],
             [
-                "Junk",
-                "Junk Email",
-                "Spam",
+                "Drafts", "Draft",
+                "Entwürfe", "Brouillons", "Borradores", "Bozze",
+                "Rascunhos", "Concepten", "Utkast", "Kladder",
+                "Luonnokset", "Robocze", "Черновики",
             ],
             [
-                "Archive",
-                "All Mail",
+                "Junk", "Junk Email", "Junk E-mail", "Spam",
+                "Werbung", "Unerwünschte Werbung", "Indésirables",
+                "Correo no deseado", "Posta indesiderata", "Ongewenst",
+                "Skräppost", "Søppelpost", "Roskaposti", "Niechciane",
+                "Спам",
+            ],
+            [
+                "Archive", "All Mail",
+                "Archiv", "Archives", "Archivo", "Archivio",
+                "Arquivo", "Archief", "Arkiv", "Arkisto", "Archiwum",
+                "Архив",
             ],
         ];
 

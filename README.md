@@ -87,7 +87,7 @@ for the full schema and precedence rules.
 | `list_accounts()` | List email accounts |
 | `list_mailboxes(account?)` | List mailboxes |
 | `get_emails(filter?, limit?)` | Get emails — all, unread, flagged, today, last_7_days |
-| `get_email(message_id)` | Get single email with full content + attachments |
+| `get_email(message_id)` | Get single email with full content, attachments, and its current account/mailbox |
 | `search(query, scope?, before?, after?, highlight?)` | Search — all, subject, sender, body, attachments |
 | `get_email_links(message_id)` | Extract links from an email |
 | `get_email_attachment(message_id, filename)` | Extract attachment content |
