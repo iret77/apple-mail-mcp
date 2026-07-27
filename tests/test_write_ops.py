@@ -2452,7 +2452,11 @@ class TestRebuildIsDiscoverable:
     async def test_description_disambiguates_from_apple_mails_index(self):
         from apple_mail_mcp.server import mcp
 
-        desc = (await mcp.get_tool("refresh_index")).description
-        assert "not Apple Mail's own" in desc
-        assert "Mailbox > Rebuild" in desc
-        assert "never send the user there" in desc.lower()
+        # Normalize: the docstring is line-wrapped, so phrases span
+        # newlines in the source.
+        desc = " ".join(
+            (await mcp.get_tool("refresh_index")).description.split()
+        ).lower()
+        assert "not apple mail's own envelope index" in desc
+        assert "mailbox > rebuild" in desc
+        assert "never send the user there" in desc
