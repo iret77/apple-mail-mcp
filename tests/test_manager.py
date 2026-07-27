@@ -1221,3 +1221,112 @@ class TestBuildFinallyIsRobust:
         finally_at = src.rindex("finally:")
         tail = src[finally_at:]
         assert tail.index("_recreate_fts_triggers") < tail.index("_flush_batch")
+
+
+class TestWriteLockIsCrossProcess:
+    """Claude Desktop starts a second server instance (upstream #106),
+    so a threading.Lock cannot prevent "database is locked"."""
+
+    def test_second_process_cannot_take_the_lock(self, tmp_path):
+        import subprocess
+        import sys
+        import textwrap
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock_path = tmp_path / "index.lock"
+        held = WriteLock(lock_path)
+        assert held.acquire()
+        try:
+            probe = textwrap.dedent(f"""
+                import sys
+                sys.path.insert(0, {str(Path("src").resolve())!r})
+                from pathlib import Path
+                from apple_mail_mcp.index.manager import WriteLock
+                got = WriteLock(Path({str(lock_path)!r})).acquire()
+                print("ACQUIRED" if got else "REFUSED")
+            """)
+            out = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert "REFUSED" in out.stdout, (out.stdout, out.stderr)
+        finally:
+            held.release()
+
+    def test_lock_is_available_again_after_release(self, tmp_path):
+        import subprocess
+        import sys
+        import textwrap
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock_path = tmp_path / "index.lock"
+        lock = WriteLock(lock_path)
+        assert lock.acquire()
+        lock.release()
+
+        probe = textwrap.dedent(f"""
+            import sys
+            sys.path.insert(0, {str(Path("src").resolve())!r})
+            from pathlib import Path
+            from apple_mail_mcp.index.manager import WriteLock
+            print("ACQUIRED" if WriteLock(Path({str(lock_path)!r})).acquire()
+                  else "REFUSED")
+        """)
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert "ACQUIRED" in out.stdout, (out.stdout, out.stderr)
+
+    def test_a_dead_holder_does_not_wedge_the_index(self, tmp_path):
+        """The OS drops flock when a process dies — a crashed instance
+        must not lock the index out permanently."""
+        import subprocess
+        import sys
+        import textwrap
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock_path = tmp_path / "index.lock"
+        grabber = textwrap.dedent(f"""
+            import sys
+            sys.path.insert(0, {str(Path("src").resolve())!r})
+            from pathlib import Path
+            from apple_mail_mcp.index.manager import WriteLock
+            WriteLock(Path({str(lock_path)!r})).acquire()
+            # exit without releasing
+        """)
+        subprocess.run(
+            [sys.executable, "-c", grabber],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        lock = WriteLock(lock_path)
+        assert lock.acquire(), "dead process still holds the lock"
+        lock.release()
+
+    def test_threads_in_one_process_are_still_serialized(self, tmp_path):
+        """flock is per-file-description, so it would NOT stop a second
+        thread here — the thread lock must still do that."""
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock = WriteLock(tmp_path / "index.lock")
+        assert lock.acquire()
+        try:
+            assert lock.acquire() is False
+        finally:
+            lock.release()
+
+    def test_manager_lock_lives_next_to_the_database(self, temp_db_path):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        assert m._write_lock._path == temp_db_path.with_suffix(".lock")
