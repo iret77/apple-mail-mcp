@@ -472,6 +472,7 @@ def _index_guidance(
     stalled: bool = False,
     phase: str | None = None,
     syncing: bool = False,
+    error: str | None = None,
 ) -> tuple[str | None, str | None, list[str], str]:
     """Turn raw index state into instructions a non-technical user can follow.
 
@@ -485,6 +486,23 @@ def _index_guidance(
     cmd = _index_command()
     app = "Claude" if _install_mode() == "bundle" else "the app running this"
 
+    if error and "database is locked" in error.lower():
+        return (
+            "Another process is holding the index database.",
+            None,
+            [
+                "This is the extension's own database, not Apple Mail's "
+                "— quitting Mail does not help and is not needed.",
+                "Claude Desktop starts two copies of this server, and "
+                "both use the same index. Quit Claude completely "
+                "(Cmd-Q), reopen it, and try the rebuild again.",
+                "If it repeats, the index is fine — only the rebuild is "
+                "blocked. Search, flagging and read/unread keep working.",
+            ],
+            "Another copy of this extension is holding the index "
+            "database, so the rebuild could not run. Restarting Claude "
+            "clears it — Apple Mail has nothing to do with it.",
+        )
     if syncing:
         return (
             None,
@@ -2427,6 +2445,7 @@ async def get_index_status() -> dict:
         stalled=bool(result.get("build_appears_stalled")),
         phase=result.get("build_phase"),
         syncing=syncing,
+        error=manager.last_error,
     )
     if problem:
         result["problem"] = problem

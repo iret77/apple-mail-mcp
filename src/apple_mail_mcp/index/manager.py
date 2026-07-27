@@ -945,6 +945,15 @@ class IndexManager:
         try:
             changes = self._sync_updates_locked(progress_callback)
         except BaseException as exc:
+            # sync_from_disk commits only at the very end and never
+            # rolls back. A failure mid-way therefore left an OPEN write
+            # transaction on this thread's connection, which blocked
+            # every later write in this process with "database is
+            # locked" until it was restarted.
+            try:
+                self._get_conn().rollback()
+            except sqlite3.Error:
+                logger.debug("rollback after failed sync failed")
             self._last_error = f"{type(exc).__name__}: {exc}"
             self.record_event("error", "Sync failed", error=self._last_error)
             raise

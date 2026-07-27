@@ -1330,3 +1330,53 @@ class TestWriteLockIsCrossProcess:
 
         m = IndexManager(db_path=temp_db_path)
         assert m._write_lock._path == temp_db_path.with_suffix(".lock")
+
+
+class TestFailedSyncDoesNotPoisonTheConnection:
+    """sync_from_disk commits once, at the end, and never rolls back.
+    A failure mid-way left an open write transaction that blocked every
+    later write in the process with "database is locked"."""
+
+    def test_write_still_possible_after_a_failed_sync(
+        self, temp_db_path, tmp_path
+    ):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import sync as sync_mod
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        conn = m._get_conn()
+
+        def poison(conn_, *a, **k):
+            # Open a write transaction, then die — exactly what a
+            # mid-way failure in sync_from_disk does.
+            conn_.execute(
+                "INSERT INTO emails (message_id, account, mailbox) "
+                "VALUES (999, 'a', 'INBOX')"
+            )
+            raise RuntimeError("sync exploded")
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch.object(sync_mod, "sync_from_disk", poison),
+            pytest.raises(RuntimeError),
+        ):
+            m.sync_updates()
+
+        # The poisoned row must be gone and the DB writable again.
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM emails WHERE message_id = 999"
+            ).fetchone()[0]
+            == 0
+        )
+        conn.execute(
+            "INSERT INTO emails (message_id, account, mailbox) "
+            "VALUES (1, 'a', 'INBOX')"
+        )
+        conn.commit()
+        assert m.indexed_email_count() == 1

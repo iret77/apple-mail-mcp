@@ -2460,3 +2460,51 @@ class TestRebuildIsDiscoverable:
         assert "not apple mail's own envelope index" in desc
         assert "mailbox > rebuild" in desc
         assert "never send the user there" in desc
+
+
+class TestLockErrorIsExplainedCorrectly:
+    """Twice in a live session the assistant blamed Apple Mail for
+    "database is locked" and told the user to quit Mail. Mail.app never
+    touches this database."""
+
+    @pytest.mark.asyncio
+    async def test_guidance_names_the_real_cause(self, tmp_path):
+        mgr = MagicMock()
+        mgr.is_building.return_value = False
+        mgr.write_lock_held.return_value = False
+        mgr.has_index.return_value = True
+        mgr.indexed_email_count.return_value = 63_875
+        mgr.count_skipped_too_large.return_value = 0
+        mgr.count_without_stable_id.return_value = 0
+        mgr.build_progress.return_value = None
+        mgr.recent_events.return_value = []
+        mgr.last_error = "OperationalError: database is locked"
+        stats = MagicMock()
+        stats.disk_email_count = 63_900
+        stats.mailbox_count = 24
+        stats.attachment_count = 0
+        stats.db_size_mb = 485.0
+        stats.failed_jobs_count = 0
+        stats.excluded_accounts = []
+        stats.last_sync = None
+        stats.staleness_hours = None
+        mgr.get_stats.return_value = stats
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        steps = " ".join(r["next_steps"]).lower()
+        assert "not apple mail's" in steps
+        assert "quitting mail does not help" in steps
+        assert "two copies" in steps
+        assert (
+            "apple mail has nothing to do with it" in r["user_message"].lower()
+        )
