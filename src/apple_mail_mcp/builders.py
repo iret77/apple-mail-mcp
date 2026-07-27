@@ -438,17 +438,23 @@ for (const g of groups) {{
         }}
         const remaining = new Set(g.headers);
         // Prefer the mailboxes the index already associates with these
-        // messages, and never write into a discard mailbox: the same
-        // message often still exists in Trash after being re-filed, and
-        // flagging that copy leaves the visible one untouched.
+        // messages. A discard mailbox is skipped ONLY when it is not one
+        // of those: the same message often still sits in Trash after
+        // being re-filed, and flagging that copy would leave the visible
+        // one untouched. But a message that genuinely LIVES in Junk (or
+        // in Trash) is a legitimate target — skipping it unconditionally
+        // made "flag this junk mail" impossible to satisfy.
         const preferred = g.prefer_mailboxes || [];
         const ordered = [];
         const rest = [];
         for (let m = 0; m < mailboxes.length; m++) {{
             let nm = "";
             try {{ nm = String(mailboxes[m].name()); }} catch (e) {{}}
-            if (DISCARD_MAILBOXES.indexOf(nm.toLowerCase()) !== -1) continue;
-            if (preferred.indexOf(nm) !== -1) ordered.push(mailboxes[m]);
+            const isPreferred = preferred.indexOf(nm) !== -1;
+            const isDiscard =
+                DISCARD_MAILBOXES.indexOf(nm.toLowerCase()) !== -1;
+            if (isDiscard && !isPreferred) continue;
+            if (isPreferred) ordered.push(mailboxes[m]);
             else rest.push(mailboxes[m]);
         }}
         const candidates = ordered.concat(rest);

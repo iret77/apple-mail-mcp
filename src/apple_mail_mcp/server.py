@@ -255,7 +255,9 @@ class WriteResult(TypedDict, total=False):
 
     updated: list[int | str]  # actually modified
     unchanged: list[int | str]  # already in the wanted state — no write
-    not_found: list[int | str]  # not located (unknown, moved or deleted)
+    not_found: list[int | str]  # Mail was reachable; the message was not
+    failed: list[int | str]  # Mail refused/was unreachable — NOT a verdict
+    error: str  # what Apple Mail actually said, when `failed` is non-empty
     skipped_hidden: list[int | str]  # resolved into an excluded account
     hint: str  # present only when something is actionable (e.g. no index)
 
@@ -415,7 +417,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-27.1"
+SERVER_REVISION = "2026-07-27.2"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -949,6 +951,11 @@ async def _apply_write(
     by_header = [g for g in groups if g.get("by_header")]
     updated: list[MessageRef] = []
     unchanged: list[MessageRef] = []
+    # A write that never reached Apple Mail is NOT evidence that the
+    # message is gone. Reporting it as not_found sent the caller hunting
+    # for a message that was there all along.
+    failed: list[MessageRef] = []
+    errors: list[str] = []
 
     if located:
         try:
@@ -963,7 +970,8 @@ async def _apply_write(
             # Letting this raise would leave the caller with no idea
             # which writes did or did not happen.
             logger.warning("located write failed: %s", exc, exc_info=True)
-            not_found += [i for g in located for i in g["ids"]]
+            failed += [i for g in located for i in g["ids"]]
+            errors.append(str(exc))
 
     if scan:
         builder = make_builder(scan)
@@ -978,8 +986,9 @@ async def _apply_write(
         except Exception as exc:
             # Best-effort fallback: a timed-out or failed scan reports its
             # ids as not_found rather than erroring the whole call.
-            logger.debug("write scan fallback failed: %s", exc, exc_info=True)
-            not_found += [i for g in scan for i in g["ids"]]
+            logger.warning("write scan failed: %s", exc, exc_info=True)
+            failed += [i for g in scan for i in g["ids"]]
+            errors.append(str(exc))
 
     if by_header:
         # Caller-supplied Message-IDs. Same bounded scan as the recovery
@@ -996,7 +1005,8 @@ async def _apply_write(
             not_found += [str(x) for x in res.get("not_found", [])]
         except Exception as exc:
             logger.warning("Message-ID write failed: %s", exc, exc_info=True)
-            not_found += [h for g in by_header for h in g["headers"]]
+            failed += [h for g in by_header for h in g["headers"]]
+            errors.append(str(exc))
 
     # Recovery: a ROWID stops resolving as soon as any device files the
     # message elsewhere — the normal case with phones and tablets on the
@@ -1023,6 +1033,23 @@ async def _apply_write(
         "not_found": not_found,
         "skipped_hidden": skipped_hidden,
     }
+    if failed:
+        # Say plainly that Apple Mail never carried the write out, and
+        # what it said — the caller must not read this as "deleted".
+        result["failed"] = failed
+        result["error"] = "; ".join(dict.fromkeys(errors))[:500]
+        result["hint"] = (
+            f"{len(failed)} write(s) never reached Apple Mail — this is "
+            f"NOT a statement about the messages, they are most likely "
+            f"fine. Apple Mail said: {result['error']} — typical causes: "
+            f"Mail.app is not running, or this process has no Automation "
+            f"permission for Mail (System Settings > Privacy & Security > "
+            f"Automation). A background or scheduled run cannot show that "
+            f"consent dialog, so it must be granted once interactively. "
+            f"Reads keep working meanwhile because they come from the "
+            f"index and the .emlx files, not from Apple Events."
+        )
+        return result
     missing_headers = [m for m in not_found if isinstance(m, str)]
     if missing_headers and not [m for m in not_found if isinstance(m, int)]:
         # A Message-ID write was matched against the live mailboxes, so
