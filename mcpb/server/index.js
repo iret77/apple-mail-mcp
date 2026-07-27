@@ -36,7 +36,7 @@ const UPDATE_INTERVAL_H = 24;
 // Bump on every bundle release. The stamp records it, so installing a
 // new bundle always re-resolves the server once — otherwise a same-day
 // bundle update would run against a cached, older server build.
-const LAUNCHER_REVISION = "0.9.1";
+const LAUNCHER_REVISION = "0.10.0";
 const UPDATE_TIMEOUT_MS = 45_000; // stay well under the MCP init timeout
 
 /** Env values arrive as strings — "false" must not read as truthy. */

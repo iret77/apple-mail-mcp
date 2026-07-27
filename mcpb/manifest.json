@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "apple-mail-mcp",
   "display_name": "Read and Write Apple Mail",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "Fast Apple Mail access for Claude — full-coverage FTS5 body search, disk-first reads, plus flag/color and read/unread write tools.",
   "long_description": "Apple Mail MCP gives Claude fast, reliable access to your macOS Mail: full-coverage FTS5 body search (no recency cap), ~3ms disk-first single-email reads via .emlx parsing, and batch listing across accounts and mailboxes. This build also adds the first write tools — flag/unflag single emails or batches with Apple Mail's seven flag colors, and mark messages read (seen) or unread (unseen). Write tools return per-id result buckets so a batch never fails as a whole, and honor read-only mode and account-exclusion boundaries. The bundle is a thin launcher: it runs the Python server via `uvx` (uv required) and fetches the code from the public GitHub fork, so no Python is bundled. This is a fork of imdinu/apple-mail-mcp (GPL-3.0) tracking the write-ops branch; not affiliated with or endorsed by Apple Inc.",
   "author": {
@@ -41,7 +41,7 @@
     },
     {
       "name": "get_email",
-      "description": "Get a single email with full content and attachments by id."
+      "description": "Get a single email with full content and attachments, by its stable Message-ID header or its numeric id."
     },
     {
       "name": "search",
@@ -61,11 +61,11 @@
     },
     {
       "name": "set_flag",
-      "description": "Write — flag or unflag one email or a batch, optionally by color (red, orange, yellow, green, blue, purple, gray)."
+      "description": "Write — flag or unflag one email or a batch, optionally by color (red, orange, yellow, green, blue, purple, gray). Takes stable Message-ID headers, so it keeps working after the mail is moved from a phone."
     },
     {
       "name": "set_read_status",
-      "description": "Write — mark one email or a batch read (seen) or unread (unseen)."
+      "description": "Write — mark one email or a batch read (seen) or unread (unseen). Takes stable Message-ID headers, so it keeps working after the mail is moved from a phone."
     },
     {
       "name": "get_index_status",
