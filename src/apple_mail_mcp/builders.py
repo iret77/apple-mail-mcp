@@ -357,22 +357,10 @@ class WriteBuilder:
 const groups = {groups_json};
 const MAX_SCAN = {max_scan};
 // Never apply a recovered write in a discard mailbox.
-// Localized too: on a German install the trash is "Papierkorb" and the
-// junk folder is "Werbung". Knowing only the English names would let a
-// recovered write land in a discard mailbox on every non-English Mail.
-const DISCARD_MAILBOXES = [
-    "trash", "deleted items", "deleted messages", "bin",
-    "junk", "junk email", "junk e-mail", "spam",
-    "papierkorb", "gelöschte objekte", "werbung",
-    "unerwünschte werbung",
-    "corbeille", "indésirables",
-    "papelera", "correo no deseado",
-    "cestino", "posta indesiderata",
-    "lixeira", "prullenmand", "ongewenst",
-    "papperskorg", "skräppost", "papirkurv", "søppelpost",
-    "roskakori", "roskaposti", "kosz", "niechciane",
-    "корзина", "спам",
-];
+// Trash and junk are decided by ROLE, not by a word list of our own:
+// MailCore.isDiscardMailbox normalizes provider hierarchies
+// ("[Gmail]/Trash", "INBOX.Junk") and knows the localized names, so
+// this holds on a German, Japanese or Exchange account alike.
 const updated = [];
 const unchanged = [];
 const notFound = [];
@@ -490,8 +478,7 @@ for (const g of groups) {{
             let nm = "";
             try {{ nm = String(mailboxes[m].name()); }} catch (e) {{}}
             const isPreferred = preferred.indexOf(nm) !== -1;
-            const isDiscard =
-                DISCARD_MAILBOXES.indexOf(nm.toLowerCase()) !== -1;
+            const isDiscard = MailCore.isDiscardMailbox(nm);
             if (isDiscard && !isPreferred) continue;
             if (isPreferred) ordered.push(mailboxes[m]);
             else rest.push(mailboxes[m]);

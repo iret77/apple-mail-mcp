@@ -36,96 +36,196 @@ const MailCore = {
      * @param {string} name - Mailbox name (e.g., "INBOX", "Sent")
      * @returns {Mailbox} Mailbox object
      */
+    /**
+     * Role → the names Mail is known to use for it.
+     *
+     * A name is the WEAKEST way to find a well-known mailbox: it changes
+     * with the system language, with the macOS version, and with the
+     * provider. This table is therefore the last resort, not the first
+     * — see getMailbox below. Every entry is taken from Apple's own
+     * localized Mail user guide or is a documented provider/legacy
+     * name; nothing here is a translation someone made up.
+     */
+    MAILBOX_ROLES: {
+        inbox: [
+            "INBOX", "Inbox", "In",
+            "Eingang", "Posteingang",              // de (docs / observed)
+            "Boîte de réception",                  // fr
+            "Entrada",                             // es
+            "Entrata",                             // it
+            "Caixa de Entrada",                    // pt-BR
+            "Inkomend",                            // nl
+            "Inkorg",                              // sv
+            "Indbakke",                            // da
+            "Przychodzące",                        // pl
+            "Входящие",                            // ru
+            "受信", "受信トレイ",                    // ja
+            "收件箱",                              // zh-Hans
+        ],
+        sent: [
+            "Sent", "Sent Messages", "Sent Items", "Sent Mail", "Out",
+            "Gesendet",
+            "Envoyés", "Messages envoyés",
+            "Enviado", "Enviadas",
+            "Inviata",
+            "Verstuurd",
+            "Skickat", "Sendt",
+            "Wysłane",
+            "Отправленные",
+            "送信済み",
+            "已发出邮件", "发件箱",
+        ],
+        drafts: [
+            "Drafts", "Draft",
+            "Entwürfe", "Brouillons", "Borradores", "Bozze",
+            "Rascunhos", "Concepten", "Utkast", "Udkast", "Robocze",
+            "Черновики", "下書き", "草稿",
+        ],
+        trash: [
+            "Trash", "Deleted Items", "Deleted Messages", "Bin",
+            "Papierkorb", "Corbeille", "Papelera", "Cestino", "Lixo",
+            "Prullenmand", "Papperskorg", "Papirkurv", "Kosz",
+            "Корзина", "ゴミ箱", "废纸篓",
+        ],
+        junk: [
+            "Junk", "Junk E-mail", "Junk Email", "Spam", "Bulk Mail",
+            "Indésirable", "Indésirables",
+            "No deseado", "Correo no deseado",
+            "Indesiderata", "Indesejadas",
+            "Skräp", "Reklamepost", "Niechciane",
+            "Спам", "迷惑", "迷惑メール", "垃圾", "垃圾邮件",
+        ],
+        archive: [
+            "Archive", "All Mail", "Archived",
+            "Archiv", "Archives", "Archivo", "Archivio", "Arquivadas",
+            "Archief", "Arkiv", "Archiwum",
+            "Архив", "アーカイブ", "归档",
+        ],
+    },
+
+    /**
+     * Strip everything that is decoration rather than identity.
+     *
+     * Providers wrap the same mailbox in their own hierarchy —
+     * "[Gmail]/Sent Mail", "INBOX.Sent" on dovecot, "INBOX/Trash" —
+     * and case varies freely. Comparing the bare last segment makes
+     * those all resolve.
+     */
+    normalizeMailboxName(name) {
+        let n = String(name == null ? "" : name).trim().toLowerCase();
+        n = n.replace(/^\[[^\]]*\][\/.]?/, "");   // "[Gmail]/…"
+        n = n.replace(/^inbox[\/.]/, "");          // "INBOX.Sent"
+        const parts = n.split(/[\/.]/);
+        return (parts[parts.length - 1] || n).trim();
+    },
+
+    /** Which well-known role does this name denote, if any? */
+    mailboxRole(name) {
+        const n = this.normalizeMailboxName(name);
+        if (!n) return null;
+        for (const role of Object.keys(this.MAILBOX_ROLES)) {
+            for (const alias of this.MAILBOX_ROLES[role]) {
+                if (this.normalizeMailboxName(alias) === n) return role;
+            }
+        }
+        return null;
+    },
+
+    /**
+     * Trash or junk — a mailbox a recovered write must not land in.
+     * Role-based, so it holds in every language and on every provider.
+     */
+    isDiscardMailbox(name) {
+        const role = this.mailboxRole(name);
+        return role === "trash" || role === "junk";
+    },
+
+    /**
+     * Ask Mail itself which mailbox fills a role for this account.
+     *
+     * Language- and provider-independent when it works. The property
+     * is not guaranteed to exist on every macOS version, so this is a
+     * probe: it either returns a mailbox or null, and never throws.
+     */
+    specialMailbox(account, role) {
+        const props = {
+            sent: "sentMailbox",
+            drafts: "draftsMailbox",
+            trash: "trashMailbox",
+            junk: "junkMailbox",
+        };
+        const prop = props[role];
+        if (!prop) return null;
+        for (const owner of [account, Mail]) {
+            try {
+                const mb = owner[prop]();
+                if (mb && mb.name()) return mb;
+            } catch (e) {
+                // property absent or not applicable — try the next
+            }
+        }
+        return null;
+    },
+
+    /**
+     * Resolve a mailbox by name, from most reliable to least.
+     *
+     * The order matters: a name is what breaks first. A German Mail
+     * has no "INBOX" but a "Posteingang"; Exchange says "Deleted
+     * Items"; Gmail hides its folders under "[Gmail]/". So the exact
+     * name is tried first because it is cheap, then Mail's own notion
+     * of the role, then normalized matching that ignores hierarchy and
+     * case, and only then the name table.
+     */
     getMailbox(account, name) {
-        // Fast path: exact match
+        // 1. Exact match — cheap and correct when it hits.
         try {
             const mb = account.mailboxes.byName(name);
-            // Force evaluation to detect -1728 early
-            mb.name();
+            mb.name();  // force evaluation to detect -1728 early
             return mb;
         } catch (_) {
-            // Fall through to fuzzy matching
+            // fall through
         }
 
-        // Alias groups: names that refer to the same logical
-        // mailbox across different providers/locales
-        // Mail.app shows these names in the system language, so a
-        // German install has no "INBOX" at all — it has "Posteingang".
-        // Without the localized names the default mailbox simply does
-        // not resolve, and every JXA path fails with a bare -1728.
-        const aliases = [
-            [
-                "INBOX", "Inbox",
-                "Posteingang", "Boîte de réception", "Bandeja de entrada",
-                "Posta in arrivo", "Caixa de entrada", "Postvak IN",
-                "Inkorg", "Innboks", "Indbakke", "Saapuneet",
-                "Skrzynka odbiorcza", "Doručená pošta", "Входящие",
-            ],
-            [
-                "Sent", "Sent Items", "Sent Messages", "Sent Mail",
-                "Gesendet", "Gesendete Objekte", "Gesendete E-Mails",
-                "Envoyés", "Messages envoyés", "Enviados",
-                "Posta inviata", "Verzonden", "Skickat", "Sendt",
-                "Wysłane", "Отправленные",
-            ],
-            [
-                "Trash", "Deleted Items", "Deleted Messages", "Bin",
-                "Papierkorb", "Gelöschte Objekte", "Corbeille",
-                "Papelera", "Cestino", "Lixeira", "Prullenmand",
-                "Papperskorg", "Papirkurv", "Roskakori", "Kosz",
-                "Корзина",
-            ],
-            [
-                "Drafts", "Draft",
-                "Entwürfe", "Brouillons", "Borradores", "Bozze",
-                "Rascunhos", "Concepten", "Utkast", "Kladder",
-                "Luonnokset", "Robocze", "Черновики",
-            ],
-            [
-                "Junk", "Junk Email", "Junk E-mail", "Spam",
-                "Werbung", "Unerwünschte Werbung", "Indésirables",
-                "Correo no deseado", "Posta indesiderata", "Ongewenst",
-                "Skräppost", "Søppelpost", "Roskaposti", "Niechciane",
-                "Спам",
-            ],
-            [
-                "Archive", "All Mail",
-                "Archiv", "Archives", "Archivo", "Archivio",
-                "Arquivo", "Archief", "Arkiv", "Arkisto", "Archiwum",
-                "Архив",
-            ],
-        ];
-
-        const lower = name.toLowerCase();
-        const names = account.mailboxes.name();
-
-        // Find which alias group the requested name belongs to
-        let candidates = null;
-        for (const group of aliases) {
-            if (group.some((a) => a.toLowerCase() === lower)) {
-                candidates = group;
-                break;
-            }
+        const role = this.mailboxRole(name);
+        let names = [];
+        try {
+            names = account.mailboxes.name();
+        } catch (e) {
+            names = [];
         }
 
-        // Try alias group members first
-        if (candidates) {
-            for (const alt of candidates) {
-                if (names.some((n) => n === alt)) {
-                    return account.mailboxes.byName(alt);
-                }
-            }
+        // 2. Ask Mail which mailbox plays this role for the account.
+        if (role) {
+            const special = this.specialMailbox(account, role);
+            if (special) return special;
         }
 
-        // Last resort: case-insensitive match on actual names
+        // 3. Normalized match: ignores case and provider hierarchy, so
+        //    "[Gmail]/Sent Mail" answers a request for "Sent Mail".
+        const wanted = this.normalizeMailboxName(name);
         for (const actual of names) {
-            if (actual.toLowerCase() === lower) {
+            if (this.normalizeMailboxName(actual) === wanted) {
                 return account.mailboxes.byName(actual);
             }
         }
 
-        // Nothing found — throw the standard error
-        return account.mailboxes.byName(name);
+        // 4. Same role, different word — the localized/legacy table.
+        if (role) {
+            for (const actual of names) {
+                if (this.mailboxRole(actual) === role) {
+                    return account.mailboxes.byName(actual);
+                }
+            }
+        }
+
+        // 5. Nothing matched. Name what IS there: the caller can only
+        //    act on this if it learns which mailboxes exist.
+        throw new Error(
+            "No mailbox matching " + JSON.stringify(String(name)) +
+            (role ? " (role: " + role + ")" : "") +
+            ". Available: " + names.join(", ")
+        );
     },
 
     /**

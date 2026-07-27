@@ -129,6 +129,39 @@ as well. The RFC822 `Message-ID` header survives that. Therefore:
   down. It still raises when *no* property could be read, so an
   unreadable mailbox never reads as "0 messages".
 
+## Well-known mailboxes: resolve by role, never by name
+
+A mailbox name is the weakest handle in this codebase. It changes with
+the system language (`Posteingang`), with the macOS version (Apple's own
+docs still say `Eingang`), and with the provider (`Deleted Items`,
+`[Gmail]/Sent Mail`, `INBOX.Trash`). Defaulting to the string `INBOX`
+therefore failed outright on a German install.
+
+`MailCore.getMailbox()` resolves in this order, most reliable first:
+
+1. **Exact name** — cheap, and right when it hits.
+2. **Mail's own notion of the role** — `specialMailbox()` probes
+   `sentMailbox` / `draftsMailbox` / `trashMailbox` / `junkMailbox` on
+   the account and then the application. Language- and
+   provider-independent where the property exists; the probe never
+   throws, it returns null and the chain continues.
+3. **Normalized match** — `normalizeMailboxName()` lowercases and drops
+   provider hierarchy (`[Gmail]/…`, a leading `INBOX.`), then compares
+   the last path segment. This is what makes `INBOX.Sent` answer a
+   request for `Sent`.
+4. **The role table** (`MAILBOX_ROLES`) — localized and legacy names.
+   **Every entry is sourced from Apple's localized Mail user guide or is
+   a documented provider/legacy name.** Do not add a translation you
+   have not verified: a wrong name here is worse than a missing one,
+   because it can match somebody's real folder.
+5. **Fail loudly** — the error names the role and lists the mailboxes
+   that actually exist, so the caller can act on it.
+
+`isDiscardMailbox()` (trash or junk) rides on the same role logic, so
+the rule "a recovered write never lands in a discard mailbox" holds on
+a German, Japanese or Exchange account too — the write builder no
+longer keeps a word list of its own.
+
 ## MCP Resources (1 total)
 
 | URI | Purpose | MIME |
