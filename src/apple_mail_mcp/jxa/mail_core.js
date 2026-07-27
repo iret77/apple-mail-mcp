@@ -46,6 +46,23 @@ const MailCore = {
      * localized Mail user guide or is a documented provider/legacy
      * name; nothing here is a translation someone made up.
      */
+    /** Apple's `flag index` → colour name; null when unflagged. */
+    FLAG_COLORS: [
+        "red", "orange", "yellow", "green", "blue", "purple", "gray",
+    ],
+
+    flagColorName(index) {
+        // Number(null) is 0, which would report an UNFLAGGED message as
+        // red — an invented flag. Reject the empty cases by identity
+        // first, before any numeric coercion.
+        if (index === null || index === undefined || index === "") {
+            return null;
+        }
+        const i = Number(index);
+        if (!isFinite(i) || i < 0) return null;
+        return this.FLAG_COLORS[i] || null;
+    },
+
     MAILBOX_ROLES: {
         inbox: [
             "INBOX", "Inbox", "In",

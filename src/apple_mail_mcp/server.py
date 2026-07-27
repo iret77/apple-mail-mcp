@@ -200,6 +200,7 @@ class EmailSummary(TypedDict, total=False):
     date_received: str
     read: bool
     flagged: bool
+    flag_color: str | None
 
 
 class SearchResult(TypedDict, total=False):
@@ -239,6 +240,10 @@ class EmailFull(TypedDict, total=False):
     date_sent: str
     read: bool
     flagged: bool
+    # Which colour the flag has ("red" … "gray"), or None when the
+    # message is not flagged. `flagged` alone cannot tell a colour
+    # scheme apart, so an audit or migration is blind without it.
+    flag_color: str | None
     reply_to: str
     message_id: str
     # Where the message is RIGHT NOW. Addressing a mail by its stable
@@ -423,7 +428,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-27.5"
+SERVER_REVISION = "2026-07-28.1"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -764,6 +769,33 @@ def _normalize_message_ids(
     return ids
 
 
+async def _visible_account_names() -> list[str]:
+    """Every account the caller is allowed to see, in Mail's order.
+
+    A header the index cannot place used to be looked for in ONE
+    account — the default. A message that had simply not been indexed
+    yet (it arrived after the last sync) was therefore unreachable in
+    any other account, and reported as a mute not_found. Measured: the
+    NEWEST message in a mailbox failed while a 2013 one succeeded.
+    """
+    acct_map = _get_account_map()
+    excluded = _excluded_account_names()
+    cached = acct_map.get_cached_accounts()
+    if cached is None:
+        try:
+            await acct_map.ensure_loaded()
+            cached = acct_map.get_cached_accounts()
+        except Exception as exc:
+            logger.debug("account enumeration failed: %s", exc)
+            cached = None
+    names = [
+        a.get("name")
+        for a in (cached or [])
+        if a.get("name") and a.get("name") not in excluded
+    ]
+    return names
+
+
 async def _resolve_write_targets(
     ids: list[MessageRef],
     account: str | None,
@@ -870,21 +902,37 @@ async def _resolve_write_targets(
             # pin it. Mailboxes of that account seed the scan order.
             target_acct = acct_map.uuid_to_name(visible[0][0])
             prefer = {mb for acct, mb, _ in visible if acct == visible[0][0]}
-        else:
-            # No index row: scan the hinted or default visible account.
-            target_acct = await _resolve_visible_account(account)
+            targets = [target_acct]
+        elif account:
+            # Caller pinned the account: honour it, scan nothing else.
+            targets = [await _resolve_visible_account(account)]
             if excluded_names and (
-                target_acct is None or target_acct in excluded_names
+                targets[0] is None or targets[0] in excluded_names
             ):
                 not_found.append(header)
                 continue
             prefer = {mailbox} if mailbox else set()
+        else:
+            # The index cannot place it — most often because it arrived
+            # after the last sync. Search EVERY visible account: with
+            # one account only, a message outside it is unreachable and
+            # comes back as a mute "not found".
+            targets = await _visible_account_names()
+            if not targets:
+                targets = [await _resolve_visible_account(None)]
+            if excluded_names and not [
+                t for t in targets if t and t not in excluded_names
+            ]:
+                not_found.append(header)
+                continue
+            prefer = {mailbox} if mailbox else set()
 
-        entry = header_groups.setdefault(
-            target_acct, {"headers": [], "prefer": set()}
-        )
-        entry["headers"].append(header)
-        entry["prefer"] |= prefer
+        for target_acct in targets:
+            entry = header_groups.setdefault(
+                target_acct, {"headers": [], "prefer": set()}
+            )
+            entry["headers"].append(header)
+            entry["prefer"] |= prefer
 
     for mid in int_ids:
         located: tuple[str, str] | None = None
@@ -1124,9 +1172,10 @@ async def _apply_write(
         # a miss is a statement about Apple Mail, not about the index.
         result["hint"] = (
             f"{len(missing_headers)} message(s) with that Message-ID were "
-            f"not found in the account that was searched. The mail may "
-            f"have been deleted, or it lives in another account — pass "
-            f"`account` to search there."
+            f"not found in any visible account. Apple Mail was reachable "
+            f"and every account was searched, so the message is most "
+            f"likely deleted. If you believe it exists, call "
+            f"refresh_index() and try again."
         )
     elif moved:
         result["hint"] = (
@@ -1511,7 +1560,21 @@ async def get_emails(
         # An unknown mailbox makes JXA fail with a raw "...Error:
         # Error: Can't get object. (-1728)". Surface a clean,
         # model-friendly message; re-raise other failures intact.
-        msg = str(exc).lower()
+        raw = str(exc)
+        msg = raw.lower()
+        if "no mailbox matching" in msg:
+            # The resolver already listed what the account really has —
+            # on a system whose language we do not cover, that list IS
+            # the answer. Pass it through instead of flattening it into
+            # a bare "not found".
+            available = raw.split("Available:", 1)[-1].strip()
+            raise ValueError(
+                f"Mailbox {target_mailbox!r} does not exist in account "
+                f"{target_account!r}. This account's mailboxes are: "
+                f"{available}. Call list_mailboxes() and pass one of "
+                f"these as `mailbox`; Mail names them in the system "
+                f"language, so the English default may not apply here."
+            ) from None
         if "-1728" in msg or "can't get object" in msg:
             raise ValueError(
                 f"Mailbox {target_mailbox!r} not found"
@@ -1574,6 +1637,10 @@ JSON.stringify({{
     date_sent: MailCore.formatDate(msg.dateSent()),
     read: msg.readStatus(),
     flagged: msg.flaggedStatus(),
+    flag_color: (function () {{
+        try {{ return MailCore.flagColorName(msg.flagIndex()); }}
+        catch (e) {{ return null; }}
+    }})(),
     reply_to: msg.replyTo(),
     message_id: msg.messageId(),
     mailbox: (function () {{

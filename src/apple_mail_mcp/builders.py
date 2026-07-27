@@ -21,6 +21,7 @@ EMAIL_PROPERTIES = {
     "junk": "junkMailStatus",
     "reply_to": "replyTo",
     "message_id": "messageId",
+    "flag_color": "flagIndex",
     "source": "source",  # Raw email source - expensive!
 }
 
@@ -39,6 +40,12 @@ PROPERTY_SETS = {
         # every JXA-served listing hands out ids that stop resolving
         # the moment another device files the message elsewhere.
         "message_id",
+        # Flag COLOUR, not just flagged yes/no. Without it a caller can
+        # see that a message is flagged but not which colour, so it can
+        # neither audit nor migrate an existing colour scheme — and
+        # re-flagging blind would destroy the very information it is
+        # trying to preserve.
+        "flag_color",
     ],
     "full": [
         "id",
@@ -207,6 +214,12 @@ class QueryBuilder:
             if jxa_name in ("dateReceived", "dateSent"):
                 fmt = f"MailCore.formatDate(data.{jxa_name}[i])"
                 lines.append(f"        {py_name}: {fmt},")
+            elif jxa_name == "flagIndex":
+                # Apple reports an integer (-1 = unflagged). A caller
+                # auditing a colour scheme needs the name, not the
+                # number, and must not have to keep its own table.
+                fmt = f"MailCore.flagColorName(data.{jxa_name}[i])"
+                lines.append(f"        {py_name}: {fmt},")
             else:
                 lines.append(f"        {py_name}: data.{jxa_name}[i],")
         lines.append("    });")
@@ -371,6 +384,12 @@ const notFound = [];
 // Collapsing the two hid a broken account lookup behind a mute
 // "not found" for every id in the batch.
 const failures = [];
+// One header can now be handed to several account groups (the index
+// could not place it, so every visible account is searched). Retire it
+// globally the moment it lands, or the same message would be written
+// twice and a later group would report a mute "not found" for a header
+// that was already done.
+const settled = new Set();
 // The .emlx header keeps its angle brackets ("<a@b>"), Apple Mail's
 // messageId property drops them ("a@b"). A strict comparison between
 // the two can never match, which made every Message-ID write report a
@@ -463,7 +482,10 @@ for (const g of groups) {{
                  String(g.account) + " (" + e + ")");
             continue;
         }}
-        const remaining = new Set(g.headers);
+        const remaining = new Set(
+            g.headers.filter((h) => !settled.has(String(h)))
+        );
+        if (remaining.size === 0) continue;
         // Prefer the mailboxes the index already associates with these
         // messages. A discard mailbox is skipped ONLY when it is not one
         // of those: the same message often still sits in Trash after
@@ -506,9 +528,11 @@ for (const g of groups) {{
                 // otherwise a later mailbox may still hold a good copy.
                 if (r === "updated") {{
                     remaining.delete(target);
+                    settled.add(String(target));
                     updated.push(target);
                 }} else if (r === "unchanged") {{
                     remaining.delete(target);
+                    settled.add(String(target));
                     unchanged.push(target);
                 }}
             }}
@@ -597,8 +621,10 @@ for (const g of groups) {{
 JSON.stringify({{
     updated: updated,
     unchanged: unchanged,
-    not_found: notFound,
-    failures: failures,
+    // A header missing from one account is not missing overall: drop
+    // the ones another account already settled.
+    not_found: notFound.filter((t) => !settled.has(String(t))),
+    failures: failures.filter((f) => !settled.has(String(f.target))),
 }});
 """
 

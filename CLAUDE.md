@@ -102,6 +102,14 @@ as well. The RFC822 `Message-ID` header survives that. Therefore:
     (`WriteBuilder.applyByHeader`), so a stale row can misdirect the
     scan but can never write the wrong message. Header groups run in
     their own `osascript` call and are echoed back as headers.
+  - **A header the index cannot place searches EVERY visible account**,
+    not just the default one. That case is not exotic: it is every
+    message that arrived after the last sync. Measured — in one mailbox
+    the 2013 message flagged fine while the newest one (27 min past the
+    last sync) came back `not_found`. The JXA script retires a header
+    globally (`settled`) the moment it lands, so fanning out never
+    writes two copies and never reports a miss another account already
+    settled.
   - Reads: `_get_email_by_header()` / `_resolve_emlx_path_by_header()`
     fetch each candidate the index offers and **verify** the header on
     what came back, moving to the next candidate on a mismatch and
