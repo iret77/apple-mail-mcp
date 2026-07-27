@@ -36,7 +36,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path as _Path
 from typing import Literal
 
@@ -407,6 +407,34 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
 SERVER_REVISION = "2026-07-26.1"
+
+
+def to_local_iso(value: str | None) -> str | None:
+    """Present a stored timestamp in the viewer's own local time.
+
+    Timestamps are stored in UTC, which is right for storage but wrong
+    to hand to a person: a mail Mail.app shows at 14:54 was reported as
+    12:54. The conversion uses the running system's timezone via
+    ``astimezone()`` — never a fixed zone, since users are not all in
+    the same one, and it follows daylight saving automatically.
+
+    Anything unparseable is returned untouched: a listing must never
+    break over a cosmetic detail.
+    """
+    if not value:
+        return value
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        # Everything this server writes is UTC; say so explicitly
+        # rather than letting it be read as local.
+        parsed = parsed.replace(tzinfo=UTC)
+    try:
+        return parsed.astimezone().isoformat()
+    except (OSError, ValueError):
+        return value
 
 
 def _server_version() -> str:
@@ -1178,7 +1206,7 @@ async def get_emails(
                         id=r.message_id,
                         subject=r.subject,
                         sender=r.sender,
-                        date_received=r.date_received,
+                        date_received=to_local_iso(r.date_received),
                         read=r.read,
                         flagged=r.flagged,
                     )
@@ -1218,7 +1246,11 @@ async def get_emails(
     query = query.order_by("date_received", descending=True).limit(limit)
 
     try:
-        return await execute_query_async(query)
+        rows = await execute_query_async(query)
+        for row in rows:
+            if "date_received" in row:
+                row["date_received"] = to_local_iso(row["date_received"])
+        return rows
     except Exception as exc:
         # An unknown mailbox makes JXA fail with a raw "...Error:
         # Error: Can't get object. (-1728)". Surface a clean,
@@ -1346,7 +1378,14 @@ async def get_email(
     resolved_mailbox = _resolve_mailbox(mailbox)
 
     def _enrich_attachments(result: dict) -> dict:
-        """Replace JXA attachments with richer index data when available."""
+        """Finalize a get_email result: richer attachments + local time.
+
+        Every return path of this tool goes through here, so it is the
+        one place where stored UTC becomes the reader's local time.
+        """
+        for field in ("date_received", "date_sent"):
+            if field in result:
+                result[field] = to_local_iso(result[field])
         try:
             mgr = _get_index_manager()
             if mgr.has_index():
@@ -1855,7 +1894,7 @@ async def search(
                     "id": row["message_id"],
                     "subject": row["subject"],
                     "sender": row["sender"],
-                    "date_received": row["date_received"],
+                    "date_received": to_local_iso(row["date_received"]),
                     "score": 1.0,
                     "matched_in": f"attachment: {row['filename']}",
                     "account": acct_map.uuid_to_name(row["account"]),
@@ -1924,7 +1963,7 @@ async def search(
                         "id": r.id,
                         "subject": r.subject,
                         "sender": r.sender,
-                        "date_received": r.date_received,
+                        "date_received": to_local_iso(r.date_received),
                         "score": r.score,
                         "matched_in": (
                             scope
@@ -1991,7 +2030,7 @@ async def search(
                 "id": e["id"],
                 "subject": e["subject"],
                 "sender": e["sender"],
-                "date_received": e["date_received"],
+                "date_received": to_local_iso(e["date_received"]),
                 "score": 1.0,  # No ranking for JXA search
                 "matched_in": scope if scope != "all" else "metadata",
             }

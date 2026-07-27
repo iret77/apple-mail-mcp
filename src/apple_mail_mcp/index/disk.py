@@ -351,6 +351,27 @@ def _format_timestamp(timestamp: float | int | None) -> str:
         return ""
 
 
+def _filename_text(part) -> str:
+    """Attachment filename as plain text.
+
+    ``get_filename()`` is header-derived and can hand back a ``Header``
+    for the same reason every other header can, so it must not be used
+    raw either.
+    """
+    try:
+        raw = part.get_filename()
+    except Exception:
+        return ""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    try:
+        return str(make_header(decode_header(str(raw))))
+    except Exception:
+        return str(raw)
+
+
 def header_text(message, name: str, default: str = "") -> str:
     """Return a header as plain, decoded text — always a real ``str``.
 
@@ -845,12 +866,12 @@ def _extract_attachments(
         ):
             continue
 
-        content_id = part.get("Content-ID")
+        content_id = header_text(part, "Content-ID")
         if content_id:
             # Strip angle brackets: <cid123> → cid123
             content_id = content_id.strip("<>")
 
-        filename = part.get_filename() or ""
+        filename = _filename_text(part)
         if not filename:
             if "attachment" not in disposition.lower() and not content_id:
                 continue
@@ -936,11 +957,11 @@ def get_attachment_content(
             ):
                 continue
 
-            cid = part.get("Content-ID")
+            cid = header_text(part, "Content-ID")
             if cid:
                 cid = cid.strip("<>")
 
-            fname = part.get_filename() or ""
+            fname = _filename_text(part)
             if not fname:
                 if "attachment" not in disp.lower() and not cid:
                     continue
