@@ -351,6 +351,33 @@ def _format_timestamp(timestamp: float | int | None) -> str:
         return ""
 
 
+def header_text(message, name: str, default: str = "") -> str:
+    """Return a header as plain, decoded text — always a real ``str``.
+
+    Python's email parser returns a ``Header`` object instead of a
+    string whenever a header carries bytes it cannot decode, which real
+    mail does regularly (a non-ASCII relay name in `Received`, a broken
+    charset in `Subject`). Every string operation then fails with
+    AttributeError: 'Header' object has no attribute 'rfind' / 'strip'
+    / 'lower' — and one such message aborted the entire sync, so all
+    later mail stopped being indexed.
+
+    Callers must never touch a raw header value; go through here.
+    """
+    raw = message.get(name)
+    if raw is None:
+        return default
+    if isinstance(raw, str):
+        return raw
+    try:
+        return str(make_header(decode_header(str(raw))))
+    except Exception:
+        try:
+            return str(raw)
+        except Exception:
+            return default
+
+
 def parse_emlx(path: Path) -> EmlxEmail | None:
     """
     Parse a single .emlx file.
@@ -395,14 +422,15 @@ def parse_emlx(path: Path) -> EmlxEmail | None:
 
         # Extract subject with proper decoding
         subject = ""
-        if msg["Subject"]:
+        raw_subject = header_text(msg, "Subject")
+        if raw_subject:
             try:
-                subject = str(make_header(decode_header(msg["Subject"])))
+                subject = str(make_header(decode_header(raw_subject)))
             except (UnicodeDecodeError, LookupError):
-                subject = msg["Subject"] or ""
+                subject = raw_subject
 
         # Extract sender
-        sender = msg["From"] or ""
+        sender = header_text(msg, "From")
         if sender:
             try:
                 sender = str(make_header(decode_header(sender)))
@@ -412,7 +440,7 @@ def parse_emlx(path: Path) -> EmlxEmail | None:
         # Extract received date from Received header (delivery time)
         # Falls back to Date header if no Received header exists
         date_received = ""
-        received_header = msg["Received"]
+        received_header = header_text(msg, "Received")
         if received_header:
             try:
                 from email.utils import parsedate_to_datetime
@@ -425,14 +453,15 @@ def parse_emlx(path: Path) -> EmlxEmail | None:
                     date_received = dt.isoformat()
             except (ValueError, TypeError):
                 pass
-        if not date_received and msg["Date"]:
+        raw_date = header_text(msg, "Date")
+        if not date_received and raw_date:
             try:
                 from email.utils import parsedate_to_datetime
 
-                dt = parsedate_to_datetime(msg["Date"])
+                dt = parsedate_to_datetime(raw_date)
                 date_received = dt.isoformat()
             except (ValueError, TypeError):
-                date_received = msg["Date"]
+                date_received = raw_date
 
         # Extract body text
         body = _extract_body_text(msg)
@@ -445,23 +474,24 @@ def parse_emlx(path: Path) -> EmlxEmail | None:
 
         # Extract sent date from Date header (composition time)
         date_sent = ""
-        if msg["Date"]:
+        if raw_date:
             try:
                 from email.utils import parsedate_to_datetime
 
-                dt = parsedate_to_datetime(msg["Date"])
+                dt = parsedate_to_datetime(raw_date)
                 date_sent = dt.isoformat()
             except (ValueError, TypeError):
-                date_sent = msg["Date"]
+                date_sent = raw_date
 
         reply_to = ""
-        if msg["Reply-To"]:
+        raw_reply_to = header_text(msg, "Reply-To")
+        if raw_reply_to:
             try:
-                reply_to = str(make_header(decode_header(msg["Reply-To"])))
+                reply_to = str(make_header(decode_header(raw_reply_to)))
             except (UnicodeDecodeError, LookupError):
-                reply_to = msg["Reply-To"] or ""
+                reply_to = raw_reply_to
 
-        message_id_header = msg.get("Message-ID", "") or ""
+        message_id_header = header_text(msg, "Message-ID")
 
         # Extract read/flagged from plist footer flags bitmask
         read = None
@@ -628,7 +658,7 @@ def _estimate_attachment_size(part: email.message.Message) -> int:
     if not raw or not isinstance(raw, str):
         return 0
 
-    encoding = (part.get("Content-Transfer-Encoding") or "").lower().strip()
+    encoding = header_text(part, "Content-Transfer-Encoding").lower().strip()
 
     if encoding == "base64":
         # Compute clean length without intermediate copies. (#81)
@@ -805,7 +835,7 @@ def _extract_attachments(
 
     for part in msg.walk():
         content_type = part.get_content_type()
-        disposition = str(part.get("Content-Disposition") or "")
+        disposition = header_text(part, "Content-Disposition")
 
         # Skip multipart containers and plain text/html body
         if part.get_content_maintype() == "multipart":
@@ -897,7 +927,7 @@ def get_attachment_content(
         part_numbers = _mime_part_numbers(msg)
         for part in msg.walk():
             ct = part.get_content_type()
-            disp = str(part.get("Content-Disposition") or "")
+            disp = header_text(part, "Content-Disposition")
 
             if part.get_content_maintype() == "multipart":
                 continue

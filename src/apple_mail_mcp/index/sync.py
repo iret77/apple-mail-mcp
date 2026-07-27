@@ -271,6 +271,9 @@ def sync_from_disk(
                     skipped_per_mailbox.get(mb_key, 0) + 1
                 )
                 continue
+            # One unparseable message must never abort the whole sync:
+            # a single mail with an undecodable header stopped every
+            # later message from being indexed for a full day.
             parsed = parse_emlx(Path(path))
             if parsed:
                 attachments = parsed.attachments or []
@@ -299,8 +302,15 @@ def sync_from_disk(
 
                 added += 1
                 mailbox_counts[mb_key] = current_count + 1
-        except (OSError, ValueError, UnicodeDecodeError) as e:
-            logger.debug("Failed to parse %s: %s", path, e)
+        except Exception as e:
+            # Deliberately broad. This guard exists so ONE unusable
+            # message cannot stop the rest from being indexed, and a
+            # narrow tuple defeats that: an AttributeError from an
+            # undecodable header escaped it and aborted every sync for
+            # a day, silently leaving 158 messages unindexed. Anything
+            # a single file can throw belongs in the DLQ, not in the
+            # caller's face.
+            logger.debug("Failed to parse %s: %s", path, e, exc_info=True)
             errors += 1
             # Record into the DLQ for visibility / future retry.
             try:
