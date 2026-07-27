@@ -2099,13 +2099,23 @@ async def set_read_status(
 @mcp.tool
 async def refresh_index(full: bool = False) -> dict:
     """
-    Update the search index so recent mail becomes searchable.
+    Update or completely rebuild THIS server's mail search index.
+
+    Use this for any request to refresh, update, re-index, rebuild or
+    recreate the mail index or mail search — including "rebuild the mail
+    index from scratch" and its equivalents in other languages (e.g.
+    German "bau den Mail-Index neu auf"). Pass full=True whenever the
+    user says rebuild, from scratch, completely or similar.
+
+    This is the FTS5 index this server maintains at
+    ~/.apple-mail-mcp/index.db. It is NOT Apple Mail's own envelope
+    index, and it has nothing to do with Mail.app's "Mailbox > Rebuild"
+    menu item — never send the user there for this; you can do it here.
 
     The index otherwise syncs only when the server starts, so a
-    long-running client drifts out of date. Call this when the user asks
-    to refresh/update the index, when `get_index_status` reports a large
-    `staleness_hours`, or when a message the user just received cannot be
-    found.
+    long-running client drifts out of date. Also call it when
+    `get_index_status` reports a large `staleness_hours`, or when a
+    message the user just received cannot be found.
 
     This touches only the local index — never the mail itself — so it is
     allowed in read-only mode.

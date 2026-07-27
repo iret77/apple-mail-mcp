@@ -2434,3 +2434,25 @@ class TestDiagnosticsDoNotLie:
         m.record_event("info", "x", obj=Weird(), n=5)
         # Must survive the JSON round-trip the MCP response performs.
         json.dumps(m.recent_events())
+
+
+class TestRebuildIsDiscoverable:
+    """ "Rebuild the mail index" must route here, not to Mail.app's own
+    Mailbox > Rebuild — a live session sent the user there instead."""
+
+    @pytest.mark.asyncio
+    async def test_description_claims_the_rebuild_vocabulary(self):
+        from apple_mail_mcp.server import mcp
+
+        desc = (await mcp.get_tool("refresh_index")).description.lower()
+        for phrase in ("rebuild", "from scratch", "re-index", "recreate"):
+            assert phrase in desc, phrase
+
+    @pytest.mark.asyncio
+    async def test_description_disambiguates_from_apple_mails_index(self):
+        from apple_mail_mcp.server import mcp
+
+        desc = (await mcp.get_tool("refresh_index")).description
+        assert "not Apple Mail's own" in desc
+        assert "Mailbox > Rebuild" in desc
+        assert "never send the user there" in desc.lower()
