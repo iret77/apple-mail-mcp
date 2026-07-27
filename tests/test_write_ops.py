@@ -3165,3 +3165,93 @@ class TestJunkIsAWritableLocation:
         js = self._script(["Archiv"])
         assert "isDiscard && !isPreferred" in js
         assert "DISCARD_MAILBOXES" in js
+
+
+class TestJxaFailuresCarryTheirReason:
+    """The write script must say why, not just "not found".
+
+    A scheduled task reported every set_flag call as not_found, and the
+    server log was empty — because a failing account or mailbox lookup
+    inside the JXA script pushed every target into notFound without
+    raising anything. There was nothing left to diagnose from.
+    """
+
+    def test_script_reports_failures_with_a_reason(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        js = WriteBuilder(
+            groups=[{"account": "Work", "mailbox": "Junk", "ids": [1]}],
+            apply_js="msg.flaggedStatus = true;",
+            needs_change_js="msg.flaggedStatus() === true",
+        ).build()
+
+        assert "failures: failures" in js
+        assert "no such account: " in js
+        assert "cannot open mailbox " in js
+        assert "cannot list mailboxes of account " in js
+
+    @pytest.mark.asyncio
+    async def test_reason_reaches_the_caller_and_shapes_the_hint(self):
+        mgr = _mock_index(location=("uuid-work", "Junk"))
+        amap = _mock_acct_map()
+
+        async def jxa(script, **kw):
+            return {
+                "updated": [],
+                "unchanged": [],
+                "not_found": [],
+                "failures": [
+                    {
+                        "target": 12345,
+                        "reason": "no such account: uuid-work (Error)",
+                    }
+                ],
+            }
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=jxa,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            result = await set_flag(12345, color="orange")
+
+        assert result["failed"] == [12345]
+        assert result["not_found"] == []
+        assert "no such account" in result["error"]
+        # The hint must name THIS cause, not a generic permission story.
+        assert "does not match any account" in result["hint"]
+
+    @pytest.mark.asyncio
+    async def test_mailbox_failure_suggests_the_message_id_route(self):
+        mgr = _mock_index(location=("uuid-work", "Junk"))
+        amap = _mock_acct_map()
+
+        async def jxa(script, **kw):
+            return {
+                "updated": [],
+                "unchanged": [],
+                "not_found": [],
+                "failures": [
+                    {"target": 7, "reason": "cannot open mailbox Junk (Error)"}
+                ],
+            }
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=jxa,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_read_status
+
+            result = await set_read_status(7)
+
+        assert result["failed"] == [7]
+        assert "Message-ID" in result["hint"]

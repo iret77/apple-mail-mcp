@@ -417,7 +417,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-27.2"
+SERVER_REVISION = "2026-07-27.3"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -920,6 +920,24 @@ async def _resolve_write_targets(
     return groups, not_found, skipped_hidden, placed
 
 
+def _absorb_failures(res: dict, failed: list, errors: list, as_int: bool):
+    """Move JXA-reported failures out of the caller's success path.
+
+    The write script distinguishes "Mail was open and the message was
+    not there" (``not_found``) from "we never got that far" (
+    ``failures``, each with its reason). Merging the two is what made a
+    broken account or mailbox lookup look like a batch of deleted mail.
+    """
+    for item in res.get("failures", []) or []:
+        target = item.get("target")
+        if target is None:
+            continue
+        failed.append(int(target) if as_int else str(target))
+        reason = str(item.get("reason", "")).strip()
+        if reason:
+            errors.append(reason)
+
+
 async def _apply_write(
     message_ids: MessageRef | list[MessageRef],
     account: str | None,
@@ -965,6 +983,7 @@ async def _apply_write(
             updated += [int(x) for x in res.get("updated", [])]
             unchanged += [int(x) for x in res.get("unchanged", [])]
             not_found += [int(x) for x in res.get("not_found", [])]
+            _absorb_failures(res, failed, errors, as_int=True)
         except Exception as exc:
             # The contract is that every id lands in exactly one bucket.
             # Letting this raise would leave the caller with no idea
@@ -983,6 +1002,7 @@ async def _apply_write(
             updated += [int(x) for x in res.get("updated", [])]
             unchanged += [int(x) for x in res.get("unchanged", [])]
             not_found += [int(x) for x in res.get("not_found", [])]
+            _absorb_failures(res, failed, errors, as_int=True)
         except Exception as exc:
             # Best-effort fallback: a timed-out or failed scan reports its
             # ids as not_found rather than erroring the whole call.
@@ -1003,6 +1023,7 @@ async def _apply_write(
             updated += [str(x) for x in res.get("updated", [])]
             unchanged += [str(x) for x in res.get("unchanged", [])]
             not_found += [str(x) for x in res.get("not_found", [])]
+            _absorb_failures(res, failed, errors, as_int=False)
         except Exception as exc:
             logger.warning("Message-ID write failed: %s", exc, exc_info=True)
             failed += [h for g in by_header for h in g["headers"]]
@@ -1038,16 +1059,39 @@ async def _apply_write(
         # what it said — the caller must not read this as "deleted".
         result["failed"] = failed
         result["error"] = "; ".join(dict.fromkeys(errors))[:500]
+        blob = result["error"].lower()
+        if "no such account" in blob:
+            cause = (
+                "The account name taken from the index does not match any "
+                "account in Mail. Call refresh_index() and retry; passing "
+                "`account` with the name Mail shows also works."
+            )
+        elif "cannot open mailbox" in blob or "cannot list mailboxes" in blob:
+            cause = (
+                "The mailbox could not be opened under that name — the "
+                "index may name it differently than Mail does. Retry with "
+                "the Message-ID instead of the numeric id, which searches "
+                "by header rather than by mailbox name."
+            )
+        elif "-1743" in blob or "not authorized" in blob:
+            cause = (
+                "This process has no Automation permission for Mail "
+                "(System Settings > Privacy & Security > Automation). A "
+                "background or scheduled run cannot show that consent "
+                "dialog — it has to be granted once interactively."
+            )
+        else:
+            cause = (
+                "Check that Mail.app is running and that this process may "
+                "control it (System Settings > Privacy & Security > "
+                "Automation)."
+            )
         result["hint"] = (
-            f"{len(failed)} write(s) never reached Apple Mail — this is "
-            f"NOT a statement about the messages, they are most likely "
-            f"fine. Apple Mail said: {result['error']} — typical causes: "
-            f"Mail.app is not running, or this process has no Automation "
-            f"permission for Mail (System Settings > Privacy & Security > "
-            f"Automation). A background or scheduled run cannot show that "
-            f"consent dialog, so it must be granted once interactively. "
-            f"Reads keep working meanwhile because they come from the "
-            f"index and the .emlx files, not from Apple Events."
+            f"{len(failed)} write(s) never reached the message — this is "
+            f"NOT a statement about the mail, which is most likely fine. "
+            f"Reported: {result['error']} — {cause} Reads keep working "
+            f"meanwhile because they come from the index and the .emlx "
+            f"files, not from Apple Events."
         )
         return result
     missing_headers = [m for m in not_found if isinstance(m, str)]
