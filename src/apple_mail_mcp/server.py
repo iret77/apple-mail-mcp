@@ -241,6 +241,12 @@ class EmailFull(TypedDict, total=False):
     flagged: bool
     reply_to: str
     message_id: str
+    # Where the message is RIGHT NOW. Addressing a mail by its stable
+    # Message-ID makes its current location the one thing the caller
+    # cannot work out for itself — and after a move it is the most
+    # interesting fact about it.
+    account: str
+    mailbox: str
     attachments: list[AttachmentSummary]
 
 
@@ -1570,6 +1576,13 @@ JSON.stringify({{
     flagged: msg.flaggedStatus(),
     reply_to: msg.replyTo(),
     message_id: msg.messageId(),
+    mailbox: (function () {{
+        try {{ return String(mailbox.name()); }} catch (e) {{ return null; }}
+    }})(),
+    account: (function () {{
+        try {{ return String(mailbox.account().name()); }}
+        catch (e) {{ return null; }}
+    }})(),
     attachments: attachments
 }});
 """
@@ -1711,6 +1724,16 @@ async def _get_email_by_id(
         raise ValueError(f"Email {message_id} not found.")
     resolved_mailbox = _resolve_mailbox(mailbox)
 
+    def _with_location(
+        result: dict, account: str | None, mailbox: str | None
+    ) -> dict:
+        """Record where the message was actually found."""
+        if account and not result.get("account"):
+            result["account"] = account
+        if mailbox and not result.get("mailbox"):
+            result["mailbox"] = mailbox
+        return result
+
     def _enrich_attachments(result: dict) -> dict:
         """Finalize a get_email result: richer attachments + local time.
 
@@ -1754,6 +1777,15 @@ async def _get_email_by_id(
             emlx_path = manager.find_email_path(
                 message_id, account=idx_acct, mailbox=mailbox
             )
+            # The disk read knows the file but not its place; ask the
+            # index, so the answer can say where the message lives.
+            disk_loc = manager.find_email_location(
+                message_id, account=idx_acct, mailbox=mailbox
+            )
+            loc_account = (
+                acct_map.uuid_to_name(disk_loc[0]) if disk_loc else None
+            )
+            loc_mailbox = disk_loc[1] if disk_loc else None
             if emlx_path:
                 # A stale index row (account excluded after indexing,
                 # before re-sync) could still resolve here.
@@ -1787,7 +1819,9 @@ async def _get_email_by_id(
                             ],
                         }
                         await _overlay_live_flags(result, message_id)
-                        return _enrich_attachments(result)
+                        return _enrich_attachments(
+                            _with_location(result, loc_account, loc_mailbox)
+                        )
                 else:
                     stale_index_entry = (idx_acct, mailbox)
     except _AccountHiddenError:
@@ -1833,7 +1867,9 @@ async def _get_email_by_id(
 
     try:
         result = await execute_with_core_async(script)
-        return _enrich_attachments(result)
+        return _enrich_attachments(
+            _with_location(result, resolved_account, resolved_mailbox)
+        )
     except Exception:
         pass  # Fall through to strategy 2
 
@@ -1872,7 +1908,9 @@ async def _get_email_by_id(
                 script = _build_get_email_script(message_id, setup)
                 try:
                     result = await execute_with_core_async(script)
-                    return _enrich_attachments(result)
+                    return _enrich_attachments(
+                        _with_location(result, friendly_account, idx_mailbox)
+                    )
                 except _AccountHiddenError:
                     raise
                 except Exception:

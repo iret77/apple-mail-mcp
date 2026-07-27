@@ -3335,3 +3335,54 @@ class TestAngleBracketsDoNotBreakIdentity:
         assert calls["params"] == ("<a@b.com>", "a@b.com")
         assert "IN (?, ?)" in calls["sql"]
         del sqlite3
+
+
+class TestLocalizedMailboxNames:
+    """Mail.app names its mailboxes in the system language.
+
+    A German install has no "INBOX" — it has "Posteingang". The default
+    mailbox therefore did not resolve at all, and every JXA path failed
+    with a bare -1728. Same class of defect as the angle brackets: a
+    silent assumption about a name.
+    """
+
+    def _resolve(self, names, want):
+        import re
+        import subprocess
+        from pathlib import Path
+
+        src = Path("src/apple_mail_mcp/jxa/mail_core.js").read_text()
+        body = re.search(r"const MailCore = (\{[\s\S]*?\n\});", src).group(1)
+        js = f"""
+const MailCore = {body};
+const names = {names!r};
+const mailboxes = {{}};
+Object.defineProperty(mailboxes, 'name', {{ value: () => names }});
+mailboxes.byName = (n) => {{
+    if (names.includes(n)) return {{ name: () => n }};
+    throw new Error('-1728');
+}};
+console.log(MailCore.getMailbox({{ mailboxes }}, {want!r}).name());
+""".replace("'", '"')
+        out = subprocess.run(["node", "-e", js], capture_output=True, text=True)
+        return out.stdout.strip()
+
+    def test_german_inbox_resolves(self):
+        names = ["Posteingang", "Gesendet", "Papierkorb", "Werbung"]
+        assert self._resolve(names, "INBOX") == "Posteingang"
+
+    def test_german_junk_and_trash_resolve(self):
+        names = ["Posteingang", "Papierkorb", "Werbung"]
+        assert self._resolve(names, "Junk") == "Werbung"
+        assert self._resolve(names, "Trash") == "Papierkorb"
+
+    def test_discard_list_covers_localized_names(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        js = WriteBuilder(
+            groups=[{"account": "W", "headers": ["<a@b>"], "by_header": True}],
+            apply_js="msg.flaggedStatus = true;",
+            needs_change_js="msg.flaggedStatus() === true",
+        ).build()
+        for name in ("papierkorb", "werbung", "corbeille", "cestino"):
+            assert name in js

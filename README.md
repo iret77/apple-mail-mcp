@@ -91,7 +91,7 @@ for the full schema and precedence rules.
 | `list_accounts()` | List email accounts |
 | `list_mailboxes(account?)` | List mailboxes |
 | `get_emails(filter?, limit?)` | Get emails — all, unread, flagged, today, last_7_days |
-| `get_email(message_id)` | Get single email with full content + attachments |
+| `get_email(message_id)` | Get single email with full content, attachments, and its current account/mailbox |
 | — | *Every tool above takes either the numeric id or the RFC822 `Message-ID` header. Prefer the header: the numeric id is a per-mailbox ROWID and stops resolving as soon as another device files the mail elsewhere.* |
 | `search(query, scope?, before?, after?, highlight?)` | Search — all, subject, sender, body, attachments |
 | `get_email_links(message_id)` | Extract links from an email |
