@@ -364,6 +364,16 @@ const DISCARD_MAILBOXES = [
 const updated = [];
 const unchanged = [];
 const notFound = [];
+// Why a target could not be reached. `notFound` must stay a statement
+// about the MESSAGE ("Mail was open, it wasn't there"); anything that
+// went wrong on the way — no such account, mailbox unreadable — is a
+// statement about the ENVIRONMENT and belongs here with its reason.
+// Collapsing the two hid a broken account lookup behind a mute
+// "not found" for every id in the batch.
+const failures = [];
+function fail(targets, reason) {{
+    for (const t of targets) failures.push({{target: t, reason: reason}});
+}}
 
 // Apply the change to the message at `idx`, but only after confirming
 // it really is `targetId`. The id list is a snapshot: if the mailbox
@@ -420,7 +430,10 @@ for (const g of groups) {{
         // Group shapes differ: located/scan carry `ids`, recovery
         // carries `headers`. Reading the wrong one throws INSIDE a
         // catch, which escapes and kills the whole batch.
-        for (const t of (g.ids || g.headers || [])) notFound.push(t);
+        fail(
+            g.ids || g.headers || [],
+            "no such account: " + String(g.account) + " (" + e + ")"
+        );
         continue;
     }}
 
@@ -433,7 +446,8 @@ for (const g of groups) {{
         try {{
             mailboxes = account.mailboxes();
         }} catch (e) {{
-            for (const h of g.headers) notFound.push(h);
+            fail(g.headers, "cannot list mailboxes of account " +
+                 String(g.account) + " (" + e + ")");
             continue;
         }}
         const remaining = new Set(g.headers);
@@ -496,7 +510,8 @@ for (const g of groups) {{
         try {{
             mailboxes = account.mailboxes();
         }} catch (e) {{
-            for (const id of g.ids) notFound.push(id);
+            fail(g.ids, "cannot list mailboxes of account " +
+                 String(g.account) + " (" + e + ")");
             continue;
         }}
         const remaining = new Set(g.ids);
@@ -532,7 +547,11 @@ for (const g of groups) {{
     try {{
         mailbox = MailCore.getMailbox(account, g.mailbox);
     }} catch (e) {{
-        for (const id of g.ids) notFound.push(id);
+        fail(
+            g.ids,
+            "cannot open mailbox " + String(g.mailbox) + " in account " +
+            String(g.account) + " (" + e + ")"
+        );
         continue;
     }}
 
@@ -540,7 +559,8 @@ for (const g of groups) {{
     try {{
         ids = mailbox.messages.id();
     }} catch (e) {{
-        for (const id of g.ids) notFound.push(id);
+        fail(g.ids, "cannot read messages of " + String(g.mailbox) +
+             " (" + e + ")");
         continue;
     }}
 
@@ -556,7 +576,7 @@ for (const g of groups) {{
             else if (r === "unchanged") unchanged.push(targetId);
             else notFound.push(targetId);
         }} catch (e) {{
-            notFound.push(targetId);
+            fail([targetId], "write failed (" + e + ")");
         }}
     }}
 }}
@@ -565,6 +585,7 @@ JSON.stringify({{
     updated: updated,
     unchanged: unchanged,
     not_found: notFound,
+    failures: failures,
 }});
 """
 
