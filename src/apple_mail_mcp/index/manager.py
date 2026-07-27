@@ -1244,6 +1244,43 @@ class IndexManager:
         except sqlite3.Error:
             return 0
 
+    def get_rfc822_ids(
+        self, keys: list[tuple[str, str, int]]
+    ) -> dict[tuple[str, str, int], str]:
+        """Batch form of :meth:`get_rfc822_id`, fully scoped.
+
+        Takes ``(account, mailbox, message_id)`` triples and returns the
+        stable header for the ones the index knows. One statement for
+        the whole page instead of a query per row — the listing paths
+        call this for every result they return.
+        """
+        if not keys:
+            return {}
+        out: dict[tuple[str, str, int], str] = {}
+        conn = self._get_conn()
+        # Chunked to stay well under SQLite's variable limit (999).
+        chunk = 300
+        for start in range(0, len(keys), chunk):
+            batch = keys[start : start + chunk]
+            clause = " OR ".join(
+                ["(account = ? AND mailbox = ? AND message_id = ?)"]
+                * len(batch)
+            )
+            params: list = []
+            for acct, mbox, mid in batch:
+                params += [acct, mbox, mid]
+            rows = conn.execute(
+                "SELECT account, mailbox, message_id, rfc822_message_id "
+                f"FROM emails WHERE ({clause}) "
+                "AND rfc822_message_id IS NOT NULL",
+                params,
+            ).fetchall()
+            for r in rows:
+                out[(r["account"], r["mailbox"], r["message_id"])] = r[
+                    "rfc822_message_id"
+                ]
+        return out
+
     def find_by_rfc822(
         self, rfc822_message_id: str
     ) -> list[tuple[str, str, int]]:

@@ -34,11 +34,11 @@ src/apple_mail_mcp/
 | `list_accounts()` | List email accounts | - |
 | `list_mailboxes(account?)` | List mailboxes | account (optional) |
 | `get_emails(...)` | Unified listing | filter: all/unread/flagged/today/last_7_days |
-| `get_email(id)` | Full email content + attachments | message_id |
+| `get_email(ref)` | Full email content + attachments | message_id (numeric id **or** RFC822 header) |
 | `search(query, ...)` | Unified search | scope, before, after, offset, highlight |
-| `get_email_links(id)` | Extract links from an email | message_id |
-| `get_email_attachment(id, filename)` | Extract attachment content | message_id, filename |
-| `get_attachment(id, filename)` | *Deprecated* — use `get_email_attachment()` | message_id, filename |
+| `get_email_links(ref)` | Extract links from an email | message_id (id or header) |
+| `get_email_attachment(ref, filename)` | Extract attachment content | message_id (id or header), filename |
+| `get_attachment(ref, filename)` | *Deprecated* — use `get_email_attachment()` | message_id, filename |
 | `set_flag(ids, color?)` | *Write* — flag/unflag single or batch, optional color | message_ids, color, account?, mailbox? |
 | `set_read_status(ids, read?)` | *Write* — mark read (seen) / unread (unseen) | message_ids, read, account?, mailbox? |
 | `get_index_status()` | Index health + setup diagnostics (state, progress, Full Disk Access) | - |
@@ -53,16 +53,11 @@ per-id buckets `{updated, not_found, skipped_hidden}` (+ optional
 - **Read-only gate:** `_ensure_writable()` first line (regression test
   `TestWriteImplyingToolsHaveGuard` enforces this for every `set_`/
   `flag_`/`mark_`/… tool name).
-- **Stable identity (v6):** Mail.app ids are per-mailbox ROWIDs that die
-  the moment *any* device files a message elsewhere — the normal case
-  with phones and tablets on one account. The index therefore also
-  stores the RFC822 `Message-ID` header (`rfc822_message_id`), which
-  survives moves. When a write reports `not_found`,
-  `_retry_by_stable_id()` looks the header up, re-finds the message by
-  scanning `messages.messageId()` (batch-fetched, one IPC per mailbox),
-  and writes there — reporting the move via `hint`. Rows indexed before
-  v6 have NULL and cannot be recovered; `get_index_status` surfaces the
-  count as `without_stable_id` and points at `refresh_index(full=True)`.
+- **Stable identity is the primary handle, not a fallback.** Mail.app
+  ids are per-mailbox ROWIDs that die the moment *any* device files a
+  message elsewhere — the normal case with phones and tablets on one
+  account. So the RFC822 `Message-ID` header is now a first-class
+  reference end to end. See "Message identity" below.
 - **ID resolution:** Mail.app ids are per-mailbox ROWIDs — not globally
   addressable. `_resolve_write_targets()` reuses the index location
   resolver (`find_email_location`), groups ids by `(account, mailbox)`,
@@ -80,6 +75,49 @@ per-id buckets `{updated, not_found, skipped_hidden}` (+ optional
   blue 4, purple 5, gray 6; `color="none"` unflags, `"default"` flags
   without forcing a color. No index write needed — read/flag state is
   served live from the Envelope Index / `.emlx` footer, not cached.
+
+## Message identity (read this before touching any tool that takes an id)
+
+A Mail.app message id is a **per-mailbox ROWID**. It is exact while the
+message stays put and *dead* the moment it is filed elsewhere — which
+happens routinely, since most accounts are open on a phone and a tablet
+as well. The RFC822 `Message-ID` header survives that. Therefore:
+
+- **Every read path hands out both.** `get_email` returns `id` and
+  `message_id`; `search()` and `get_emails()` carry `message_id` in
+  every result (FTS from the `rfc822_message_id` column, the Envelope
+  Index fast path via one batched `IndexManager.get_rfc822_ids()`
+  lookup, the JXA paths from `messageId` in `PROPERTY_SETS["standard"]`).
+  Their docstrings tell the model to prefer it.
+- **Every tool that takes a message accepts both** — `get_email`,
+  `get_email_links`, `get_email_attachment`, `get_attachment`,
+  `set_flag`, `set_read_status`. `_normalize_message_ids()` validates
+  ints and header strings alike.
+- **A header is never translated back into a ROWID and then trusted.**
+  That is the whole point: an index row can be stale, and its ROWID may
+  by then belong to a *different* message.
+  - Writes: `_resolve_write_targets()` uses the index only to pick the
+    account and to order the mailbox scan (`prefer_mailboxes`). The
+    write itself matches `msg.messageId()` in JXA
+    (`WriteBuilder.applyByHeader`), so a stale row can misdirect the
+    scan but can never write the wrong message. Header groups run in
+    their own `osascript` call and are echoed back as headers.
+  - Reads: `_get_email_by_header()` / `_resolve_emlx_path_by_header()`
+    fetch each candidate the index offers and **verify** the header on
+    what came back, moving to the next candidate on a mismatch and
+    raising rather than returning a stranger's mail.
+- **`_retry_by_stable_id()` remains** for callers who only have an int:
+  a `not_found` ROWID is looked up in the index and retried by header,
+  reporting the move via `hint`. It only works while the old row still
+  exists, which is exactly why the header is the better handle.
+- **Rows indexed before schema v6** have NULL; `get_index_status`
+  surfaces the count as `without_stable_id` and points at
+  `refresh_index(full=True)`.
+- **`MailCore.batchFetch` degrades per property.** Carrying `messageId`
+  everywhere means one more bulk IPC call per listing; a property Mail
+  refuses is padded with nulls instead of taking the whole listing
+  down. It still raises when *no* property could be read, so an
+  unreadable mailbox never reads as "0 messages".
 
 ## MCP Resources (1 total)
 
@@ -108,6 +146,9 @@ search("pdf", scope="attachments")         # By attachment filename (SQL)
 search("invoice", after="2025-01-01")      # Date-range filtering
 search("meeting", highlight=True)          # Highlighted results
 search("meeting", limit=20, offset=20)    # Page 2 of results
+
+# Every result carries `message_id` (the RFC822 header). Pass THAT to
+# get_email / set_flag / set_read_status — see "Message identity".
 ```
 
 ## Architecture
