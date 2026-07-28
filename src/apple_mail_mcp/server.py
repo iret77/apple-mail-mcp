@@ -2238,10 +2238,14 @@ async def _get_email_by_id(
             exc_info=True,
         )
 
-    # Stale-entry handling: clean up the dead row and fail fast with a
-    # clear message. Skipping Strategies 1-3 here is intentional — they
-    # would also fail (the message is gone from Mail.app), with Strategy 3
-    # eating its full timeout before doing so.
+    # Stale-entry handling: clean up the dead row, then KEEP GOING.
+    # A missing .emlx means the recorded path is wrong — nothing more.
+    # The message may well still be in Mail: it was re-filed, Mail
+    # rebuilt its store, or the row simply predates a move. The old
+    # code raised "deleted or moved" here on the assumption that the
+    # live strategies would fail anyway. That assumption was never
+    # checked, and stating it as fact is the same defect this whole
+    # review pass was about.
     if stale_index_entry is not None:
         stale_acct, stale_mb = stale_index_entry
         try:
@@ -2260,11 +2264,7 @@ async def _get_email_by_id(
                 message_id,
                 exc_info=True,
             )
-        raise ValueError(
-            f"Message {message_id} was deleted or moved since the last "
-            f"index sync. Run 'apple-mail-mcp rebuild' to refresh "
-            f"the index."
-        )
+        # Fall through to the live strategies below.
 
     # Strategy 1: Try specified mailbox
     mailbox_setup = build_mailbox_setup_js(resolved_account, resolved_mailbox)
@@ -2378,7 +2378,15 @@ async def _get_email_by_id(
                 f"look in the right place, or use its Message-ID."
             ) from None
         if "not found" in msg or "-1728" in msg or "can't get object" in msg:
-            raise ValueError(f"Message {message_id} not found.") from None
+            extra = (
+                " Its index entry was stale and has been removed; call "
+                "refresh_index() to re-record it if it still exists."
+                if stale_index_entry is not None
+                else ""
+            )
+            raise ValueError(
+                f"Message {message_id} not found.{extra}"
+            ) from None
         raise
 
 

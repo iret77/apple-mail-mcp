@@ -4529,3 +4529,24 @@ class TestTheLastTwoGapPaths:
         assert "the account could not be read at all" in js
         # The throw must sit BEFORE any per-mailbox loop.
         assert js.index("could not be read at all") < js.index("mbLimit =")
+
+
+class TestAStalePathIsNotADeletedMessage:
+    """Fifth review round, the last one.
+
+    A missing .emlx file means the path recorded in the index is wrong.
+    It does not mean the message left Apple Mail — it may have been
+    re-filed, or Mail may have rebuilt its store. The old code raised
+    "deleted or moved" right there and skipped the live strategies,
+    justified by the assumption that they would fail anyway. That
+    assumption was never verified.
+    """
+
+    def test_the_shortcut_is_gone(self):
+        import inspect
+
+        from apple_mail_mcp import server
+
+        src = inspect.getsource(server)
+        assert "deleted or moved since the last" not in src
+        assert "KEEP GOING" in src
