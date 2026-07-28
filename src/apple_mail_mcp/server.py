@@ -432,7 +432,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-28.16"
+SERVER_REVISION = "2026-07-28.17"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -1581,7 +1581,11 @@ async def list_mailboxes(account: str | None = None) -> list[Mailbox]:
     List all mailboxes for an email account.
 
     Args:
-        account: Account name. Uses APPLE_MAIL_DEFAULT_ACCOUNT env var or
+        account: Account name, or "all" to list across EVERY visible
+                 account in one call — which is what you want for a
+                 survey or a triage pass; without it you would need one
+                 call per account and would have to know their names
+                 first. Uses APPLE_MAIL_DEFAULT_ACCOUNT env var or the
                  first account if not specified.
 
     Returns:
@@ -1641,18 +1645,42 @@ async def get_emails(
         >>> get_emails("Work", "INBOX", filter="today")  # Today's work emails
     """
     limit, _ = _validate_pagination(limit)
-    if _hidden_account(account):
+    all_accounts = isinstance(account, str) and account.strip().lower() in (
+        "all",
+        "*",
+    )
+    if all_accounts:
+        # The Envelope Index query already means "every account" when
+        # given no UUID; only this tool's defaulting stood in the way.
+        # Excluded accounts stay excluded — the filter runs on UUIDs
+        # further down, not on this name.
+        account = None
+    if not all_accounts and _hidden_account(account):
         # Hidden account explicitly requested: return nothing and do
         # NOT fall through to JXA (which would surface its mail).
         return []
     # Resolve None/excluded-default to a visible account so neither the
     # fast path nor the JXA fallback implicitly targets a hidden one.
-    target_account = await _resolve_visible_account(account)
-    if target_account is None and _excluded_account_names():
+    target_account = (
+        None if all_accounts else (await _resolve_visible_account(account))
+    )
+    if (
+        not all_accounts
+        and target_account is None
+        and _excluded_account_names()
+    ):
         # No visible account at all (every account is hidden): the JXA
         # fallback would target Mail.accounts()[0] — a hidden one.
         return []
-    target_mailbox = _resolve_mailbox(mailbox)
+    # With "all" and no explicit mailbox, do not apply the INBOX
+    # default: it would narrow six accounts to whichever of them
+    # happens to have a mailbox by that name — and on a localized Mail
+    # none of them does.
+    target_mailbox = (
+        None
+        if (all_accounts and mailbox is None)
+        else _resolve_mailbox(mailbox)
+    )
 
     # Strategy 0: direct read against Apple's Envelope Index SQLite.
     # 100-1000x faster than JXA at scale because we skip the
@@ -1681,6 +1709,10 @@ async def get_emails(
             account_uuid: str | None = None
             if target_account:
                 account_uuid = _get_account_map().name_to_uuid(target_account)
+            elif all_accounts:
+                # Explicitly every account: leave the scope open. Hidden
+                # accounts are still dropped below, by UUID.
+                account_uuid = None
             else:
                 # No account requested: scope to the first account,
                 # matching the documented behavior and the JXA path
@@ -1769,6 +1801,17 @@ async def get_emails(
         logger.debug(
             "Envelope Index fast path unavailable (%s); falling back to JXA",
             exc,
+        )
+
+    if all_accounts:
+        # Only the Envelope Index can answer across accounts. JXA walks
+        # one account at a time, so falling through would quietly
+        # answer a different question than the one that was asked.
+        raise ValueError(
+            "Listing across all accounts needs Apple's Envelope Index, "
+            "which is not readable right now (Full Disk Access, or an "
+            "unsupported Mail.app layout). Call get_index_status() for "
+            "the reason, or pass a single `account`."
         )
 
     # Strategy 1: JXA batchFetch fallback. Preserves correctness
@@ -1896,12 +1939,15 @@ JSON.stringify({{
 """
 
 
+MAX_READ_BATCH = 50
+
+
 @mcp.tool
 async def get_email(
-    message_id: int | str,
+    message_id: int | str | list[int | str],
     account: str | None = None,
     mailbox: str | None = None,
-) -> EmailFull:
+) -> EmailFull | list[dict]:
     """
     Get a single email with full content.
 
@@ -1910,7 +1956,13 @@ async def get_email(
     that speed up lookup but are not required.
 
     Args:
-        message_id: The email's numeric id (from search / get_emails)
+        message_id: One reference, or a LIST of them (max 50). A batch
+            costs one round-trip instead of one per message, and each
+            read is a few milliseconds from disk — so fetching the page
+            you just listed is nearly free. A list returns a list of
+            {"ref": ..., "email": {...}} or {"ref": ..., "error": "..."}
+            entries, in the order given: one unreadable message never
+            takes the batch down.
         account: Optional hint (speeds up lookup, not required)
         mailbox: Optional hint (speeds up lookup, not required)
 
@@ -1940,9 +1992,36 @@ async def get_email(
         {"id": 12345, "subject": "Meeting notes",
          "content": "Hi team,\\n\\nHere are the notes...", ...}
     """
-    if isinstance(message_id, str):
-        return await _get_email_by_header(message_id, account, mailbox)
-    return await _get_email_by_id(message_id, account, mailbox)
+    refs = _normalize_message_ids(message_id)
+    if not isinstance(message_id, (list, tuple)) and len(refs) == 1:
+        # A single reference keeps the single-object shape it always
+        # had — callers and their parsers depend on it.
+        one = refs[0]
+        if isinstance(one, str):
+            return await _get_email_by_header(one, account, mailbox)
+        return await _get_email_by_id(one, account, mailbox)
+
+    if len(refs) > MAX_READ_BATCH:
+        raise ValueError(
+            f"Too many references ({len(refs)}); max {MAX_READ_BATCH} per "
+            f"call. Each one is a disk read of a few milliseconds, so the "
+            f"limit is about how much text fits in your context, not "
+            f"speed — split the list."
+        )
+
+    async def fetch(ref: MessageRef) -> dict:
+        try:
+            if isinstance(ref, str):
+                got = await _get_email_by_header(ref, account, mailbox)
+            else:
+                got = await _get_email_by_id(ref, account, mailbox)
+            return {"ref": ref, "email": got}
+        except Exception as exc:
+            # One unreadable message must not take the batch down with
+            # it — the same bucket contract the write tools follow.
+            return {"ref": ref, "error": str(exc)}
+
+    return list(await asyncio.gather(*(fetch(r) for r in refs)))
 
 
 class _LiveLookupIncomplete(RuntimeError):

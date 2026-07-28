@@ -33,8 +33,8 @@ src/apple_mail_mcp/
 |------|---------|----------------|
 | `list_accounts()` | List email accounts | - |
 | `list_mailboxes(account?)` | List mailboxes | account (optional) |
-| `get_emails(...)` | Unified listing | filter: all/unread/flagged/today/last_7_days |
-| `get_email(ref)` | Full email content + attachments + current `account`/`mailbox` | message_id (numeric id **or** RFC822 header) |
+| `get_emails(...)` | Unified listing; `account="all"` lists across every visible account in one call | filter, account ("all" supported) |
+| `get_email(ref)` | Full email content + attachments + current `account`/`mailbox`. Takes a **list** (max 50) for one-round-trip batches | message_id (id, header, or list) |
 | `search(query, ...)` | Unified search | scope, before, after, offset, highlight |
 | `get_email_links(ref)` | Extract links from an email | message_id (id or header) |
 | `get_email_attachment(ref, filename)` | Extract attachment content | message_id (id or header), filename |

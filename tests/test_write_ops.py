@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -4746,3 +4747,171 @@ class TestFlagColoursCarryNoMeaning:
             "purple": 5,
             "gray": 6,
         }
+
+
+class TestBatchReadsAndCrossAccountListing:
+    """Fewer round-trips for surveys and triage.
+
+    Measured motivation: a colour survey of 57 flagged messages needed
+    58 tool calls. The reads themselves are 1-5ms of disk; the cost was
+    entirely in the round-trips.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_list_returns_one_entry_per_reference(self):
+        async def by_header(h, account=None, mailbox=None):
+            return {"message_id": h, "subject": f"re {h}"}
+
+        with patch(
+            "apple_mail_mcp.server._get_email_by_header", side_effect=by_header
+        ):
+            from apple_mail_mcp.server import get_email
+
+            out = await get_email(["<a@x>", "<b@x>"])
+
+        assert [e["ref"] for e in out] == ["<a@x>", "<b@x>"]
+        assert out[0]["email"]["subject"] == "re <a@x>"
+
+    @pytest.mark.asyncio
+    async def test_one_bad_reference_does_not_sink_the_batch(self):
+        async def flaky(h, account=None, mailbox=None):
+            if h == "<bad@x>":
+                raise ValueError("not found")
+            return {"message_id": h}
+
+        with patch(
+            "apple_mail_mcp.server._get_email_by_header", side_effect=flaky
+        ):
+            from apple_mail_mcp.server import get_email
+
+            out = await get_email(["<a@x>", "<bad@x>", "<c@x>"])
+
+        assert "email" in out[0]
+        assert out[1]["error"] == "not found"
+        assert "email" in out[2]
+
+    @pytest.mark.asyncio
+    async def test_a_single_reference_keeps_the_old_shape(self):
+        """Existing callers must not have to change."""
+
+        async def by_id(mid, account=None, mailbox=None):
+            return {"id": mid, "subject": "single"}
+
+        with patch("apple_mail_mcp.server._get_email_by_id", side_effect=by_id):
+            from apple_mail_mcp.server import get_email
+
+            out = await get_email(42)
+
+        assert out["subject"] == "single"  # not a list
+
+    @pytest.mark.asyncio
+    async def test_oversized_batch_is_refused_with_the_reason(self):
+        from apple_mail_mcp.server import MAX_READ_BATCH, get_email
+
+        refs = [f"<m{i}@x>" for i in range(MAX_READ_BATCH + 1)]
+        with pytest.raises(ValueError, match="context"):
+            await get_email(refs)
+
+    @pytest.mark.asyncio
+    async def test_account_all_drops_both_defaults(self):
+        """ "all" must not be narrowed by the INBOX default either."""
+        captured = {}
+
+        def fetch(env_path, *, account_uuid, mailbox_name, filter_kind, limit):
+            captured["account_uuid"] = account_uuid
+            captured["mailbox_name"] = mailbox_name
+            return []
+
+        mgr = MagicMock()
+        amap = _mock_acct_map()
+        amap.get_cached_accounts.return_value = [
+            {"name": "byte5", "id": "uuid-byte5"}
+        ]
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                side_effect=fetch,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            await get_emails(account="all")
+
+        assert captured["account_uuid"] is None  # every account
+        assert captured["mailbox_name"] is None  # every mailbox
+
+
+class TestExcludedAccountsSurviveTheAllShortcut:
+    """ "all" must not become a hole in the exclusion boundary (#90)."""
+
+    @pytest.mark.asyncio
+    async def test_hidden_account_rows_are_dropped(self):
+        from types import SimpleNamespace
+
+        rows = [
+            SimpleNamespace(
+                message_id=1,
+                subject="visible",
+                sender="a@x",
+                date_received="2026-07-28T10:00:00",
+                read=False,
+                flagged=False,
+                account_uuid="uuid-visible",
+                mailbox_name="Posteingang",
+            ),
+            SimpleNamespace(
+                message_id=2,
+                subject="secret",
+                sender="b@x",
+                date_received="2026-07-28T10:00:00",
+                read=False,
+                flagged=False,
+                account_uuid="uuid-secret",
+                mailbox_name="Posteingang",
+            ),
+        ]
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+        amap = _mock_acct_map(excluded_uuids={"uuid-secret"})
+        amap.get_cached_accounts.return_value = [
+            {"name": "byte5", "id": "uuid-visible"},
+            {"name": "Secret", "id": "uuid-secret"},
+        ]
+
+        with (
+            patch(
+                "apple_mail_mcp.server._excluded_account_names",
+                return_value={"Secret"},
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                return_value=rows,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            out = await get_emails(account="all")
+
+        assert [e["subject"] for e in out] == ["visible"]
