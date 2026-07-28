@@ -21,6 +21,15 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="$(node -p "require('$REPO/mcpb/manifest.json').version")"
+# One version line for everything. Two numbers claimed a difference in
+# content that does not exist and turned every bug report into a
+# translation exercise.
+for f in pyproject.toml server.json mcpb/server/index.js; do
+  if ! grep -q "$VERSION" "$REPO/$f"; then
+    echo "[build] REFUSED: $f does not carry version $VERSION" >&2
+    exit 1
+  fi
+done
 OUT="${1:-$REPO/dist/apple-mail-mcp-$VERSION.mcpb}"
 mkdir -p "$(dirname "$OUT")"
 
