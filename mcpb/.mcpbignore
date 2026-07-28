@@ -1,8 +1,0 @@
-.DS_Store
-*.log
-.env
-.env.*
-*.swp
-.vscode/
-.idea/
-README.md
