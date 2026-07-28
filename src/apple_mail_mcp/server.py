@@ -27,6 +27,7 @@ RESOURCES (1 total):
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -432,7 +433,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-28.5"
+SERVER_REVISION = "2026-07-28.7"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -757,6 +758,15 @@ def _normalize_message_ids(
                 raise ValueError(
                     "message reference must not be an empty string."
                 )
+            # HTML-escaped brackets are another shape the same
+            # reference arrives in: "&lt;a@b&gt;", sometimes wrapping a
+            # stringified list as well. Nothing in it trips the checks
+            # below, so it would sail through and miss in silence —
+            # observed live, where the caller happened to notice.
+            # Unescape FIRST: an escaped list has to become a list
+            # before it can be unwrapped as one.
+            if "&lt;" in item or "&gt;" in item or "&amp;" in item:
+                item = html.unescape(item).strip()
             # Some clients serialize a list parameter as JSON text, so
             # what arrives is the string '["<a@b>"]' rather than a list.
             # Taken literally that is a Message-ID nothing will ever
@@ -861,6 +871,46 @@ JSON.stringify({{
             result["flag_color"] = got["flag_color"]
     except Exception as exc:
         logger.debug("flag colour unavailable for %s: %s", message_id, exc)
+
+
+async def _overlay_flag_colors_bulk(
+    rows: list[dict], account: str, mailbox: str
+) -> None:
+    """Resolve the flag colour for a whole page in ONE osascript call.
+
+    Asking per message costs a process spawn each: a survey of 57
+    flagged messages took a minute. Apple hands out a property for the
+    entire mailbox in a single bulk fetch, so the cost is two of those
+    regardless of how many messages the page holds.
+    """
+    wanted = [r["id"] for r in rows if r.get("flagged") and r.get("id")]
+    if not wanted or not account or not mailbox:
+        return
+    script = f"""
+const account = MailCore.getAccount({json.dumps(account)});
+const mailbox = MailCore.getMailbox(account, {json.dumps(mailbox)});
+const ids = mailbox.messages.id();
+const flags = mailbox.messages.flagIndex();
+const out = {{}};
+for (const id of {json.dumps(wanted)}) {{
+    const i = ids.indexOf(id);
+    out[String(id)] = i === -1 ? null : MailCore.flagColorName(flags[i]);
+}}
+JSON.stringify(out);
+"""
+    try:
+        colors = await execute_with_core_async(
+            script, timeout=STRATEGY3_TIMEOUT
+        )
+    except Exception as exc:
+        logger.debug("bulk flag colours unavailable: %s", exc)
+        return
+    if not isinstance(colors, dict):
+        return
+    for row in rows:
+        color = colors.get(str(row.get("id")))
+        if color:
+            row["flag_color"] = color
 
 
 async def _resolve_write_targets(
@@ -1604,7 +1654,7 @@ async def get_emails(
                         )
                     except Exception as exc:
                         logger.debug("stable-id lookup failed: %s", exc)
-                return [
+                summaries = [
                     EmailSummary(
                         id=r.message_id,
                         message_id=headers.get(
@@ -1618,6 +1668,21 @@ async def get_emails(
                     )
                     for r in visible
                 ]
+                # Flag colours for the whole page in one call per
+                # mailbox. Without this the caller has to fetch each
+                # message on its own just to learn its colour, which is
+                # one process spawn per message.
+                by_box: dict[tuple[str, str], list[dict]] = {}
+                for summary, r in zip(summaries, visible, strict=True):
+                    if summary.get("flagged"):
+                        key = (
+                            _get_account_map().uuid_to_name(r.account_uuid),
+                            r.mailbox_name,
+                        )
+                        by_box.setdefault(key, []).append(summary)
+                for (acct_name, box), group in by_box.items():
+                    await _overlay_flag_colors_bulk(group, acct_name, box)
+                return summaries
     except (
         FileNotFoundError,
         sqlite3.OperationalError,
