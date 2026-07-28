@@ -19,11 +19,73 @@ The only Apple Mail MCP server with **full-coverage body search** — reliable o
 
 ## Quick Start
 
+### Claude Desktop — the easy way
+
+No terminal, no Python, no config file.
+
+1. **Download** the newest `apple-mail-mcp-<version>.mcpb` from
+   [Releases](https://github.com/iret77/apple-mail-mcp/releases).
+2. **Double-click it.** Claude Desktop installs it as an extension.
+3. **Grant Full Disk Access to Claude Desktop** — see the box below.
+   This step is not optional and it is the one people miss.
+4. **Quit Claude Desktop completely and start it again.** A permission
+   granted while the app is running does not reach the already-running
+   process.
+
+That is the whole installation. The bundle is a thin launcher: it runs
+the Python server via `uvx` and fetches the code from this repository,
+so nothing is bundled and updates arrive with the next bundle you
+install.
+
+> ### ⚠️ Full Disk Access — read this, it is the usual reason nothing works
+>
+> Reading your mail means reading `~/Library/Mail`, which macOS
+> protects. macOS grants that permission to **the application that
+> launches the server** — not to this package, and not to your
+> terminal.
+>
+> **With the bundle, that application is Claude Desktop.**
+>
+> System Settings → Privacy & Security → **Full Disk Access** → switch
+> on **Claude**. Then quit Claude Desktop and start it again.
+>
+> Granting it to Terminal does nothing for the bundle: the terminal
+> never launches this server.
+>
+> **Don't want to give Claude Desktop full disk access?** Then build the
+> index yourself, from a terminal that has the permission, and turn the
+> automatic build off:
+>
+> ```bash
+> pipx install apple-mail-mcp && apple-mail-mcp index
+> ```
+>
+> Set *Build the search index automatically* to **off** in the
+> extension's settings. The server then reads the finished index at
+> `~/.apple-mail-mcp/index.db`, which is not a protected path. Search,
+> flagging and read/unread keep working; only live disk reads fall back
+> to a slower route.
+
+### What happens on the first start
+
+The search index is built in the background. On a large mailbox this
+takes minutes and shows nothing at all while it runs — that is normal,
+not a hang, and the server answers the whole time.
+
+**If anything looks wrong, do not go digging. Ask your assistant:**
+
+> Ask the Apple Mail integration for its index status and show me the
+> result.
+
+It reports which build is answering, what the index is doing, how far
+along it is, and whether `~/Library/Mail` is readable — in plain
+language. That answer is also what makes a bug report useful.
+
+### Other MCP clients
+
 ```bash
 pipx install apple-mail-mcp
 ```
-
-Add to your MCP client:
 
 ```json
 {
@@ -35,56 +97,32 @@ Add to your MCP client:
 }
 ```
 
-**Claude Desktop / Cowork:** a double-click `.mcpb` bundle is available —
-see [`mcpb/README.md`](mcpb/README.md). Build it with
-`./scripts/build-mcpb.sh`.
+Here the client you configure is the application that launches the
+server, so **it** is the one that needs Full Disk Access. Building the
+index yourself from a terminal works the same way as above.
 
-### Three things worth knowing before you start
+Building the bundle from source: `./scripts/build-mcpb.sh`, details in
+[`mcpb/README.md`](mcpb/README.md).
 
-1. **The first start builds a search index in the background.** It takes
-   minutes on a large mailbox and shows nothing while it runs. That is
-   normal, not a hang — the server answers the whole time.
-2. **It needs Full Disk Access, granted to the app that launches it** —
-   Claude Desktop, not this package, and not your terminal. That single
-   point is the most common reason nothing gets indexed.
-3. **When anything looks wrong, ask your assistant for the index
-   status** rather than digging yourself. It reports the running build,
-   what the index is doing, whether `~/Library/Mail` is readable, and
-   what to do next — in plain language, and that report is what makes a
-   bug report useful:
+### Who needs Full Disk Access — quick reference
 
-   > Ask the Apple Mail integration for its index status and show me the
-   > result.
-
-### Permissions: who needs Full Disk Access?
-
-Building the index reads `~/Library/Mail`, which macOS protects. TCC
-grants that access to the **process that launches the server**, not to
-this package — the single most common setup mistake:
-
-| Index built by | Grant Full Disk Access to |
+| Index built by | Permission goes to |
 |---|---|
-| The server, automatically | **the app that starts it** (e.g. Claude Desktop) |
+| The server, automatically | **the app that starts it** — Claude Desktop with the bundle, otherwise your MCP client |
 | You, via `apple-mail-mcp index` | **the terminal app** you run it in |
 
-Granting it to your terminal does *not* help when an MCP client spawns
-the server — the client is the responsible app then.
+The rule behind both rows: macOS grants the permission to the process
+that launches the server, never to the package itself.
 
-If you'd rather not grant your MCP client full disk access, use the
-manual route: set `APPLE_MAIL_INDEX_AUTO_BUILD=false`, build the index
-from a terminal that has access, and the server will read it from
-`~/.apple-mail-mcp/index.db` (not a protected path). Search and the
-write tools keep working; only live disk reads fall back to a slower
-path.
+### Building the index by hand
 
-Call the `get_index_status()` tool at any time — it reports which setup
-is active and what to do next.
-
-### Build the Search Index (Recommended)
+Only needed if the launching app has no Full Disk Access, or if you
+prefer to keep it that way. With the bundle and the permission granted,
+the server does this itself on first start.
 
 ```bash
-# Requires Full Disk Access for Terminal
-# System Settings → Privacy & Security → Full Disk Access → Add Terminal
+# The TERMINAL needs Full Disk Access for this route:
+# System Settings → Privacy & Security → Full Disk Access → add Terminal
 
 apple-mail-mcp index --verbose
 ```
@@ -107,17 +145,56 @@ for the full schema and precedence rules.
 |------|---------|
 | `list_accounts()` | List email accounts |
 | `list_mailboxes(account?)` | List mailboxes |
-| `get_emails(filter?, limit?)` | Get emails — all, unread, flagged, today, last_7_days |
-| `get_email(message_id)` | Get single email with full content, attachments, and its current account/mailbox |
+| `get_emails(filter?, account?, limit?)` | Get emails — all, unread, flagged, today, last_7_days. `account="all"` lists across **every** visible account in one call |
+| `get_email(ref)` | Get an email with full content, attachments, flag colour, and its current account/mailbox. Takes a **list** (max 50) to fetch a whole page in one round-trip |
 | — | *Every tool above takes either the numeric id or the RFC822 `Message-ID` header. Prefer the header: the numeric id is a per-mailbox ROWID and stops resolving as soon as another device files the mail elsewhere.* |
 | `search(query, scope?, before?, after?, highlight?)` | Search — all, subject, sender, body, attachments |
 | `get_email_links(message_id)` | Extract links from an email |
 | `get_email_attachment(message_id, filename)` | Extract attachment content |
 | `get_attachment(message_id, filename)` | *Deprecated* — use `get_email_attachment()` |
-| `set_flag(message_ids, color?)` | **Write** — flag/unflag one email or a batch, optionally by color (red, orange, yellow, green, blue, purple, gray) |
-| `set_read_status(message_ids, read?)` | **Write** — mark one email or a batch read (seen) or unread (unseen) |
+| `set_flag(refs, color?)` | **Write** — flag/unflag one email or a batch (max 500), optionally by color (red, orange, yellow, green, blue, purple, gray) |
+| `set_read_status(refs, read?)` | **Write** — mark one email or a batch read (seen) or unread (unseen) |
 | `get_index_status()` | Index health and setup diagnostics — build state, progress, and whether Full Disk Access is missing |
 | `refresh_index(full?)` | Update the index on demand — the index otherwise syncs only at server start |
+
+### Fewer round-trips
+
+Two things make surveys and triage cheap, because the cost of reading
+mail here is the round-trip, not the read — a single message comes off
+disk in 1-5 ms:
+
+- **`get_emails(account="all")`** answers across every account at once.
+  Without it you need one call per account, and you have to know their
+  names first.
+- **`get_email([ref, ref, ...])`** fetches up to 50 messages in one
+  call. The result is one entry per reference, in order, each either
+  `{"ref", "email"}` or `{"ref", "error"}` — one unreadable message
+  never sinks the batch. The cap is about how much text fits in a
+  model's context, not about speed.
+- **Listings already carry `flag_color`** for flagged messages,
+  resolved for the whole page in one call. Reading a colour scheme back
+  needs no per-message follow-up.
+
+A survey that used to take 58 tool calls now takes one.
+
+### Flag colours carry no meaning
+
+`set_flag` writes Apple Mail's seven colours and nothing more. This
+server attaches **no** semantics to any of them — red as urgent, red as
+read-later, red as one particular client are all equally valid, and
+which one applies is the user's own convention. It belongs wherever
+they keep their instructions, not in this tool. A model that does not
+know what a colour means here is told to ask rather than invent a
+scheme.
+
+### An incomplete search is never reported as absence
+
+A message is reported missing only when the search actually covered
+everywhere it could be. A mailbox cap, a mailbox Mail refused to read,
+a skipped trash folder, a timeout, a denied Automation permission — all
+of these leave the question open, and the result says so instead of
+implying the mail is gone. Write results carry a `diagnostics` block
+naming what was searched and what was not.
 
 ### Write operations
 
