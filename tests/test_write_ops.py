@@ -3910,3 +3910,109 @@ class TestAFailedWriteExplainsItself:
             result = await set_read_status(7)
 
         assert "diagnostics" not in result
+
+
+class TestReadPathFindsUnindexedMessages:
+    """The read path demanded an index row; the write path stopped
+    needing one long ago.
+
+    Live: get_emails handed out five message_ids and get_email then
+    failed on every one with "not found in the index" — the messages
+    had arrived after the last sync. The tool that produced the handle
+    and the tool that consumes it disagreed about what a handle means.
+    """
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_a_live_lookup(self):
+        header = "<fresh@x.com>"
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.find_by_rfc822.return_value = []  # not indexed yet
+        amap = _mock_acct_map()
+        amap.get_cached_accounts.return_value = [{"name": "byte5"}]
+
+        async def jxa(script, **kw):
+            assert "normHeaderValue" in script
+            return {"account": "byte5", "mailbox": "Posteingang", "id": 77}
+
+        async def by_id(rowid, account=None, mailbox=None):
+            return {"id": rowid, "message_id": header, "subject": "fresh"}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=jxa,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch("apple_mail_mcp.server._get_email_by_id", side_effect=by_id),
+        ):
+            from apple_mail_mcp.server import get_email
+
+            result = await get_email(header)
+
+        assert result["id"] == 77
+        assert result["subject"] == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_a_truly_missing_message_says_so_plainly(self):
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.find_by_rfc822.return_value = []
+        amap = _mock_acct_map()
+        amap.get_cached_accounts.return_value = [{"name": "byte5"}]
+
+        async def nothing(script, **kw):
+            return None
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=nothing,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import get_email
+
+            with pytest.raises(ValueError, match="not in any visible account"):
+                await get_email("<gone@x.com>")
+
+
+class TestFlagColourOnTheDiskPath:
+    """The colour is not in the .emlx footer, and guessing at bit
+    positions would invent flags. Ask Apple for that one property."""
+
+    @pytest.mark.asyncio
+    async def test_unflagged_message_costs_no_extra_call(self):
+        from apple_mail_mcp.server import _overlay_flag_color
+
+        calls = []
+
+        async def spy(script, **kw):
+            calls.append(script)
+            return {"flag_color": "red"}
+
+        with patch(
+            "apple_mail_mcp.server.execute_with_core_async", side_effect=spy
+        ):
+            result = {"flagged": False}
+            await _overlay_flag_color(result, 1, "byte5", "Posteingang")
+
+        assert calls == []
+        assert "flag_color" not in result
+
+    @pytest.mark.asyncio
+    async def test_flagged_message_gets_its_colour(self):
+        from apple_mail_mcp.server import _overlay_flag_color
+
+        async def jxa(script, **kw):
+            return {"flag_color": "blue"}
+
+        with patch(
+            "apple_mail_mcp.server.execute_with_core_async", side_effect=jxa
+        ):
+            result = {"flagged": True}
+            await _overlay_flag_color(result, 1, "byte5", "Posteingang")
+
+        assert result["flag_color"] == "blue"

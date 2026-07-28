@@ -432,7 +432,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-28.4"
+SERVER_REVISION = "2026-07-28.5"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -827,6 +827,40 @@ async def _visible_account_names() -> list[str]:
         if a.get("name") and a.get("name") not in excluded
     ]
     return names
+
+
+async def _overlay_flag_color(
+    result: dict, message_id: int, account: str | None, mailbox: str | None
+) -> None:
+    """Fetch the flag colour for a message the disk path served.
+
+    The `.emlx` footer bitmask gives read and flagged; the COLOUR is not
+    documented there, and guessing at bit positions would invent flags.
+    Apple reports it directly as `flagIndex`, so ask for that one
+    property for this one message — but only when the message is
+    actually flagged, so an unflagged listing costs nothing.
+    """
+    if not result.get("flagged") or result.get("flag_color"):
+        return
+    if not account or not mailbox:
+        return
+    script = f"""
+const account = MailCore.getAccount({json.dumps(account)});
+const mailbox = MailCore.getMailbox(account, {json.dumps(mailbox)});
+const ids = mailbox.messages.id();
+const idx = ids.indexOf({int(message_id)});
+JSON.stringify({{
+    flag_color: idx === -1
+        ? null
+        : MailCore.flagColorName(mailbox.messages[idx].flagIndex()),
+}});
+"""
+    try:
+        got = await execute_with_core_async(script, timeout=STRATEGY3_TIMEOUT)
+        if got and got.get("flag_color"):
+            result["flag_color"] = got["flag_color"]
+    except Exception as exc:
+        logger.debug("flag colour unavailable for %s: %s", message_id, exc)
 
 
 async def _resolve_write_targets(
@@ -1768,6 +1802,58 @@ async def get_email(
     return await _get_email_by_id(message_id, account, mailbox)
 
 
+async def _locate_header_via_jxa(header: str) -> tuple[str, str, int] | None:
+    """Find a message by its RFC822 header without using the index.
+
+    The write path has searched live for a while; the read path still
+    demanded an index row and gave up with "not in the index" for
+    exactly the messages that matter most — the ones that arrived after
+    the last sync. Returns ``(account, mailbox, id)`` or None.
+    """
+    accounts = await _visible_account_names()
+    if not accounts:
+        one = await _resolve_visible_account(None)
+        accounts = [one] if one else []
+    if not accounts:
+        return None
+    script = f"""
+const targets = {json.dumps(accounts)};
+const needle = MailCore.normHeaderValue({json.dumps(header)});
+let hit = null;
+for (const name of targets) {{
+    let account;
+    try {{ account = MailCore.getAccount(name); }} catch (e) {{ continue; }}
+    let boxes;
+    try {{ boxes = account.mailboxes(); }} catch (e) {{ continue; }}
+    const limit = Math.min(boxes.length, {STRATEGY3_MAX_MAILBOXES});
+    for (let m = 0; m < limit && !hit; m++) {{
+        let ids;
+        try {{ ids = boxes[m].messages.messageId(); }} catch (e) {{ continue; }}
+        for (let i = 0; i < ids.length; i++) {{
+            if (MailCore.normHeaderValue(ids[i]) === needle) {{
+                hit = {{
+                    account: name,
+                    mailbox: String(boxes[m].name()),
+                    id: boxes[m].messages[i].id(),
+                }};
+                break;
+            }}
+        }}
+    }}
+    if (hit) break;
+}}
+JSON.stringify(hit);
+"""
+    try:
+        found = await execute_with_core_async(script, timeout=RECOVERY_TIMEOUT)
+    except Exception as exc:
+        logger.debug("live header lookup failed: %s", exc)
+        return None
+    if not found:
+        return None
+    return found["account"], found["mailbox"], int(found["id"])
+
+
 async def _get_email_by_header(
     header: str,
     account: str | None,
@@ -1793,10 +1879,20 @@ async def _get_email_by_header(
 
     candidates = await asyncio.to_thread(manager.find_by_rfc822, header)
     if not candidates:
-        raise ValueError(
-            f"Email {header!r} not found in the index. It may be newer "
-            f"than the last sync (call refresh_index()) or deleted."
-        )
+        # Not indexed yet — the normal state for anything that arrived
+        # after the last sync. Ask Apple Mail directly rather than
+        # declaring a message missing that is sitting in a mailbox.
+        live = await _locate_header_via_jxa(header)
+        if live is None:
+            raise ValueError(
+                f"Email {header!r} was not found in the index and not in "
+                f"any visible account. It was most likely deleted."
+            )
+        acct_name, mbox, rowid = live
+        result = await _get_email_by_id(rowid, acct_name, mbox)
+        if _header_key(result.get("message_id")) == _header_key(header):
+            return result
+        raise ValueError(f"Email {header!r} could not be retrieved.")
 
     acct_map = _get_account_map()
     excluded = _excluded_account_names()
@@ -1950,6 +2046,9 @@ async def _get_email_by_id(
                             ],
                         }
                         await _overlay_live_flags(result, message_id)
+                        await _overlay_flag_color(
+                            result, message_id, loc_account, loc_mailbox
+                        )
                         return _enrich_attachments(
                             _with_location(result, loc_account, loc_mailbox)
                         )
