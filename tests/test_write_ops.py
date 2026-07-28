@@ -3313,33 +3313,51 @@ class TestAngleBracketsDoNotBreakIdentity:
         # Raw comparisons must be gone.
         assert "headers.indexOf(target)" not in js
 
-    def test_index_lookup_matches_either_form(self, tmp_path):
+    def test_index_lookup_matches_either_form(self):
+        """Brackets, and any stray whitespace a folded header brings.
+
+        A strict comparison here fails silently and the caller then
+        searches the wrong account — the failure mode that cost a full
+        debugging session.
+        """
+        import os
         import sqlite3
+        import tempfile
 
         from apple_mail_mcp.index.manager import IndexManager
 
-        calls = {}
-
-        class FakeConn:
-            def execute(self, sql, params):
-                calls["sql"] = sql
-                calls["params"] = params
-                return FakeCur()
-
-        class FakeCur:
-            def fetchall(self):
-                return []
+        path = tempfile.mktemp(suffix=".db")
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE emails (account TEXT, mailbox TEXT, "
+            "message_id INT, rfc822_message_id TEXT, indexed_at TEXT)"
+        )
+        stored_forms = [
+            "<a@x.com>",  # as the .emlx header carries it
+            "b@x.com",  # as Apple Mail reports it
+            " <c@x.com>\n",  # folded / padded
+            "\t<d@x.com>\r\n",
+        ]
+        for i, stored in enumerate(stored_forms):
+            conn.execute(
+                "INSERT INTO emails VALUES ('U','Posteingang',?,?,'2026')",
+                (i, stored),
+            )
+        conn.commit()
 
         mgr = IndexManager.__new__(IndexManager)
-        mgr._get_conn = lambda: FakeConn()  # type: ignore[assignment]
-
-        mgr.find_by_rfc822("a@b.com")
-        assert calls["params"] == ("<a@b.com>", "a@b.com")
-
-        mgr.find_by_rfc822("<a@b.com>")
-        assert calls["params"] == ("<a@b.com>", "a@b.com")
-        assert "IN (?, ?)" in calls["sql"]
-        del sqlite3
+        mgr._get_conn = lambda: conn  # type: ignore[assignment]
+        try:
+            for i, stored in enumerate(stored_forms):
+                bare = stored.strip().strip("<>").strip()
+                for probe in (bare, f"<{bare}>"):
+                    found = mgr.find_by_rfc822(probe)
+                    assert found, f"{probe!r} missed stored {stored!r}"
+                    assert found[0][2] == i
+        finally:
+            conn.close()
+            os.unlink(path)
 
 
 class TestWellKnownMailboxesResolveByRole:
@@ -3696,3 +3714,64 @@ class TestUnindexedHeaderSearchesEveryAccount:
         assert "settled.add(String(target));" in js
         # A miss in one account must not survive a hit in another.
         assert "notFound.filter((t) => !settled.has(String(t)))" in js
+
+
+class TestIndexOrdersTheSearchButNeverLimitsIt:
+    """A stale index row must not end the search in silence.
+
+    Measured: the index placed a message in account byte5 / Posteingang
+    and Apple Mail agreed it was there — yet set_flag reported
+    not_found. Whatever the index says, it is at best where the message
+    WAS. It now decides the ORDER of the search; the other visible
+    accounts follow, and cost nothing once the header has been settled.
+    """
+
+    @pytest.mark.asyncio
+    async def test_indexed_account_comes_first_others_follow(self):
+        mgr = _mock_index(location=None)
+        mgr.find_by_rfc822.return_value = [("uuid-byte5", "Posteingang", 1)]
+        amap = _mock_acct_map(uuid_to_name="byte5")
+        amap.get_cached_accounts.return_value = [
+            {"name": "iCloud"},
+            {"name": "byte5"},
+            {"name": "freenea"},
+        ]
+        captured = {}
+
+        async def fake_exec(script, **kw):
+            captured["script"] = script
+            return {"updated": ["<a@x.com>"], "not_found": []}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            await set_flag("<a@x.com>", color="green")
+
+        script = captured["script"]
+        order = [
+            script.index(f'"account": "{n}"')
+            for n in ("byte5", "iCloud", "freenea")
+        ]
+        assert order[0] < order[1] < order[2]  # index hint leads
+        assert '"prefer_mailboxes": ["Posteingang"]' in script
+
+    def test_a_settled_header_skips_the_remaining_accounts(self):
+        """Broader search must stay free when the first account hits."""
+        from apple_mail_mcp.builders import WriteBuilder
+
+        js = WriteBuilder(
+            groups=[
+                {"account": "A", "headers": ["<x@y>"], "by_header": True},
+                {"account": "B", "headers": ["<x@y>"], "by_header": True},
+            ],
+            apply_js="msg.flaggedStatus = true;",
+            needs_change_js="msg.flaggedStatus() === true",
+        ).build()
+        assert "if (remaining.size === 0) continue;" in js

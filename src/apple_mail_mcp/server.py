@@ -428,7 +428,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-28.1"
+SERVER_REVISION = "2026-07-28.2"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -902,7 +902,17 @@ async def _resolve_write_targets(
             # pin it. Mailboxes of that account seed the scan order.
             target_acct = acct_map.uuid_to_name(visible[0][0])
             prefer = {mb for acct, mb, _ in visible if acct == visible[0][0]}
-            targets = [target_acct]
+            # The index says where it WAS. Treat that as the first
+            # place to look, not as the only one: a row can be stale,
+            # and a miss there used to end the search in silence while
+            # the message sat in another account. Later accounts cost
+            # nothing once the header has been settled.
+            others = [
+                a
+                for a in await _visible_account_names()
+                if a and a != target_acct
+            ]
+            targets = [target_acct, *others]
         elif account:
             # Caller pinned the account: honour it, scan nothing else.
             targets = [await _resolve_visible_account(account)]
@@ -966,9 +976,10 @@ async def _resolve_write_targets(
             "prefer_mailboxes": sorted(entry["prefer"]),
             "by_header": True,
         }
-        for acct, entry in sorted(
-            header_groups.items(), key=lambda kv: kv[0] or ""
-        )
+        # Insertion order, NOT alphabetical: the account the index
+        # points at was inserted first and has to be searched first.
+        # Sorting by name threw that priority away.
+        for acct, entry in header_groups.items()
     ]
 
     # Index-free / index-miss fallback: scan one visible account's

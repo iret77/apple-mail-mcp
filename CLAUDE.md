@@ -102,6 +102,12 @@ as well. The RFC822 `Message-ID` header survives that. Therefore:
     (`WriteBuilder.applyByHeader`), so a stale row can misdirect the
     scan but can never write the wrong message. Header groups run in
     their own `osascript` call and are echoed back as headers.
+  - **The index orders the search; it never limits it.** A header is
+    looked for in the account the index points at FIRST, then in every
+    other visible account. A row says where the message *was*: it can
+    be stale, and a miss there used to end the search in silence while
+    the message sat one account over. Group order is insertion order —
+    sorting the groups by name once threw that priority away.
   - **A header the index cannot place searches EVERY visible account**,
     not just the default one. That case is not exotic: it is every
     message that arrived after the last sync. Measured — in one mailbox
