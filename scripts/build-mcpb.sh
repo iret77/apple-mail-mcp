@@ -50,3 +50,7 @@ fi
 "${MCPB[@]}" pack "$REPO/mcpb" "$OUT"
 
 echo "[build] bundle ready at $OUT (version $VERSION)"
+echo "[build] when publishing, upload BOTH names so the permanent link works:"
+echo "[build]   gho iret77 release upload <tag> \"$OUT\" -R iret77/apple-mail-mcp"
+echo "[build]   cp \"$OUT\" /tmp/apple-mail-mcp.mcpb && gho iret77 release upload <tag> /tmp/apple-mail-mcp.mcpb -R iret77/apple-mail-mcp --clobber"
+echo "[build]   gho iret77 release edit <tag> -R iret77/apple-mail-mcp --latest"
