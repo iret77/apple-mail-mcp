@@ -1378,6 +1378,18 @@ async def _apply_write(
             f"mail rule) and were re-found by their Message-ID header. "
             f"Their ids have changed; call refresh_index() to update them."
         )
+    elif not_found and unsearched:
+        # Covers the numeric ids too: recovery may have timed out or
+        # skipped mailboxes, and that gap was recorded but never read
+        # here — so a moved message came back as "probably deleted".
+        result["hint"] = (
+            f"{len(not_found)} reference(s) were not found, but "
+            f"{unsearched} place(s) were never searched (scan limit, an "
+            f"unreadable mailbox, a skipped trash/junk mailbox, or a "
+            f"recovery that did not finish). This is NOT evidence that "
+            f"the messages are gone — pass `account` and `mailbox`, or "
+            f"call refresh_index() and retry."
+        )
     elif not_found and not _get_index_manager().has_index():
         result["hint"] = (
             "Some ids weren't found by scanning the default account. Pass "

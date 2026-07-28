@@ -4479,3 +4479,53 @@ class TestRecoveryAndStrategy3KeepTheirGaps:
 
         assert result["not_found"] == [5]
         assert result["diagnostics"]["mailboxes_not_searched"] >= 1
+
+
+class TestTheLastTwoGapPaths:
+    """Fourth review round. Both were half-fixes of my own.
+
+    The recovery gap was counted but never read in the numeric branch,
+    and an account whose mailbox list cannot be enumerated at all threw
+    before the per-mailbox catch, so no INCOMPLETE marker was emitted.
+    """
+
+    @pytest.mark.asyncio
+    async def test_numeric_ids_also_see_the_coverage_gap(self):
+        def locate(mid, account=None, mailbox=None):
+            return ("uuid-work", "INBOX")
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.find_email_location.side_effect = locate
+        mgr.get_rfc822_id.return_value = "<moved@x>"
+        amap = _mock_acct_map()
+
+        async def router(script, **kw):
+            if '"by_header": true' in script:
+                raise TimeoutError("recovery wedged")
+            return {"updated": [], "unchanged": [], "not_found": [5]}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=router,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_read_status
+
+            result = await set_read_status(5)
+
+        assert result["not_found"] == [5]
+        assert "never searched" in result["hint"]
+        assert "probably deleted" not in result["hint"]
+
+    def test_an_unreadable_account_is_marked_incomplete(self):
+        from apple_mail_mcp.builders import GetEmailBuilder
+
+        js = GetEmailBuilder(message_id=42, account="byte5").build()
+        assert "allMailboxes = account.mailboxes();" in js
+        assert "the account could not be read at all" in js
+        # The throw must sit BEFORE any per-mailbox loop.
+        assert js.index("could not be read at all") < js.index("mbLimit =")

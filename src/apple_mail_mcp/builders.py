@@ -674,7 +674,18 @@ const targetId = {self.message_id};
 let msg = null;
 {acct_setup}
 
-const allMailboxes = account.mailboxes();
+let allMailboxes;
+try {{
+    allMailboxes = account.mailboxes();
+}} catch (e) {{
+    // The account itself could not be enumerated, so NOTHING was
+    // searched. Falling through to "message not found" would state an
+    // absence that was never established.
+    throw new Error(
+        'Message not found with ID: ' + targetId +
+        ' (INCOMPLETE: the account could not be read at all)'
+    );
+}}
 const mbLimit = Math.min(allMailboxes.length, {self.max_mailboxes});
 // A scan that stops early is not evidence of absence. Count what was
 // left out and say so, instead of letting "not found" stand for both.
