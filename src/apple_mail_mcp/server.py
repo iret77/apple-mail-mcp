@@ -268,6 +268,10 @@ class WriteResult(TypedDict, total=False):
     unchanged: list[int | str]  # already in the wanted state — no write
     not_found: list[int | str]  # Mail was reachable; the message was not
     failed: list[int | str]  # Mail refused/was unreachable — NOT a verdict
+    # Only when something did not land: what the write actually did.
+    # Without it a not_found is unfalsifiable from the outside — three
+    # separate causes produced the identical empty answer today.
+    diagnostics: dict
     error: str  # what Apple Mail actually said, when `failed` is non-empty
     skipped_hidden: list[int | str]  # resolved into an excluded account
     hint: str  # present only when something is actionable (e.g. no index)
@@ -428,7 +432,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-28.3"
+SERVER_REVISION = "2026-07-28.4"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -1166,6 +1170,26 @@ async def _apply_write(
         "not_found": not_found,
         "skipped_hidden": skipped_hidden,
     }
+    if not_found or failed:
+        # Say what was actually attempted. A bare not_found cannot be
+        # checked by the caller: it looks the same whether the index
+        # placed the message, which accounts were searched, or whether
+        # the reference arrived in the shape the caller intended.
+        header_groups = [g for g in by_header]
+        result["diagnostics"] = {
+            "accounts_searched": [g.get("account") for g in header_groups],
+            "mailboxes_preferred": sorted(
+                {
+                    mb
+                    for g in header_groups
+                    for mb in (g.get("prefer_mailboxes") or [])
+                }
+            ),
+            "located_by_index": [
+                f"{acct}/{mbox}" for acct, mbox in placed.values()
+            ],
+            "references_as_received": [str(i) for i in ids],
+        }
     if failed:
         # Say plainly that Apple Mail never carried the write out, and
         # what it said — the caller must not read this as "deleted".
