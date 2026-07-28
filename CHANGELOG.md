@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-07-28
+
+### Added
+- `get_emails(before=, after=, offset=)` — a mailbox can be walked
+  backwards. Until now only the newest N per mailbox were reachable, so
+  a stored cursor deep in the backlog could not be approached at all,
+  and `search()` needs keywords and is useless for a gapless reverse
+  scan. Pass the oldest `date_received` you have seen as `before` to get
+  the next page; that is stable while new mail arrives, unlike `offset`.
+- The JXA fallback refuses these parameters instead of dropping them —
+  ignoring a window would page the same newest N forever and let the
+  caller conclude the backlog is empty.
+
 ## [0.18.0] - 2026-07-28
 
 Fork release (iret77). Adds write tools, stable message identity and

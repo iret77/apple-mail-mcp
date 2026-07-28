@@ -432,7 +432,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-28.18"
+SERVER_REVISION = "2026-07-28.19"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -924,6 +924,29 @@ JSON.stringify(out);
         color = colors.get(str(row.get("id")))
         if color:
             row["flag_color"] = color
+
+
+def _parse_date_bound(value: str | None, name: str) -> float | None:
+    """ISO date/datetime -> Unix timestamp for the Envelope Index.
+
+    Naive input is read as local time, because that is what a caller
+    typing a date means; the column stores Unix epoch.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(
+            f"`{name}` must be an ISO date or datetime "
+            f"(2026-07-28 or 2026-07-28T09:30), got {value!r}."
+        ) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.timestamp()
 
 
 async def _resolve_write_targets(
@@ -1615,6 +1638,9 @@ async def get_emails(
         "all", "unread", "flagged", "today", "last_7_days", "this_week"
     ] = "all",
     limit: int = 50,
+    before: str | None = None,
+    after: str | None = None,
+    offset: int = 0,
 ) -> list[EmailSummary]:
     """
     Get emails from a specific mailbox with optional filtering.
@@ -1635,6 +1661,14 @@ async def get_emails(
             - "last_7_days": Emails received in the last 7 days
             - "this_week": Alias for last_7_days
         limit: Maximum number of emails to return (default: 50)
+        before: ISO date/datetime — only messages received strictly
+            before it. This is how you walk a mailbox backwards: pass
+            the oldest `date_received` you have seen to get the next
+            page. Stable while new mail arrives, unlike `offset`.
+        after: ISO date/datetime — only messages received after it.
+        offset: Skip this many of the newest matches. Simpler than
+            `before`, but a message arriving mid-walk shifts every
+            later page by one.
 
     Returns:
         List of email dictionaries sorted by date (newest first).
@@ -1644,7 +1678,9 @@ async def get_emails(
         >>> get_emails(filter="unread", limit=10)  # Unread emails
         >>> get_emails("Work", "INBOX", filter="today")  # Today's work emails
     """
-    limit, _ = _validate_pagination(limit)
+    limit, offset = _validate_pagination(limit, offset)
+    before_ts = _parse_date_bound(before, "before")
+    after_ts = _parse_date_bound(after, "after")
     all_accounts = isinstance(account, str) and account.strip().lower() in (
         "all",
         "*",
@@ -1740,6 +1776,9 @@ async def get_emails(
                     mailbox_name=target_mailbox,
                     filter_kind=filter,
                     limit=limit,
+                    before=before_ts,
+                    after=after_ts,
+                    offset=offset,
                 )
                 visible = [
                     r
@@ -1801,6 +1840,17 @@ async def get_emails(
         logger.debug(
             "Envelope Index fast path unavailable (%s); falling back to JXA",
             exc,
+        )
+
+    if before_ts is not None or after_ts is not None or offset:
+        # The JXA fallback has no date window and no offset. Silently
+        # dropping them would answer a different question than the one
+        # asked — the caller would page through the same newest N
+        # forever and conclude the backlog is empty.
+        raise ValueError(
+            "`before`, `after` and `offset` need Apple's Envelope Index, "
+            "which is not readable right now. Call get_index_status() "
+            "for the reason."
         )
 
     if all_accounts:

@@ -4817,7 +4817,9 @@ class TestBatchReadsAndCrossAccountListing:
         """ "all" must not be narrowed by the INBOX default either."""
         captured = {}
 
-        def fetch(env_path, *, account_uuid, mailbox_name, filter_kind, limit):
+        def fetch(
+            env_path, *, account_uuid, mailbox_name, filter_kind, limit, **kw
+        ):
             captured["account_uuid"] = account_uuid
             captured["mailbox_name"] = mailbox_name
             return []
@@ -4915,3 +4917,86 @@ class TestExcludedAccountsSurviveTheAllShortcut:
             out = await get_emails(account="all")
 
         assert [e["subject"] for e in out] == ["visible"]
+
+
+class TestBacklogCanBeWalkedBackwards:
+    """Reported by a scheduled triage run: the backlog was unreachable.
+
+    `get_emails` only ever returned the newest N per mailbox, so a
+    stored cursor deep in the mailbox could not be approached, and
+    `search()` requires keywords and is therefore useless for a gapless
+    reverse scan. That was a genuine tool limit, not an omission by the
+    agent.
+    """
+
+    def _capture(self, **kwargs):
+        seen = {}
+
+        def fetch(env_path, **kw):
+            seen.update(kw)
+            return []
+
+        return seen, fetch
+
+    @pytest.mark.asyncio
+    async def test_before_and_offset_reach_the_sql_layer(self):
+        seen, fetch = self._capture()
+        mgr = MagicMock()
+        amap = _mock_acct_map()
+        amap.get_cached_accounts.return_value = [
+            {"name": "byte5", "id": "uuid-byte5"}
+        ]
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                side_effect=fetch,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            await get_emails(
+                account="all", before="2026-01-15T10:00:00", offset=20
+            )
+
+        assert seen["before"] is not None
+        assert seen["offset"] == 20
+        assert seen["after"] is None
+
+    def test_a_bad_date_says_what_is_expected(self):
+        from apple_mail_mcp.server import _parse_date_bound
+
+        assert _parse_date_bound(None, "before") is None
+        assert _parse_date_bound("2026-07-28", "before") > 0
+        with pytest.raises(ValueError, match="ISO date"):
+            _parse_date_bound("last tuesday", "before")
+
+    @pytest.mark.asyncio
+    async def test_the_jxa_fallback_refuses_rather_than_ignoring(self):
+        """Dropping the window would page the same newest N forever."""
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="byte5"),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=FileNotFoundError("no mail dir"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            with pytest.raises(ValueError, match="Envelope Index"):
+                await get_emails(before="2026-01-15")
