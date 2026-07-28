@@ -46,6 +46,15 @@ const MailCore = {
      * localized Mail user guide or is a documented provider/legacy
      * name; nothing here is a translation someone made up.
      */
+    /** Message-ID without its angle brackets — see normHeader in the
+     *  write builder. Both sides must agree or nothing ever matches. */
+    normHeaderValue(v) {
+        let s = String(v == null ? "" : v).trim();
+        if (s.charAt(0) === "<") s = s.slice(1);
+        if (s.charAt(s.length - 1) === ">") s = s.slice(0, -1);
+        return s;
+    },
+
     /** Apple's `flag index` → colour name; null when unflagged. */
     FLAG_COLORS: [
         "red", "orange", "yellow", "green", "blue", "purple", "gray",
