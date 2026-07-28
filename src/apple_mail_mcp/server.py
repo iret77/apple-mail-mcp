@@ -1398,11 +1398,18 @@ async def _apply_write(
             "exact, and it will explain how."
         )
     elif not_found:
+        # No claim of deletion here: a numeric id is a per-mailbox
+        # ROWID, so this search covered one account and the mailboxes
+        # the index pointed at — never "everywhere". Say what that
+        # means and name the handle that does span accounts.
         result["hint"] = (
-            "Some ids could not be located, and no stable Message-ID is "
-            "on record for them. They were probably deleted, or the index "
-            "predates stable ids — call refresh_index(full=True) to "
-            "re-record them."
+            "Some ids could not be located. A numeric id is only unique "
+            "within a mailbox, so this searched one account and the "
+            "places the index knows — not every account. No stable "
+            "Message-ID was on record to widen the search with: call "
+            "refresh_index(full=True) to record them, pass `account` "
+            "and `mailbox`, or address the messages by their "
+            "`message_id`, which is searched across all accounts."
         )
     return result
 

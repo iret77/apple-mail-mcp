@@ -4626,3 +4626,62 @@ class TestNumericIdCannotSpeakForOtherAccounts:
                 await get_email(42)
 
         assert "not searched" not in str(err.value)
+
+
+class TestNoWriteHintClaimsDeletion:
+    """Seventh round. The last hint that still asserted deletion.
+
+    A numeric write miss searches one account and the places the index
+    knows. Calling that "probably deleted" states an absence for every
+    account nobody looked in — and a numeric id cannot be searched
+    across accounts at all, which is precisely why the hint has to point
+    at the Message-ID instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_numeric_miss_does_not_say_deleted(self):
+        mgr = _mock_index(location=("uuid-work", "INBOX"))
+        mgr.get_rfc822_id.return_value = None  # nothing to recover with
+        amap = _mock_acct_map()
+
+        async def miss(script, **kw):
+            return {"updated": [], "unchanged": [], "not_found": [7]}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=miss,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            result = await set_flag(7, color="red")
+
+        hint = result["hint"]
+        assert "probably deleted" not in hint
+        assert "not every account" in hint
+        assert "message_id" in hint
+
+    def test_no_write_hint_anywhere_asserts_deletion_unconditionally(self):
+        """A guard for the whole family of hints.
+
+        Comment lines are stripped first: they document the defects
+        that were removed and legitimately contain the old wording.
+        Only what the tool actually emits is checked.
+        """
+        import inspect
+
+        from apple_mail_mcp import server
+
+        code = "\n".join(
+            line
+            for line in inspect.getsource(server._apply_write).splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "probably deleted" not in code
+        # Deletion may be named in exactly one place — and only where a
+        # complete search has established it.
+        assert code.count("deleted") == 1
+        assert "every mailbox was searched" in code
