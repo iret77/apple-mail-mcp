@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Two failures kept repeating in this repo, both from trusting a
+# convenience command instead of checking what it did:
+#
+#   1. Bundle files landing on the source branch, because a broad
+#      `git checkout main -- .` pulled them across. That branch is what
+#      upstream diffs are cut from and must carry source only.
+#   2. Merge conflict markers committed, which made a whole test module
+#      unimportable — 775 tests silently not running.
+#
+# Care did not catch either. This does.
+set -u
+
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+staged="$(git diff --cached --name-only --diff-filter=ACM)"
+[ -z "$staged" ] && exit 0
+
+fail=0
+
+# 1. Fork-only paths must not reach the source branch.
+SOURCE_BRANCH="feat/write-ops-flag-read"
+if [ "$branch" = "$SOURCE_BRANCH" ]; then
+  offenders="$(printf '%s\n' "$staged" | grep -E '^(mcpb/|dist/|UPSTREAM_PR_PLAN\.md)' || true)"
+  if [ -n "$offenders" ]; then
+    echo "pre-commit: REFUSED — fork-only files on $SOURCE_BRANCH:" >&2
+    printf '  %s\n' $offenders >&2
+    echo "  This branch is what upstream diffs are cut from." >&2
+    echo "  Unstage them, or commit on chore/mcpb-desktop-bundle." >&2
+    fail=1
+  fi
+fi
+
+# 2. No conflict markers, on any branch.
+for f in $staged; do
+  [ -f "$f" ] || continue
+  case "$f" in .githooks/*) continue;; esac
+  if grep -qE '^(<<<<<<< |>>>>>>> )' "$f" 2>/dev/null; then
+    echo "pre-commit: REFUSED — merge conflict markers in $f" >&2
+    fail=1
+  fi
+done
+
+[ "$fail" -eq 0 ] || {
+  echo "  Override with --no-verify only if you know exactly why." >&2
+  exit 1
+}
+exit 0
