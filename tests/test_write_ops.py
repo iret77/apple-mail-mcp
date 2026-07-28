@@ -4329,3 +4329,69 @@ class TestWriteScanReportsWhatItSkipped:
             result = await set_flag("<x@y>", color="red")
 
         assert "every mailbox was searched" in result["hint"]
+
+
+class TestEveryScanPathCountsWhatItSkipped:
+    """Second review round: two scan paths still claimed full coverage.
+
+    The numeric-id scan never counted its own cap or unreadable
+    mailboxes, and a trash/junk mailbox that is deliberately skipped was
+    counted as searched — so a message living only there could be
+    declared deleted.
+    """
+
+    def _js(self, groups):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        return WriteBuilder(
+            groups=groups,
+            apply_js="msg.flaggedStatus = true;",
+            needs_change_js="msg.flaggedStatus() === true",
+        ).build()
+
+    def test_numeric_scan_counts_its_cap_and_unreadable(self):
+        js = self._js([{"account": "A", "ids": [1], "scan": True}])
+        assert "cappedBoxes += Math.max(0, mailboxes.length - limit);" in js
+        # the id() failure path must count, not silently continue
+        assert js.count("unreadableBoxes++") >= 2
+
+    def test_a_skipped_discard_mailbox_is_reported(self):
+        js = self._js(
+            [{"account": "A", "headers": ["<x@y>"], "by_header": True}]
+        )
+        assert "skippedDiscard++" in js
+        assert "scan_skipped_discard: skippedDiscard" in js
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_trash_mailbox_prevents_a_deletion_verdict(self):
+        mgr = _mock_index(location=None)
+        mgr.find_by_rfc822.return_value = []
+        amap = _mock_acct_map()
+        amap.get_cached_accounts.return_value = [{"name": "byte5"}]
+
+        async def skipped_trash(script, **kw):
+            return {
+                "updated": [],
+                "unchanged": [],
+                "not_found": ["<x@y>"],
+                "scan_capped": 0,
+                "scan_unreadable": 0,
+                "scan_skipped_discard": 2,
+            }
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=skipped_trash,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            result = await set_flag("<x@y>", color="red")
+
+        assert "2 mailbox(es) were never searched" in result["hint"]
+        assert "trash/junk" in result["hint"]
+        assert "deleted" not in result["hint"]
+        assert result["diagnostics"]["mailboxes_not_searched"] == 2

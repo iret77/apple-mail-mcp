@@ -1200,6 +1200,11 @@ async def _apply_write(
             unchanged += [int(x) for x in res.get("unchanged", [])]
             not_found += [int(x) for x in res.get("not_found", [])]
             _absorb_failures(res, failed, errors, as_int=True)
+            unsearched += (
+                int(res.get("scan_capped") or 0)
+                + int(res.get("scan_unreadable") or 0)
+                + int(res.get("scan_skipped_discard") or 0)
+            )
         except Exception as exc:
             # The contract is that every id lands in exactly one bucket.
             # Letting this raise would leave the caller with no idea
@@ -1219,6 +1224,11 @@ async def _apply_write(
             unchanged += [int(x) for x in res.get("unchanged", [])]
             not_found += [int(x) for x in res.get("not_found", [])]
             _absorb_failures(res, failed, errors, as_int=True)
+            unsearched += (
+                int(res.get("scan_capped") or 0)
+                + int(res.get("scan_unreadable") or 0)
+                + int(res.get("scan_skipped_discard") or 0)
+            )
         except Exception as exc:
             # Best-effort fallback: a timed-out or failed scan reports its
             # ids as not_found rather than erroring the whole call.
@@ -1240,8 +1250,10 @@ async def _apply_write(
             unchanged += [str(x) for x in res.get("unchanged", [])]
             not_found += [str(x) for x in res.get("not_found", [])]
             _absorb_failures(res, failed, errors, as_int=False)
-            unsearched += int(res.get("scan_capped") or 0) + int(
-                res.get("scan_unreadable") or 0
+            unsearched += (
+                int(res.get("scan_capped") or 0)
+                + int(res.get("scan_unreadable") or 0)
+                + int(res.get("scan_skipped_discard") or 0)
             )
         except Exception as exc:
             logger.warning("Message-ID write failed: %s", exc, exc_info=True)
@@ -1342,7 +1354,9 @@ async def _apply_write(
             result["hint"] = (
                 f"{len(missing_headers)} message(s) were not found, but "
                 f"{unsearched} mailbox(es) were never searched (scan "
-                f"limit reached, or Mail refused to read them). This is "
+                f"limit, unreadable, or a trash/junk mailbox that is "
+                f"skipped unless the index expects the message there). "
+                f"This is "
                 f"NOT evidence that the message is gone — pass `account` "
                 f"and `mailbox` to aim the write, or call "
                 f"refresh_index() so the index can place it directly."
