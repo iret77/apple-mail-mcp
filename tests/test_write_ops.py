@@ -4050,3 +4050,79 @@ class TestHtmlEscapedReferences:
         from apple_mail_mcp.server import _normalize_message_ids
 
         assert _normalize_message_ids("[&quot;&lt;x@y&gt;&quot;]") == ["<x@y>"]
+
+
+class TestFlagColoursComeInOneCall:
+    """57 flagged messages must not mean 57 process spawns.
+
+    A read-only survey of a flagged mailbox took a minute because each
+    message needed its own osascript call just to learn its colour.
+    Apple hands out a property for the whole mailbox in one bulk fetch,
+    so the cost is fixed per mailbox rather than per message.
+    """
+
+    @pytest.mark.asyncio
+    async def test_one_call_serves_the_whole_page(self):
+        from apple_mail_mcp.server import _overlay_flag_colors_bulk
+
+        rows = [
+            {"id": 1, "flagged": True},
+            {"id": 2, "flagged": True},
+            {"id": 3, "flagged": False},
+            {"id": 4, "flagged": True},
+        ]
+        calls = []
+
+        async def jxa(script, **kw):
+            calls.append(script)
+            return {"1": "orange", "2": "red", "4": "blue"}
+
+        with patch(
+            "apple_mail_mcp.server.execute_with_core_async", side_effect=jxa
+        ):
+            await _overlay_flag_colors_bulk(rows, "byte5", "Posteingang")
+
+        assert len(calls) == 1  # not one per message
+        assert [r.get("flag_color") for r in rows] == [
+            "orange",
+            "red",
+            None,
+            "blue",
+        ]
+        # Only flagged ids are asked for.
+        assert "[1, 2, 4]" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_no_flagged_message_means_no_call_at_all(self):
+        from apple_mail_mcp.server import _overlay_flag_colors_bulk
+
+        calls = []
+
+        async def jxa(script, **kw):
+            calls.append(script)
+            return {}
+
+        with patch(
+            "apple_mail_mcp.server.execute_with_core_async", side_effect=jxa
+        ):
+            await _overlay_flag_colors_bulk(
+                [{"id": 1, "flagged": False}], "byte5", "Posteingang"
+            )
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_failing_lookup_leaves_the_listing_intact(self):
+        from apple_mail_mcp.server import _overlay_flag_colors_bulk
+
+        async def boom(script, **kw):
+            raise TimeoutError("mailbox too slow")
+
+        rows = [{"id": 1, "flagged": True, "subject": "keep me"}]
+        with patch(
+            "apple_mail_mcp.server.execute_with_core_async", side_effect=boom
+        ):
+            await _overlay_flag_colors_bulk(rows, "byte5", "Posteingang")
+
+        assert rows[0]["subject"] == "keep me"
+        assert "flag_color" not in rows[0]
