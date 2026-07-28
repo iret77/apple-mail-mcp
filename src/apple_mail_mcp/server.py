@@ -1266,9 +1266,13 @@ async def _apply_write(
     # survives moves, and apply there.
     dead_ids = [m for m in not_found if isinstance(m, int)]
     if dead_ids:
-        recovered, still_missing, moved = await _retry_by_stable_id(
-            dead_ids, account, make_builder, placed
-        )
+        (
+            recovered,
+            still_missing,
+            moved,
+            recovery_gaps,
+        ) = await _retry_by_stable_id(dead_ids, account, make_builder, placed)
+        unsearched += recovery_gaps
         updated += recovered["updated"]
         unchanged += recovered["unchanged"]
         # Headers that failed have already been matched on their stable
@@ -1396,7 +1400,7 @@ async def _retry_by_stable_id(
     account: str | None,
     make_builder,
     placed: dict[int, tuple[str, str]],
-) -> tuple[dict[str, list[int]], list[int], list[int]]:
+) -> tuple[dict[str, list[int]], list[int], list[int], int]:
     """Re-apply a failed write using the RFC822 Message-ID.
 
     Mail.app ids are per-mailbox ROWIDs: the moment another device (or a
@@ -1404,15 +1408,19 @@ async def _retry_by_stable_id(
     even though the message is perfectly fine. The header is stable, so
     look it up in the index, scan for it, and write there.
 
-    Returns ``(results, still_missing, moved)`` where ``results`` has
-    ``updated`` / ``unchanged`` lists keyed back to the *original* ids,
-    ``still_missing`` are ids with no stable id or no match, and
-    ``moved`` are the ids that were recovered elsewhere.
+    Returns ``(results, still_missing, moved, unsearched)``. ``results``
+    has ``updated`` / ``unchanged`` keyed back to the *original* ids,
+    ``still_missing`` are ids with no stable id or no match, ``moved``
+    are the ids recovered elsewhere, and ``unsearched`` counts the
+    mailboxes this recovery never looked in — a cap, an unreadable
+    mailbox, a skipped discard mailbox, or an outright failure. Without
+    that count the caller would present an unfinished recovery as proof
+    the message is gone.
     """
     empty: dict[str, list[int]] = {"updated": [], "unchanged": []}
     manager = _get_index_manager()
     if not manager.has_index():
-        return empty, missing, []
+        return empty, missing, [], 0
 
     # Map each dead id to its stable header. SCOPE the lookup to where
     # the index placed that id: a Mail.app id is unique only within a
@@ -1432,7 +1440,7 @@ async def _retry_by_stable_id(
         if header:
             header_by_id[mid] = header
     if not header_by_id:
-        return empty, missing, []
+        return empty, missing, [], 0
 
     # One header may belong to several requested ids (the same mail
     # filed in two mailboxes). The scan applies to ONE copy per header,
@@ -1445,7 +1453,7 @@ async def _retry_by_stable_id(
         h: ids[0] for h, ids in ids_per_header.items() if len(ids) == 1
     }
     if not unambiguous:
-        return empty, missing, []
+        return empty, missing, [], 0
 
     # Scan the account the message actually lived in — NOT the default
     # one. Aiming every recovery at `Mail.accounts()[0]` would make it
@@ -1470,7 +1478,7 @@ async def _retry_by_stable_id(
         entry["headers"].append(header)
         entry["prefer"].add(scope[1])
     if not by_account:
-        return empty, missing, []
+        return empty, missing, [], 0
 
     builder = make_builder(
         [
@@ -1489,8 +1497,10 @@ async def _retry_by_stable_id(
             builder.build(), timeout=RECOVERY_TIMEOUT
         )
     except Exception as exc:
-        logger.debug("stable-id recovery failed: %s", exc, exc_info=True)
-        return empty, missing, []
+        logger.warning("stable-id recovery failed: %s", exc, exc_info=True)
+        # The recovery never ran. Flag it as unsearched so the caller
+        # cannot read the outcome as "the message is not there".
+        return empty, missing, [], 1
 
     # JXA answers in headers; map each back to its single id.
     results: dict[str, list[int]] = {"updated": [], "unchanged": []}
@@ -1502,7 +1512,13 @@ async def _retry_by_stable_id(
 
     recovered = set(results["updated"]) | set(results["unchanged"])
     still_missing = [m for m in missing if m not in recovered]
-    return results, still_missing, sorted(recovered)
+    unsearched = (
+        int(res.get("scan_capped") or 0)
+        + int(res.get("scan_unreadable") or 0)
+        + int(res.get("scan_skipped_discard") or 0)
+        + len(res.get("failures") or [])
+    )
+    return results, still_missing, sorted(recovered), unsearched
 
 
 # ========== MCP Tools (10 total) ==========
@@ -2336,7 +2352,19 @@ async def _get_email_by_id(
         # doubled-up "...Error: Error: Message not found... (-1728)".
         # Surface a clean, model-friendly not-found for that case;
         # re-raise anything else (Mail.app down, permissions) intact.
-        msg = str(exc).lower()
+        raw = str(exc)
+        msg = raw.lower()
+        if "incomplete:" in msg:
+            # The scan stopped early — a mailbox cap or one Mail would
+            # not read. Absence was never established, so do not claim
+            # it: the caller can act on this, "not found" it cannot.
+            detail = raw.split("INCOMPLETE:", 1)[-1].rstrip(")").strip()
+            raise ValueError(
+                f"Message {message_id} was not found, but the search was "
+                f"incomplete ({detail} not searched). This does not mean "
+                f"the message is gone — pass `account` and `mailbox` to "
+                f"look in the right place, or use its Message-ID."
+            ) from None
         if "not found" in msg or "-1728" in msg or "can't get object" in msg:
             raise ValueError(f"Message {message_id} not found.") from None
         raise

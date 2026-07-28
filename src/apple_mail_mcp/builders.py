@@ -676,6 +676,9 @@ let msg = null;
 
 const allMailboxes = account.mailboxes();
 const mbLimit = Math.min(allMailboxes.length, {self.max_mailboxes});
+// A scan that stops early is not evidence of absence. Count what was
+// left out and say so, instead of letting "not found" stand for both.
+let unsearched = Math.max(0, allMailboxes.length - mbLimit);
 for (let i = 0; i < mbLimit && !msg; i++) {{
     try {{
         const mb = allMailboxes[i];
@@ -685,12 +688,17 @@ for (let i = 0; i < mbLimit && !msg; i++) {{
             msg = mb.messages[mbIdx];
         }}
     }} catch(e) {{
-        // Skip inaccessible mailboxes (Junk/Drafts -1728)
+        unsearched++;  // inaccessible mailbox (Junk/Drafts -1728)
     }}
 }}
 
 if (!msg) {{
-    throw new Error('Message not found with ID: ' + targetId);
+    throw new Error(
+        'Message not found with ID: ' + targetId +
+        (unsearched > 0
+            ? ' (INCOMPLETE: ' + unsearched + ' mailbox(es) not searched)'
+            : '')
+    );
 }}
 
 {self.attachment_js}

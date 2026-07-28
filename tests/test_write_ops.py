@@ -4395,3 +4395,87 @@ class TestEveryScanPathCountsWhatItSkipped:
         assert "trash/junk" in result["hint"]
         assert "deleted" not in result["hint"]
         assert result["diagnostics"]["mailboxes_not_searched"] == 2
+
+
+class TestRecoveryAndStrategy3KeepTheirGaps:
+    """Third review round, same property, two more places.
+
+    Stable-id recovery discarded its own scan counters and its failures,
+    and get_email's all-mailbox scan threw a bare "not found" whether it
+    had searched everything or given up at the cap. Both let an
+    unfinished search read as proof the message is gone.
+    """
+
+    def test_strategy3_scan_reports_what_it_skipped(self):
+        from apple_mail_mcp.builders import GetEmailBuilder
+
+        js = GetEmailBuilder(message_id=42, account="byte5").build()
+        assert "let unsearched = Math.max(0, allMailboxes.length" in js
+        assert "unsearched++" in js
+        assert "INCOMPLETE:" in js
+
+    @pytest.mark.asyncio
+    async def test_incomplete_strategy3_does_not_claim_absence(self):
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+        mgr.has_usable_index.return_value = False
+
+        async def incomplete(script, **kw):
+            raise RuntimeError(
+                "Error: Message not found with ID: 42 "
+                "(INCOMPLETE: 9 mailbox(es) not searched)"
+            )
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=incomplete,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="byte5"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_email
+
+            with pytest.raises(ValueError) as err:
+                await get_email(42)
+
+        text = str(err.value)
+        assert "search was incomplete" in text
+        assert "9 mailbox" in text
+        assert "does not mean the message is gone" in text
+
+    @pytest.mark.asyncio
+    async def test_a_failed_recovery_counts_as_unsearched(self):
+        """Recovery that never ran must not harden a miss into a fact."""
+
+        def locate(mid, account=None, mailbox=None):
+            return ("uuid-work", "INBOX")
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.find_email_location.side_effect = locate
+        mgr.get_rfc822_id.return_value = "<moved@x>"
+        amap = _mock_acct_map()
+
+        async def router(script, **kw):
+            if '"by_header": true' in script:
+                raise TimeoutError("recovery wedged")
+            return {"updated": [], "unchanged": [], "not_found": [5]}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=router,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_read_status
+
+            result = await set_read_status(5)
+
+        assert result["not_found"] == [5]
+        assert result["diagnostics"]["mailboxes_not_searched"] >= 1
