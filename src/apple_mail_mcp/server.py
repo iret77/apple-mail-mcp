@@ -433,7 +433,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-28.7"
+SERVER_REVISION = "2026-07-28.8"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -2819,6 +2819,14 @@ async def set_flag(
             - "none": remove the flag
             - "red" | "orange" | "yellow" | "green" | "blue" |
               "purple" | "gray": flag with that color
+
+            These are Apple Mail's seven colors and nothing more. This
+            server attaches NO meaning to any of them and never will:
+            what a color stands for is the user's own convention, it
+            differs from person to person, and it belongs wherever they
+            keep their instructions — not in this tool. Do not invent a
+            scheme, and do not assume one; if you do not know what a
+            color means to this user, ask them.
         account: Optional hint. Speeds id resolution; required (with
             mailbox) to place ids when no search index is built.
         mailbox: Optional hint (see account).

@@ -4126,3 +4126,64 @@ class TestFlagColoursComeInOneCall:
 
         assert rows[0]["subject"] == "keep me"
         assert "flag_color" not in rows[0]
+
+
+class TestFlagColoursCarryNoMeaning:
+    """What a colour stands for is the user's convention, not ours.
+
+    Everybody uses these differently — red as urgent, red as read-later,
+    red as a client. A server that bakes in a scheme forces its own
+    habits on every user and quietly corrupts theirs on the first
+    write. The mapping here is Apple's name-to-index table and nothing
+    else; the meaning lives with the user, wherever they keep their
+    instructions.
+    """
+
+    SEMANTIC_WORDS = (
+        "urgent",
+        "important",
+        "priority",
+        "todo",
+        "action required",
+        "waiting",
+        "deadline",
+        "spam",
+        "wichtig",
+        "dringend",
+    )
+
+    def test_the_write_tool_ascribes_no_meaning(self):
+        import inspect
+
+        from apple_mail_mcp import server
+
+        doc = (inspect.getdoc(server.set_flag) or "").lower()
+        assert doc, "set_flag lost its docstring"
+        for word in self.SEMANTIC_WORDS:
+            assert word not in doc, (
+                f"set_flag's docstring ties {word!r} to a colour. Colour "
+                f"meaning is the user's convention and must stay out of "
+                f"this server."
+            )
+
+    def test_the_docstring_says_so_explicitly(self):
+        import inspect
+
+        from apple_mail_mcp import server
+
+        doc = (inspect.getdoc(server.set_flag) or "").lower()
+        assert "no meaning" in doc
+        assert "ask them" in doc
+
+    def test_the_colour_table_is_apples_mapping_only(self):
+        from apple_mail_mcp.builders import FLAG_COLOR_INDEX
+
+        assert FLAG_COLOR_INDEX == {
+            "red": 0,
+            "orange": 1,
+            "yellow": 2,
+            "green": 3,
+            "blue": 4,
+            "purple": 5,
+            "gray": 6,
+        }

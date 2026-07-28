@@ -75,6 +75,15 @@ per-id buckets `{updated, not_found, skipped_hidden}` (+ optional
   blue 4, purple 5, gray 6; `color="none"` unflags, `"default"` flags
   without forcing a color. No index write needed — read/flag state is
   served live from the Envelope Index / `.emlx` footer, not cached.
+- **Color MEANING never enters this server.** The table above is
+  Apple's name-to-index mapping, nothing more. What a color stands for
+  is the user's own convention — red as urgent, red as read-later, red
+  as a particular client — and it differs per person. Baking a scheme
+  in would impose our habits and silently corrupt theirs on the first
+  write. The meaning belongs wherever the user keeps their
+  instructions. `TestFlagColoursCarryNoMeaning` fails the build if a
+  semantic word ever appears in `set_flag`'s docstring, and the
+  docstring tells the model to ask rather than assume.
 
 ## Message identity (read this before touching any tool that takes an id)
 
