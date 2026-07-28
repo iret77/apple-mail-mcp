@@ -4550,3 +4550,79 @@ class TestAStalePathIsNotADeletedMessage:
         src = inspect.getsource(server)
         assert "deleted or moved since the last" not in src
         assert "KEEP GOING" in src
+
+
+class TestNumericIdCannotSpeakForOtherAccounts:
+    """Sixth round. Strategy 3 walks ONE account.
+
+    With six accounts configured, "message not found" after searching
+    one of them is an absence claim about five that nobody looked in.
+    A numeric id is only unique within a mailbox, so it cannot be
+    searched across accounts at all — which makes saying so, and
+    pointing at the Message-ID, the only honest answer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_says_which_accounts_were_not_searched(self):
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+        mgr.has_usable_index.return_value = False
+
+        async def gone(script, **kw):
+            raise RuntimeError("Error: Message not found with ID: 42")
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=gone,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="iCloud"),
+            ),
+            patch(
+                "apple_mail_mcp.server._visible_account_names",
+                AsyncMock(return_value=["iCloud", "byte5", "freenea"]),
+            ),
+        ):
+            from apple_mail_mcp.server import get_email
+
+            with pytest.raises(ValueError) as err:
+                await get_email(42)
+
+        text = str(err.value)
+        assert "2 account(s) were not searched" in text
+        assert "Message-ID" in text  # the handle that does span accounts
+
+    @pytest.mark.asyncio
+    async def test_a_single_account_setup_still_says_not_found(self):
+        """With one account, one account IS everywhere."""
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+        mgr.has_usable_index.return_value = False
+
+        async def gone(script, **kw):
+            raise RuntimeError("Error: Message not found with ID: 42")
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=gone,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="byte5"),
+            ),
+            patch(
+                "apple_mail_mcp.server._visible_account_names",
+                AsyncMock(return_value=["byte5"]),
+            ),
+        ):
+            from apple_mail_mcp.server import get_email
+
+            with pytest.raises(ValueError) as err:
+                await get_email(42)
+
+        assert "not searched" not in str(err.value)

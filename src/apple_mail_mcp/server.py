@@ -2384,6 +2384,25 @@ async def _get_email_by_id(
                 if stale_index_entry is not None
                 else ""
             )
+            # Strategy 3 walks ONE account. With several configured,
+            # that is not a search of everywhere — saying "not found"
+            # would claim an absence for accounts nobody looked in.
+            if account is None:
+                others = [
+                    a
+                    for a in await _visible_account_names()
+                    if a and a != resolved_account
+                ]
+                if others:
+                    raise ValueError(
+                        f"Message {message_id} was not found in account "
+                        f"{resolved_account!r}, and the other "
+                        f"{len(others)} account(s) were not searched: a "
+                        f"numeric id is only unique within a mailbox, so "
+                        f"it cannot be looked for across accounts. Pass "
+                        f"`account`, or use the message's Message-ID, "
+                        f"which is searched everywhere.{extra}"
+                    ) from None
             raise ValueError(
                 f"Message {message_id} not found.{extra}"
             ) from None
