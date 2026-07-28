@@ -23,11 +23,10 @@ The only Apple Mail MCP server with **full-coverage body search** — reliable o
 
 No terminal, no Python, no config file.
 
-1. **[⬇ Download the bundle](https://github.com/iret77/apple-mail-mcp/releases/latest/download/apple-mail-mcp.mcpb)**
-   — one link, always the current build. (Every release also carries a
-   version-stamped copy, `apple-mail-mcp-<version>.mcpb`, if you want to
-   know what you downloaded without opening it. All releases:
-   [Releases](https://github.com/iret77/apple-mail-mcp/releases).)
+1. **[⬇ Open the latest release](https://github.com/iret77/apple-mail-mcp/releases/latest)**
+   and download `apple-mail-mcp-<version>.mcpb` from its Assets. Every
+   file carries its version in the name, so what you downloaded is never
+   in doubt — that is worth the extra click.
 2. **Double-click it.** Claude Desktop installs it as an extension.
 3. **Grant Full Disk Access to Claude Desktop** — see the box below.
    This step is not optional and it is the one people miss.
