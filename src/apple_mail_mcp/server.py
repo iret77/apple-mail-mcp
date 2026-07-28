@@ -27,6 +27,7 @@ RESOURCES (1 total):
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -432,7 +433,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-28.5"
+SERVER_REVISION = "2026-07-28.6"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -757,6 +758,15 @@ def _normalize_message_ids(
                 raise ValueError(
                     "message reference must not be an empty string."
                 )
+            # HTML-escaped brackets are another shape the same
+            # reference arrives in: "&lt;a@b&gt;", sometimes wrapping a
+            # stringified list as well. Nothing in it trips the checks
+            # below, so it would sail through and miss in silence —
+            # observed live, where the caller happened to notice.
+            # Unescape FIRST: an escaped list has to become a list
+            # before it can be unwrapped as one.
+            if "&lt;" in item or "&gt;" in item or "&amp;" in item:
+                item = html.unescape(item).strip()
             # Some clients serialize a list parameter as JSON text, so
             # what arrives is the string '["<a@b>"]' rather than a list.
             # Taken literally that is a Message-ID nothing will ever

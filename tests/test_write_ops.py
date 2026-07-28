@@ -4016,3 +4016,37 @@ class TestFlagColourOnTheDiskPath:
             await _overlay_flag_color(result, 1, "byte5", "Posteingang")
 
         assert result["flag_color"] == "blue"
+
+
+class TestHtmlEscapedReferences:
+    """`&lt;a@b&gt;` is the same message as `<a@b>`.
+
+    Observed live: the caller passed HTML-escaped brackets and had to
+    notice and retry by itself. Nothing in an escaped reference trips
+    the malformed-input checks, so it would otherwise sail through and
+    miss in silence — the third input shape in one day to produce a
+    mute not_found.
+    """
+
+    @pytest.mark.parametrize(
+        "given,expected",
+        [
+            ("&lt;a@b.com&gt;", ["<a@b.com>"]),
+            ("[&quot;&lt;a@b&gt;&quot;]", ["<a@b>"]),
+            (
+                "[&quot;&lt;a@b&gt;&quot;, &quot;&lt;c@d&gt;&quot;]",
+                ["<a@b>", "<c@d>"],
+            ),
+            ("a&amp;b@x.com", ["a&b@x.com"]),
+        ],
+    )
+    def test_escaped_forms_are_repaired(self, given, expected):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids(given) == expected
+
+    def test_unescaping_happens_before_unwrapping(self):
+        """An escaped list must become a list before it is unwrapped."""
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids("[&quot;&lt;x@y&gt;&quot;]") == ["<x@y>"]
