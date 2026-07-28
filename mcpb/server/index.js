@@ -35,12 +35,12 @@ import { homedir } from "node:os";
 // any push — testers would report against a build nobody could name.
 // A new server reaches them only through a new bundle.
 const DEFAULT_REF =
-  "git+https://github.com/iret77/apple-mail-mcp@server-v0.14.0";
+  "git+https://github.com/iret77/apple-mail-mcp@server-v0.15.0";
 const UPDATE_INTERVAL_H = 24;
 // Bump on every bundle release. The stamp records it, so installing a
 // new bundle always re-resolves the server once — otherwise a same-day
 // bundle update would run against a cached, older server build.
-const LAUNCHER_REVISION = "0.14.0";
+const LAUNCHER_REVISION = "0.15.0";
 // A cold `uvx --refresh` clones the repo and builds a wheel; 45s was
 // not enough on a first run, and the timeout then marked the update as
 // done anyway (see refreshCache) — leaving the old server in place for
