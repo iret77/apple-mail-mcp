@@ -390,6 +390,11 @@ const failures = [];
 // twice and a later group would report a mute "not found" for a header
 // that was already done.
 const settled = new Set();
+// A scan that did not cover everything is not a verdict. Count what
+// was left out so the caller can tell "the message is not there" from
+// "we did not get to look everywhere".
+let cappedBoxes = 0;
+let unreadableBoxes = 0;
 // The .emlx header keeps its angle brackets ("<a@b>"), Apple Mail's
 // messageId property drops them ("a@b"). A strict comparison between
 // the two can never match, which made every Message-ID write report a
@@ -507,11 +512,13 @@ for (const g of groups) {{
         }}
         const candidates = ordered.concat(rest);
         const limit = Math.min(candidates.length, MAX_SCAN);
+        cappedBoxes += Math.max(0, candidates.length - limit);
         for (let m = 0; m < limit && remaining.size > 0; m++) {{
             let headers;
             try {{
                 headers = candidates[m].messages.messageId();
             }} catch (e) {{
+                unreadableBoxes++;
                 continue;  // skip inaccessible mailbox
             }}
             const normed = headers.map(normHeader);
@@ -621,6 +628,8 @@ for (const g of groups) {{
 JSON.stringify({{
     updated: updated,
     unchanged: unchanged,
+    scan_capped: cappedBoxes,
+    scan_unreadable: unreadableBoxes,
     // A header missing from one account is not missing overall: drop
     // the ones another account already settled.
     not_found: notFound.filter((t) => !settled.has(String(t))),

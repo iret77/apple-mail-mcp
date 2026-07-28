@@ -3933,7 +3933,15 @@ class TestReadPathFindsUnindexedMessages:
 
         async def jxa(script, **kw):
             assert "normHeaderValue" in script
-            return {"account": "byte5", "mailbox": "Posteingang", "id": 77}
+            return {
+                "hit": {
+                    "account": "byte5",
+                    "mailbox": "Posteingang",
+                    "id": 77,
+                },
+                "capped": 0,
+                "unreadable": 0,
+            }
 
         async def by_id(rowid, account=None, mailbox=None):
             return {"id": rowid, "message_id": header, "subject": "fresh"}
@@ -3963,7 +3971,7 @@ class TestReadPathFindsUnindexedMessages:
         amap.get_cached_accounts.return_value = [{"name": "byte5"}]
 
         async def nothing(script, **kw):
-            return None
+            return {"hit": None, "capped": 0, "unreadable": 0}
 
         with (
             patch(
@@ -4037,7 +4045,10 @@ class TestHtmlEscapedReferences:
                 "[&quot;&lt;a@b&gt;&quot;, &quot;&lt;c@d&gt;&quot;]",
                 ["<a@b>", "<c@d>"],
             ),
-            ("a&amp;b@x.com", ["a&b@x.com"]),
+            # `&` is legal in a Message-ID, so "&amp;" must survive
+            # untouched: decoding it would name a DIFFERENT message and
+            # a write would land on that one while reporting success.
+            ("a&amp;b@x.com", ["a&amp;b@x.com"]),
         ],
     )
     def test_escaped_forms_are_repaired(self, given, expected):
@@ -4126,3 +4137,195 @@ class TestFlagColoursComeInOneCall:
 
         assert rows[0]["subject"] == "keep me"
         assert "flag_color" not in rows[0]
+
+
+class TestAnIncompleteSearchIsNotAVerdict:
+    """Found by an external review of today's changes.
+
+    A capped scan, an unreadable mailbox, a timeout or a refused
+    Automation permission all leave the question open. Answering them
+    with "most likely deleted" turns an incomplete search into a
+    statement about the user's mail — the same defect that, in its
+    write-path form, cost a full day of debugging.
+    """
+
+    def _ctx(self, jxa):
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.find_by_rfc822.return_value = []
+        amap = _mock_acct_map()
+        amap.get_cached_accounts.return_value = [{"name": "byte5"}]
+        return (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=jxa,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        )
+
+    @pytest.mark.asyncio
+    async def test_capped_scan_says_the_search_was_incomplete(self):
+        async def capped(script, **kw):
+            return {"hit": None, "capped": 12, "unreadable": 0}
+
+        a, b, c = self._ctx(capped)
+        with a, b, c:
+            from apple_mail_mcp.server import get_email
+
+            with pytest.raises(ValueError) as err:
+                await get_email("<x@y.com>")
+
+        text = str(err.value)
+        assert "could not be completed" in text
+        assert "12 mailbox" in text
+        assert "deleted" not in text  # never a verdict
+
+    @pytest.mark.asyncio
+    async def test_unreadable_mailbox_is_not_a_missing_message(self):
+        async def unreadable(script, **kw):
+            return {"hit": None, "capped": 0, "unreadable": 3}
+
+        a, b, c = self._ctx(unreadable)
+        with a, b, c:
+            from apple_mail_mcp.server import get_email
+
+            with pytest.raises(ValueError, match="could not be completed"):
+                await get_email("<x@y.com>")
+
+    @pytest.mark.asyncio
+    async def test_a_refused_apple_event_is_not_a_missing_message(self):
+        async def refused(script, **kw):
+            raise RuntimeError("Not authorized to send Apple events (-1743)")
+
+        a, b, c = self._ctx(refused)
+        with a, b, c:
+            from apple_mail_mcp.server import get_email
+
+            with pytest.raises(ValueError) as err:
+                await get_email("<x@y.com>")
+
+        assert "-1743" in str(err.value)
+        assert "says nothing about whether the message exists" in str(err.value)
+
+    @pytest.mark.asyncio
+    async def test_a_complete_search_may_still_conclude_absence(self):
+        """The distinction only helps if a real miss stays a real miss."""
+
+        async def clean_miss(script, **kw):
+            return {"hit": None, "capped": 0, "unreadable": 0}
+
+        a, b, c = self._ctx(clean_miss)
+        with a, b, c:
+            from apple_mail_mcp.server import get_email
+
+            with pytest.raises(ValueError) as err:
+                await get_email("<x@y.com>")
+
+        assert "every mailbox was searched" in str(err.value)
+
+
+class TestAmpersandIsNotStructure:
+    """`&` is legal in a Message-ID local part.
+
+    "<a&amp;b@x>" and "<a&b@x>" can both exist as distinct messages.
+    Decoding the entity would aim a write at the other one and report
+    success — unrecoverable. A reference that fails to match instead is
+    answered with a miss, which the caller can act on.
+    """
+
+    def test_ampersand_entity_survives_untouched(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids("<a&amp;b@x.com>") == ["<a&amp;b@x.com>"]
+        assert _normalize_message_ids("a&amp;b@x.com") == ["a&amp;b@x.com"]
+
+    def test_structural_entities_are_still_decoded(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids("&lt;a@b&gt;") == ["<a@b>"]
+        assert _normalize_message_ids("[&quot;&lt;a@b&gt;&quot;]") == ["<a@b>"]
+
+
+class TestWriteScanReportsWhatItSkipped:
+    """The write path had the read path's defect too.
+
+    A header scan is capped at STRATEGY3_MAX_MAILBOXES and skips
+    mailboxes Mail refuses. A miss that follows either of those is not
+    evidence the message is gone, and the hint must not say it is.
+    """
+
+    def test_the_script_counts_what_it_left_out(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        js = WriteBuilder(
+            groups=[{"account": "A", "headers": ["<x@y>"], "by_header": True}],
+            apply_js="msg.flaggedStatus = true;",
+            needs_change_js="msg.flaggedStatus() === true",
+        ).build()
+        assert "cappedBoxes" in js
+        assert "unreadableBoxes++" in js
+        assert "scan_capped: cappedBoxes" in js
+
+    @pytest.mark.asyncio
+    async def test_a_capped_scan_does_not_claim_deletion(self):
+        mgr = _mock_index(location=None)
+        mgr.find_by_rfc822.return_value = []
+        amap = _mock_acct_map()
+        amap.get_cached_accounts.return_value = [{"name": "byte5"}]
+
+        async def capped(script, **kw):
+            return {
+                "updated": [],
+                "unchanged": [],
+                "not_found": ["<x@y>"],
+                "scan_capped": 7,
+                "scan_unreadable": 2,
+            }
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=capped,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            result = await set_flag("<x@y>", color="red")
+
+        assert result["not_found"] == ["<x@y>"]
+        assert "9 mailbox(es) were never searched" in result["hint"]
+        assert "deleted" not in result["hint"]
+        assert result["diagnostics"]["mailboxes_not_searched"] == 9
+
+    @pytest.mark.asyncio
+    async def test_a_complete_scan_may_still_conclude_deletion(self):
+        mgr = _mock_index(location=None)
+        mgr.find_by_rfc822.return_value = []
+        amap = _mock_acct_map()
+        amap.get_cached_accounts.return_value = [{"name": "byte5"}]
+
+        async def complete(script, **kw):
+            return {
+                "updated": [],
+                "unchanged": [],
+                "not_found": ["<x@y>"],
+                "scan_capped": 0,
+                "scan_unreadable": 0,
+            }
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=complete,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            result = await set_flag("<x@y>", color="red")
+
+        assert "every mailbox was searched" in result["hint"]

@@ -27,7 +27,6 @@ RESOURCES (1 total):
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import logging
 import os
@@ -765,8 +764,22 @@ def _normalize_message_ids(
             # observed live, where the caller happened to notice.
             # Unescape FIRST: an escaped list has to become a list
             # before it can be unwrapped as one.
-            if "&lt;" in item or "&gt;" in item or "&amp;" in item:
-                item = html.unescape(item).strip()
+            #
+            # Only the three entities that carry STRUCTURE are decoded.
+            # `&amp;` is deliberately left alone: `&` is legal in a
+            # Message-ID local part, so "<a&amp;b@x>" and "<a&b@x>" can
+            # both exist as distinct messages, and decoding would aim
+            # the write at the other one while reporting success. A
+            # reference that then fails to match is answered with a
+            # miss, which is recoverable; a write to the wrong message
+            # is not.
+            if "&lt;" in item or "&gt;" in item or "&quot;" in item:
+                item = (
+                    item.replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", '"')
+                    .strip()
+                )
             # Some clients serialize a list parameter as JSON text, so
             # what arrives is the string '["<a@b>"]' rather than a list.
             # Taken literally that is a Message-ID nothing will ever
@@ -1174,6 +1187,9 @@ async def _apply_write(
     # for a message that was there all along.
     failed: list[MessageRef] = []
     errors: list[str] = []
+    # Mailboxes the scan never reached: a miss that follows one of
+    # these is not evidence that the message is gone.
+    unsearched = 0
 
     if located:
         try:
@@ -1224,6 +1240,9 @@ async def _apply_write(
             unchanged += [str(x) for x in res.get("unchanged", [])]
             not_found += [str(x) for x in res.get("not_found", [])]
             _absorb_failures(res, failed, errors, as_int=False)
+            unsearched += int(res.get("scan_capped") or 0) + int(
+                res.get("scan_unreadable") or 0
+            )
         except Exception as exc:
             logger.warning("Message-ID write failed: %s", exc, exc_info=True)
             failed += [h for g in by_header for h in g["headers"]]
@@ -1273,6 +1292,7 @@ async def _apply_write(
                 f"{acct}/{mbox}" for acct, mbox in placed.values()
             ],
             "references_as_received": [str(i) for i in ids],
+            "mailboxes_not_searched": unsearched,
         }
     if failed:
         # Say plainly that Apple Mail never carried the write out, and
@@ -1318,13 +1338,22 @@ async def _apply_write(
     if missing_headers and not [m for m in not_found if isinstance(m, int)]:
         # A Message-ID write was matched against the live mailboxes, so
         # a miss is a statement about Apple Mail, not about the index.
-        result["hint"] = (
-            f"{len(missing_headers)} message(s) with that Message-ID were "
-            f"not found in any visible account. Apple Mail was reachable "
-            f"and every account was searched, so the message is most "
-            f"likely deleted. If you believe it exists, call "
-            f"refresh_index() and try again."
-        )
+        if unsearched:
+            result["hint"] = (
+                f"{len(missing_headers)} message(s) were not found, but "
+                f"{unsearched} mailbox(es) were never searched (scan "
+                f"limit reached, or Mail refused to read them). This is "
+                f"NOT evidence that the message is gone — pass `account` "
+                f"and `mailbox` to aim the write, or call "
+                f"refresh_index() so the index can place it directly."
+            )
+        else:
+            result["hint"] = (
+                f"{len(missing_headers)} message(s) with that Message-ID "
+                f"were not found in any visible account. Apple Mail was "
+                f"reachable and every mailbox was searched, so the "
+                f"message is most likely deleted."
+            )
     elif moved:
         result["hint"] = (
             f"{len(moved)} message(s) had been moved (another device, or a "
@@ -1867,33 +1896,53 @@ async def get_email(
     return await _get_email_by_id(message_id, account, mailbox)
 
 
+class _LiveLookupIncomplete(RuntimeError):
+    """The live search did not cover everything it would have needed to.
+
+    Distinct from "the message is not there": a capped scan, a mailbox
+    Mail refused to read, a timeout or a denied Automation permission
+    all leave the question OPEN. Reporting them as a missing message
+    turns an incomplete search into a verdict — the defect that cost a
+    day of debugging in its write-path form.
+    """
+
+
 async def _locate_header_via_jxa(header: str) -> tuple[str, str, int] | None:
     """Find a message by its RFC822 header without using the index.
 
-    The write path has searched live for a while; the read path still
-    demanded an index row and gave up with "not in the index" for
-    exactly the messages that matter most — the ones that arrived after
-    the last sync. Returns ``(account, mailbox, id)`` or None.
+    Returns ``(account, mailbox, id)``, or None when every mailbox was
+    searched and the header was genuinely absent.
+
+    Raises:
+        _LiveLookupIncomplete: the search could not be completed, so
+            nothing may be concluded about the message.
     """
     accounts = await _visible_account_names()
     if not accounts:
         one = await _resolve_visible_account(None)
         accounts = [one] if one else []
     if not accounts:
-        return None
+        raise _LiveLookupIncomplete("no visible account could be resolved")
     script = f"""
 const targets = {json.dumps(accounts)};
 const needle = MailCore.normHeaderValue({json.dumps(header)});
 let hit = null;
+let capped = 0;      // mailboxes past the scan limit
+let unreadable = 0;  // mailboxes Mail refused
 for (const name of targets) {{
+    if (hit) break;
     let account;
-    try {{ account = MailCore.getAccount(name); }} catch (e) {{ continue; }}
+    try {{ account = MailCore.getAccount(name); }}
+    catch (e) {{ unreadable++; continue; }}
     let boxes;
-    try {{ boxes = account.mailboxes(); }} catch (e) {{ continue; }}
+    try {{ boxes = account.mailboxes(); }}
+    catch (e) {{ unreadable++; continue; }}
     const limit = Math.min(boxes.length, {STRATEGY3_MAX_MAILBOXES});
+    capped += Math.max(0, boxes.length - limit);
     for (let m = 0; m < limit && !hit; m++) {{
         let ids;
-        try {{ ids = boxes[m].messages.messageId(); }} catch (e) {{ continue; }}
+        try {{ ids = boxes[m].messages.messageId(); }}
+        catch (e) {{ unreadable++; continue; }}
         for (let i = 0; i < ids.length; i++) {{
             if (MailCore.normHeaderValue(ids[i]) === needle) {{
                 hit = {{
@@ -1905,18 +1954,27 @@ for (const name of targets) {{
             }}
         }}
     }}
-    if (hit) break;
 }}
-JSON.stringify(hit);
+JSON.stringify({{hit: hit, capped: capped, unreadable: unreadable}});
 """
     try:
-        found = await execute_with_core_async(script, timeout=RECOVERY_TIMEOUT)
+        res = await execute_with_core_async(script, timeout=RECOVERY_TIMEOUT)
     except Exception as exc:
-        logger.debug("live header lookup failed: %s", exc)
-        return None
-    if not found:
-        return None
-    return found["account"], found["mailbox"], int(found["id"])
+        # Timeout, refused Apple Events, Mail not running: the search
+        # never happened. Saying "not found" here would be a lie.
+        raise _LiveLookupIncomplete(str(exc)) from exc
+    if not isinstance(res, dict):
+        raise _LiveLookupIncomplete("the live search returned no answer")
+    hit = res.get("hit")
+    if hit:
+        return hit["account"], hit["mailbox"], int(hit["id"])
+    skipped = int(res.get("capped") or 0) + int(res.get("unreadable") or 0)
+    if skipped:
+        raise _LiveLookupIncomplete(
+            f"{skipped} mailbox(es) were not searched (scan limit or "
+            f"unreadable), so the message may still exist in one of them"
+        )
+    return None
 
 
 async def _get_email_by_header(
@@ -1947,11 +2005,21 @@ async def _get_email_by_header(
         # Not indexed yet — the normal state for anything that arrived
         # after the last sync. Ask Apple Mail directly rather than
         # declaring a message missing that is sitting in a mailbox.
-        live = await _locate_header_via_jxa(header)
+        try:
+            live = await _locate_header_via_jxa(header)
+        except _LiveLookupIncomplete as exc:
+            raise ValueError(
+                f"Email {header!r} is not in the index, and the live "
+                f"search could not be completed: {exc}. This says "
+                f"nothing about whether the message exists — retry, "
+                f"pass `account` to narrow the search, or call "
+                f"refresh_index() so the index can place it directly."
+            ) from None
         if live is None:
             raise ValueError(
                 f"Email {header!r} was not found in the index and not in "
-                f"any visible account. It was most likely deleted."
+                f"any visible account; every mailbox was searched, so it "
+                f"was most likely deleted."
             )
         acct_name, mbox, rowid = live
         result = await _get_email_by_id(rowid, acct_name, mbox)
