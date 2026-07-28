@@ -392,8 +392,14 @@ class TestGetEmail:
     async def test_strategy0_cleans_stale_index_entry(
         self, mock_exec, mock_mgr, mock_acct_map
     ):
-        """Stale FTS5 entry is auto-cleaned and a clear error is raised
-        without falling through to JXA cascade. (#74)
+        """Stale FTS5 entry is auto-cleaned — and the search CONTINUES.
+
+        A missing .emlx means the recorded path is wrong, nothing more:
+        the message may have been re-filed, or Mail may have rebuilt its
+        store. The original behaviour raised "deleted or moved" here on
+        the assumption that the live strategies would fail anyway; that
+        assumption was never checked, and it made the tool state an
+        absence it had not established. (#74, corrected after review.)
         """
         from pathlib import Path
         from unittest.mock import AsyncMock
@@ -411,17 +417,18 @@ class TestGetEmail:
 
         from apple_mail_mcp.server import get_email
 
+        mock_exec.side_effect = RuntimeError("Message not found (-1728)")
+
         with patch("pathlib.Path.exists", return_value=False):
-            with pytest.raises(ValueError, match="deleted or moved"):
+            with pytest.raises(ValueError, match="not found"):
                 await get_email(42, account="Work", mailbox="INBOX")
 
         # The stale entry was cleaned up with the resolved account UUID
         mock_mgr.return_value.delete_email.assert_called_once_with(
             42, account="uuid-1", mailbox="INBOX"
         )
-        # JXA cascade was skipped — no point trying strategies that will
-        # all fail on a deleted message
-        mock_exec.assert_not_called()
+        # Apple Mail was actually asked before absence was reported.
+        mock_exec.assert_called()
 
     @pytest.mark.asyncio
     async def test_get_email_uses_index_for_fallback(self):

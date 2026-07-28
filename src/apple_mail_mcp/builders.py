@@ -390,6 +390,12 @@ const failures = [];
 // twice and a later group would report a mute "not found" for a header
 // that was already done.
 const settled = new Set();
+// A scan that did not cover everything is not a verdict. Count what
+// was left out so the caller can tell "the message is not there" from
+// "we did not get to look everywhere".
+let cappedBoxes = 0;
+let unreadableBoxes = 0;
+let skippedDiscard = 0;
 // The .emlx header keeps its angle brackets ("<a@b>"), Apple Mail's
 // messageId property drops them ("a@b"). A strict comparison between
 // the two can never match, which made every Message-ID write report a
@@ -501,17 +507,25 @@ for (const g of groups) {{
             try {{ nm = String(mailboxes[m].name()); }} catch (e) {{}}
             const isPreferred = preferred.indexOf(nm) !== -1;
             const isDiscard = MailCore.isDiscardMailbox(nm);
-            if (isDiscard && !isPreferred) continue;
+            if (isDiscard && !isPreferred) {{
+                // Deliberately not searched — but "not searched" all
+                // the same. Counting it as covered would let a message
+                // that only sits in Trash or Junk be declared deleted.
+                skippedDiscard++;
+                continue;
+            }}
             if (isPreferred) ordered.push(mailboxes[m]);
             else rest.push(mailboxes[m]);
         }}
         const candidates = ordered.concat(rest);
         const limit = Math.min(candidates.length, MAX_SCAN);
+        cappedBoxes += Math.max(0, candidates.length - limit);
         for (let m = 0; m < limit && remaining.size > 0; m++) {{
             let headers;
             try {{
                 headers = candidates[m].messages.messageId();
             }} catch (e) {{
+                unreadableBoxes++;
                 continue;  // skip inaccessible mailbox
             }}
             const normed = headers.map(normHeader);
@@ -553,11 +567,13 @@ for (const g of groups) {{
         }}
         const remaining = new Set(g.ids);
         const limit = Math.min(mailboxes.length, MAX_SCAN);
+        cappedBoxes += Math.max(0, mailboxes.length - limit);
         for (let m = 0; m < limit && remaining.size > 0; m++) {{
             let ids;
             try {{
                 ids = mailboxes[m].messages.id();
             }} catch (e) {{
+                unreadableBoxes++;
                 continue;  // skip inaccessible mailbox (Junk/Drafts -1728)
             }}
             for (const targetId of Array.from(remaining)) {{
@@ -621,6 +637,9 @@ for (const g of groups) {{
 JSON.stringify({{
     updated: updated,
     unchanged: unchanged,
+    scan_capped: cappedBoxes,
+    scan_unreadable: unreadableBoxes,
+    scan_skipped_discard: skippedDiscard,
     // A header missing from one account is not missing overall: drop
     // the ones another account already settled.
     not_found: notFound.filter((t) => !settled.has(String(t))),
@@ -655,8 +674,22 @@ const targetId = {self.message_id};
 let msg = null;
 {acct_setup}
 
-const allMailboxes = account.mailboxes();
+let allMailboxes;
+try {{
+    allMailboxes = account.mailboxes();
+}} catch (e) {{
+    // The account itself could not be enumerated, so NOTHING was
+    // searched. Falling through to "message not found" would state an
+    // absence that was never established.
+    throw new Error(
+        'Message not found with ID: ' + targetId +
+        ' (INCOMPLETE: the account could not be read at all)'
+    );
+}}
 const mbLimit = Math.min(allMailboxes.length, {self.max_mailboxes});
+// A scan that stops early is not evidence of absence. Count what was
+// left out and say so, instead of letting "not found" stand for both.
+let unsearched = Math.max(0, allMailboxes.length - mbLimit);
 for (let i = 0; i < mbLimit && !msg; i++) {{
     try {{
         const mb = allMailboxes[i];
@@ -666,12 +699,17 @@ for (let i = 0; i < mbLimit && !msg; i++) {{
             msg = mb.messages[mbIdx];
         }}
     }} catch(e) {{
-        // Skip inaccessible mailboxes (Junk/Drafts -1728)
+        unsearched++;  // inaccessible mailbox (Junk/Drafts -1728)
     }}
 }}
 
 if (!msg) {{
-    throw new Error('Message not found with ID: ' + targetId);
+    throw new Error(
+        'Message not found with ID: ' + targetId +
+        (unsearched > 0
+            ? ' (INCOMPLETE: ' + unsearched + ' mailbox(es) not searched)'
+            : '')
+    );
 }}
 
 {self.attachment_js}

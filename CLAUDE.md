@@ -152,6 +152,49 @@ as well. The RFC822 `Message-ID` header survives that. Therefore:
   down. It still raises when *no* property could be read, so an
   unreadable mailbox never reads as "0 messages".
 
+## An incomplete search is never a verdict
+
+The single most expensive defect class in this codebase, and the one an
+external review found **twelve** separate instances of in one pass. The
+rule:
+
+> A tool may report that a message is absent ONLY when the search
+> actually covered every place the message could have been. Anything
+> else — a mailbox cap, a mailbox Mail refused to read, a deliberately
+> skipped trash/junk mailbox, a timeout, a denied Apple Events
+> permission, a recovery that did not finish, an account that was never
+> enumerated — leaves the question OPEN and must be reported as such.
+
+Why it matters more than it sounds: all of these produce the *identical*
+empty answer. Three different causes (a stringified list taken for a
+Message-ID, a stale index row pinning the search to one account, and a
+genuinely deleted message) each cost a full debugging round because the
+result looked the same from outside.
+
+How it is enforced:
+
+- Every scan branch counts what it left out. The JXA write script
+  returns `scan_capped`, `scan_unreadable` and `scan_skipped_discard`;
+  `GetEmailBuilder` marks its error `INCOMPLETE`; `_locate_header_via_jxa`
+  raises `_LiveLookupIncomplete` rather than returning None.
+- `_apply_write` sums them into `diagnostics.mailboxes_not_searched`
+  and picks the hint from it. `TestNoWriteHintClaimsDeletion` allows the
+  word "deleted" exactly once in `_apply_write` — in the branch where a
+  complete search established it.
+- **A numeric id cannot be searched across accounts at all** (it is a
+  per-mailbox ROWID, so the same number is a different message
+  elsewhere). Widening that search would risk returning or writing a
+  stranger's mail. The honest answer is to state the limit and point at
+  the `message_id`, which *is* searched everywhere.
+- A missing `.emlx` file means the recorded PATH is stale, nothing more.
+  Strategy 0 cleans the row and **continues** into the live strategies;
+  it used to raise "deleted or moved" on the unverified assumption that
+  they would fail anyway — and a test had frozen that assumption in.
+
+When adding a code path that can end in "not found", the question is not
+"did I find it?" but **"did I look everywhere it could be, and if not,
+does the caller learn that?"**
+
 ## Well-known mailboxes: resolve by role, never by name
 
 A mailbox name is the weakest handle in this codebase. It changes with
