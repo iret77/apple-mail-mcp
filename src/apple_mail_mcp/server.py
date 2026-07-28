@@ -432,7 +432,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-28.17"
+SERVER_REVISION = "2026-07-28.18"
 
 
 def to_local_iso(value: str | None) -> str | None:
