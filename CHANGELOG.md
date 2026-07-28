@@ -5,10 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0] - 2026-07-28
+## [0.18.0] - 2026-07-28
 
 Fork release (iret77). Adds write tools, stable message identity and
 diagnostics on top of upstream 0.4.2.
+
+The jump from 0.4.2 to 0.18.0 unifies two version lines that had drifted
+apart: the `.mcpb` bundle was numbered per build and had reached 0.17.0,
+while the package still carried upstream's 0.4.2. Package, `server.json`,
+the bundle manifest and the launcher now share one number — two numbers
+claimed a difference in content that does not exist, and made a bug
+report something you had to translate.
 
 ### Added
 - **Write tools** `set_flag(refs, color?)` and `set_read_status(refs, read?)`
