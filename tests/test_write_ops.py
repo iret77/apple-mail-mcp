@@ -3846,3 +3846,67 @@ class TestJsonEncodedListParameter:
 
         assert result["updated"] == [header]
         assert '\\"' not in captured["script"]  # no JSON text as an id
+
+
+class TestAFailedWriteExplainsItself:
+    """A bare not_found is unfalsifiable from the outside.
+
+    Three separate causes produced the identical empty answer in one
+    day: a stringified list taken for a Message-ID, a stale index row
+    pinning the search to one account, and a genuinely deleted message.
+    The result now states what was attempted, so the next occurrence is
+    one call instead of a session.
+    """
+
+    @pytest.mark.asyncio
+    async def test_not_found_reports_what_was_searched(self):
+        mgr = _mock_index(location=None)
+        mgr.find_by_rfc822.return_value = [("uuid-byte5", "Posteingang", 1)]
+        amap = _mock_acct_map(uuid_to_name="byte5")
+        amap.get_cached_accounts.return_value = [
+            {"name": "byte5"},
+            {"name": "iCloud"},
+        ]
+
+        async def miss(script, **kw):
+            return {"updated": [], "unchanged": [], "not_found": ["<a@x>"]}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=miss,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            result = await set_flag("<a@x>", color="green")
+
+        diag = result["diagnostics"]
+        assert diag["accounts_searched"] == ["byte5", "iCloud"]
+        assert diag["mailboxes_preferred"] == ["Posteingang"]
+        assert diag["references_as_received"] == ["<a@x>"]
+
+    @pytest.mark.asyncio
+    async def test_a_clean_success_stays_quiet(self):
+        """Diagnostics are for failures; a success must not carry noise."""
+        mgr = _mock_index(location=("uuid-work", "INBOX"))
+        amap = _mock_acct_map()
+
+        async def hit(script, **kw):
+            return {"updated": [7], "unchanged": [], "not_found": []}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=hit,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_read_status
+
+            result = await set_read_status(7)
+
+        assert "diagnostics" not in result
