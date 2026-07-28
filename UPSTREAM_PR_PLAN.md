@@ -1,58 +1,57 @@
-# Upstream-PR-Plan — iret77/apple-mail-mcp → imdinu/apple-mail-mcp
+# Upstream PR plan — iret77/apple-mail-mcp → imdinu/apple-mail-mcp
 
-Stand: 2026-07-27. Basis geprüft: `git merge-base upstream/main feat/write-ops-flag-read`
-== `upstream/main` HEAD (`ee655d4`). **Upstream ist uns 0 Commits voraus**, wir sind 30
-voraus (22 Dateien, +7025/−217). Kein Rebase nötig.
+Measured, not assumed: `git merge-base upstream/main feat/write-ops-flag-read`
+== `upstream/main` HEAD (`ee655d4`). **Upstream is zero commits ahead of us**;
+we are ahead by the work listed below. No rebase needed.
 
-## Leitgedanke
+## Guiding idea
 
-Der Maintainer bekommt **kein Alles-oder-nichts-Paket**. Jede Einheit ist so
-geschnitten, dass er sie einzeln mergen, in Ruhe reviewen, umbauen oder ablehnen kann,
-ohne dass die anderen dadurch fallen. Wo eine Abhängigkeit technisch unvermeidbar ist,
-steht sie unten ausdrücklich dabei — samt Zusage, dass wir bei Ablehnung eines Stücks
-den Rest darauf umbauen.
+The maintainer must not face an all-or-nothing package. Every unit below is cut
+so it can be merged, reviewed at leisure, reworked or declined on its own,
+without dragging the others down. Where a dependency is unavoidable it is named
+— together with the commitment to rebuild the rest if one piece is rejected.
 
-## Vorgaben aus dem Upstream-CONTRIBUTING.md
+## What upstream's CONTRIBUTING.md asks for
 
-- „Keep the diff focused — avoid unrelated changes in the same PR."
-- „PRs are typically squash-merged into `main`." → unsere Commit-Historie landet nicht
-  drüben; **es zählt der Diff pro PR**, nicht unsere Reihenfolge.
-- Pflicht: `ruff check src/`, `ruff format --check src/`, `pytest`.
-- Lizenz GPL-3.0.
+- "Keep the diff focused — avoid unrelated changes in the same PR."
+- "PRs are typically squash-merged into `main`." → our commit history does not
+  travel; **what counts is the diff per PR**, not our sequence.
+- Required: `ruff check src/`, `ruff format --check src/`, `pytest`.
+- GPL-3.0.
 
-## Was Upstream schon hat (geprüft, nicht vermutet)
+## What upstream already has (verified, not assumed)
 
-- `_ensure_writable()` + `APPLE_MAIL_READ_ONLY` (#80) — **das Gate existiert, bewacht
-  aber nichts.** Aufhänger für Track C.
-- Die Resource `index://status` — dort können Zählwerte andocken, ohne ein neues Tool.
-- 8 Tools.
+- `_ensure_writable()` and `APPLE_MAIL_READ_ONLY` (#80) — **the gate exists but
+  guards nothing.** That is the hook for track C.
+- The `index://status` resource — counters can attach there without a new tool.
+- 8 tools.
 
-## Was nicht upstream geht
+## What must not travel upstream
 
-| Sache | Wo | Grund |
+| Item | Where | Why |
 |---|---|---|
-| `mcpb/`, `scripts/build-mcpb.sh`, `dist/`, diese Datei | Fork-Branches | Fork-Distribution |
-| `install_mode`, `source_ref`, `APPLE_MAIL_MCP_LAUNCHER`, `APPLE_MAIL_MCP_REF` | server.py:478–498, 2724 | beschreibt unseren Bundle-Launcher |
-| `SERVER_REVISION` | server.py:418 | unser Build-Stempel |
-| `.mcpb`-Absatz im README | README.md | Fork-spezifisch |
+| `mcpb/`, `scripts/build-mcpb.sh`, `dist/`, this file | fork branches | fork distribution |
+| `install_mode`, `source_ref`, `APPLE_MAIL_MCP_LAUNCHER`, `APPLE_MAIL_MCP_REF` | server.py | describes our bundle launcher |
+| `SERVER_REVISION` | server.py | our build stamp |
+| The `.mcpb` paragraph in the README | README.md | fork-specific |
 
 ---
 
-# Die Einheiten
+# The units
 
-`⊘` = kann ohne Auswirkung auf alle anderen abgelehnt werden.
-`↑` = baut auf der genannten Einheit auf (textuell, nicht inhaltlich — bei Ablehnung
-bauen wir um).
+`⊘` = can be declined with no effect on any other unit.
+`↑` = builds on the named unit (usually textually — same file; if it is
+rejected we rework the rest).
 
-## Track A — Fehlerbehebungen, keine API-Änderung
+## Track A — bug fixes, no API change
 
-Acht Stück, alle klein und für sich prüfbar. Keine erweitert die Tool-Oberfläche, alle
-reparieren nachweislich kaputtes Verhalten.
+Eight of them, each small and reviewable on its own. None widens the tool
+surface; all repair demonstrably broken behaviour.
 
-| # | Branch | Diff | Abh. |
+| # | Branch | Diff | Dep. |
 |---|---|---|---|
 | A1 | `fix/emlx-header-decoding` | `disk.py`, `sync.py` | ⊘ |
-| A2 | `fix/oversized-emails-visible` | `disk.py`, `config.py`, `schema.py`, `server.py` (nur Resource) | ⊘ |
+| A2 | `fix/oversized-emails-visible` | `disk.py`, `config.py`, `schema.py`, `server.py` (resource only) | ⊘ |
 | A3 | `fix/stale-emlx-flags` | `server.py`, `envelope_direct.py` | ⊘ |
 | A4 | `fix/local-timestamps` | `server.py` | ⊘ |
 | A5 | `fix/sync-transaction-rollback` | `manager.py` | ⊘ |
@@ -60,48 +59,54 @@ reparieren nachweislich kaputtes Verhalten.
 | A7 | `perf/rebuild-fts-delete-all` | `manager.py` | ↑ A6 |
 | A8 | `fix/cross-process-write-lock` | `manager.py`, `watcher.py` | ↑ A6 |
 
-**A1 — unlesbare Header.** Ein nicht-ASCII-`Subject`, `Received`, `Content-ID` oder
-Anhangs-Dateiname lässt Pythons `email`-Modul ein `Header`-Objekt statt `str` liefern;
-der erste `.strip()` wirft `AttributeError` und **der komplette Sync bricht ab** — bei
-uns einen Tag lang unbemerkt, weil der Fehler nur auf stderr ging. `header_text()` /
-`_filename_text()` garantieren dekodierten `str`; ein Guard-Test verhindert die Rückkehr
-roher Headerzugriffe. Dazu: der Per-Message-Guard im Sync fängt `Exception` statt nur
-drei Typen — eine kaputte Mail darf nie den ganzen Lauf killen.
-*Der wichtigste Einzel-PR der Reihe.*
+**A1 — an undecodable header aborts the entire sync.** A non-ASCII `Subject`,
+`Received`, `Content-ID` or attachment filename makes Python's `email` module
+hand back a `Header` object instead of a `str`; the first `.strip()` raises
+`AttributeError` and **the whole sync dies**. It ran unnoticed for a day here,
+because the error only ever reached stderr. `header_text()` and
+`_filename_text()` guarantee a decoded `str`, and a guard test forbids raw
+header access returning to the parser. The per-message guard in `sync.py` now
+catches `Exception` rather than three specific types: one bad message must
+never kill the run. *The single most valuable PR of the set.*
 
-**A2 — übergroße Mails.** Verschwanden still. Jetzt als `too_large` in der DLQ, Grenze
-über `APPLE_MAIL_INDEX_MAX_EMAIL_MB` (Default 25) konfigurierbar, Zählwerte über die
-**bestehende** Resource `index://status` sichtbar — kein neues Tool.
+**A2 — oversized messages vanished silently.** Now recorded in the DLQ as
+`too_large`, with the limit configurable via `APPLE_MAIL_INDEX_MAX_EMAIL_MB`
+(default 25) and the counts surfaced through the **existing** `index://status`
+resource — no new tool, hence independent of track B.
 
-**A3 — veralteter Gelesen-/Markiert-Status.** `get_email()` las beides aus dem
-Plist-Footer der `.emlx`, den Mail nicht zuverlässig neu schreibt. Overlay aus Apples
-Envelope Index (ein Read-only-Select).
+**A3 — stale read/flagged state.** `get_email()` read both from the `.emlx`
+plist footer, which Mail does not reliably rewrite. Overlaid from Apple's
+Envelope Index (one read-only SELECT).
 
-**A4 — Zeitzone.** Alle Zeitstempel gingen als UTC raus, Mail.app zeigt Ortszeit (bei
-uns 12:54 statt 14:54). `to_local_iso()` konvertiert an jeder Ausgabegrenze über die
-**System**-Zone, DST-korrekt, nie über eine fest verdrahtete. Speicherung bleibt UTC.
+**A4 — time zone.** All timestamps went out as UTC while Mail.app shows local
+time (12:54 versus 14:54 here). `to_local_iso()` converts at every output
+boundary using the **system** zone (DST-correct), never a hardcoded one.
+Storage stays UTC.
 
-**A5–A8 — vier Ursachen von „database is locked".** Nacheinander gefunden, deshalb
-einzeln schneidbar; sie liegen aber alle in `manager.py` und stapeln daher textuell:
+**A5–A8 — four causes of "database is locked."** Found one after another, hence
+separable; they all live in `manager.py` and therefore stack textually:
 
-- **A5 Rollback** — eine abgebrochene Transaktion blieb offen und blockierte danach
-  *jeden* Schreibzugriff.
-- **A6 Verbindungen pro Thread** (`threading.local`) — ein Hintergrund-Rebuild legte
-  sonst den Server lahm.
-- **A7 FTS-Trigger** vor dem `DELETE` fallen lassen, einmaliges
-  `INSERT INTO emails_fts(emails_fts) VALUES('delete-all')`, Trigger als **erste**
-  Aktion im `finally` zurück. DDL committet implizit — ein Rollback holt sie nicht
-  wieder, ein Fehler hätte den Index dauerhaft ohne Trigger hinterlassen.
-- **A8 Cross-Prozess-Lock** (`fcntl.flock`). Ein `threading.Lock` reicht nicht: Claude
-  Desktop startet den Server **zweimal** — das ist deren offenes Issue **#106**. Fällt
-  auf Thread-Lock zurück, wenn die Lockdatei nicht anlegbar ist.
+- **A5 rollback** — an aborted transaction stayed open and blocked *every*
+  later write.
+- **A6 per-thread connections** (`threading.local`) — a background rebuild
+  otherwise froze the server.
+- **A7 FTS triggers** dropped before the `DELETE`, the index emptied with a
+  single `INSERT INTO emails_fts(emails_fts) VALUES('delete-all')`, triggers
+  restored as the **first** action in `finally`. DDL commits implicitly in
+  SQLite, so a rollback does not bring them back: without the restore, a
+  failure mid-rebuild leaves an index that silently stops matching its FTS
+  table.
+- **A8 cross-process lock** (`fcntl.flock`). A `threading.Lock` is not enough:
+  Claude Desktop starts the server **twice** — your open issue **#106**. Falls
+  back to thread-only locking when the lock file cannot be created.
 
-## Track B — Diagnose (additiv, Tool-Oberfläche wächst)
+## Track B — diagnostics (additive, the tool surface grows)
 
-Anlass: **stderr eines MCP-Servers erreicht niemanden.** Unter einem Desktop-Client ist
-der Server eine Blackbox — der Nutzer sieht „geht nicht", der Agent hat keinen Kanal.
+Motivation: **an MCP server's stderr reaches nobody.** Under a desktop client
+the server is a black box — the user sees "it doesn't work" and the agent has
+no channel at all.
 
-| # | Branch | Diff | Abh. |
+| # | Branch | Diff | Dep. |
 |---|---|---|---|
 | B1 | `feat/build-progress-and-phases` | `manager.py` | ↑ A6 |
 | B2 | `feat/index-status-tool` | `server.py`, `manager.py` | ↑ B1 |
@@ -109,98 +114,100 @@ der Server eine Blackbox — der Nutzer sieht „geht nicht", der Agent hat kein
 | B4 | `feat/server-log-file` | `cli.py`, `config.py` | ⊘ |
 | B5 | `feat/optional-auto-build` | `cli.py`, `config.py` | ⊘ |
 
-**B1** liefert das Innenleben ohne neue Tools: Build-Phase, Fortschritt, Zeit seit
-letztem Fortschritt, Stall-Erkennung, Ereignis-Ring (letzte 50). Nützt schon der
-bestehenden Resource `index://status`. Wer B2 nicht will, kann B1 trotzdem nehmen.
+**B1** adds the internals without any new tool: build phase, progress, seconds
+since the last progress, stall detection, a ring of the last 50 events. The
+**existing** `index://status` resource can serve all of it, so B1 is usable
+even if B2 is declined.
 
-**B2** `get_index_status()` — Zustand, Fortschritt, Erreichbarkeit von
-`~/Library/Mail` (= Full Disk Access), DLQ-Zahlen, handlungsfähige `next_steps`.
-*Vor dem PR zu entfernen: `install_mode`, `source_ref`, `SERVER_REVISION`.*
+**B2** `get_index_status()` — state, progress, whether `~/Library/Mail` is
+readable (the Full Disk Access test), DLQ counts, actionable `next_steps`.
+*Strip before the PR: `install_mode`, `source_ref`, `SERVER_REVISION`.*
 
-**B3** `refresh_index(full=False)` — Sync auf Zuruf, `full=True` baut im Hintergrund
-neu; meldet ehrlich `already_running`/`failed` statt blind „started". Der Docstring
-beansprucht bewusst „rebuild / neu aufbauen" **und** stellt klar, dass es nicht Apples
-Envelope Index ist — sonst schickt das Modell den Nutzer zu „Postfach › Neu aufbauen"
-in Mail.app. Live passiert.
+**B3** `refresh_index(full=False)` — sync on demand, `full=True` rebuilds in the
+background. Two details earned the hard way: it reports `already_running` /
+`failed` instead of a blind "started", and its docstring deliberately claims
+the vocabulary "rebuild / re-index" **and** states this is not Apple's own
+envelope index — without that, a model sends the user to "Mailbox > Rebuild" in
+Mail.app. That happened live.
 
-**B4** Datei-Logging mit `0600` auch nach Rotation.
+**B4** rotating file log at `~/.apple-mail-mcp/server.log`, created `0600` even
+after rotation (a naive handler loses the mode on the rotated file), and an
+empty config value really disables it (`Path("")` normalises to `"."`, which is
+truthy).
 
-**B5 — Auto-Build, ausdrücklich als Opt-in mit Default `false`.** Baut den Index beim
-ersten Start im Hintergrund, wenn keiner existiert. Wir schlagen den konservativen
-Default vor, weil das eine Produktentscheidung des Maintainers ist und keine
-Fehlerbehebung: der Server liefe sonst beim ersten Start ungefragt über
-`~/Library/Mail`. Unser Bundle setzt die Variable ohnehin explizit, der Code-Default
-kostet uns also nichts. Ein Satz gehört in den PR: *„Wenn du den Default umdrehen
-willst, ist das eine Zeile — wir haben ihn bewusst konservativ gelassen."*
+**B5 — auto-build, offered as opt-in with default `false`.** Builds the index in
+the background on first `serve` when none exists. We propose the conservative
+default because this is a product decision, not a bug fix: with `true` the
+server would walk `~/Library/Mail` unasked on first start — minutes on a large
+mailbox. Flipping it is one line, and we deliberately left it off.
 
-## Track C — Schreiben und stabile Identität
+## Track C — writing, and stable identity
 
-| # | Branch | Diff | Abh. |
+| # | Branch | Diff | Dep. |
 |---|---|---|---|
 | C1 | `feat/stable-identity-schema` | `schema.py`, `manager.py`, `sync.py`, `disk.py`, `watcher.py` | ⊘ |
 | C2 | `feat/expose-message-id-in-reads` | `search.py`, `server.py`, `builders.py`, `mail_core.js` | ↑ C1 |
 | C3 | `feat/write-tools` | `builders.py`, `server.py` | ⊘ |
 | C4 | `feat/message-id-as-write-reference` | `server.py`, `builders.py` | ↑ C2, C3 |
 
-**C1** Schema v6: Spalte `rfc822_message_id` + Index, Migration v5→v6 als
-In-place-`ALTER`. Reine Datenhaltung, ändert kein Verhalten — schafft nur die
-Voraussetzung.
+**C1** schema v6: an `rfc822_message_id` column plus index, migration v5→v6 as
+an in-place `ALTER`. Pure storage, no behaviour change — but the prerequisite
+for the rest.
 
-**C2** Alle Lesewege geben den Header aus: `search()` (FTS und Anhänge), `get_emails()`
-(Envelope-Schnellpfad per gebündeltem `get_rfc822_ids()`, JXA-Pfade über `messageId` im
-Standard-Property-Set), `get_email()`. **Nützt für sich allein**, auch ohne jedes
-Schreib-Tool: ein Client, der eine Mail über einen Aufruf hinaus festhalten will, hat
-bisher nur eine ROWID, die beim nächsten Verschieben tot ist. Enthält die Härtung von
-`MailCore.batchFetch` — eine verweigerte Property wird mit `null` aufgefüllt statt die
-ganze Auflistung mitzureißen; wirft weiterhin, wenn **gar nichts** lesbar war, denn
-eine unlesbare Mailbox darf nie als „0 Mails" durchgehen.
+**C2** every read path hands out the header: `search()` (full text and
+attachments), `get_emails()` (Envelope fast path via one batched
+`get_rfc822_ids()` lookup, JXA paths via `messageId` in the standard property
+set), `get_email()`. **Useful on its own, with no write tools at all:** a client
+holding on to a message between calls currently has only a ROWID, which dies on
+the next move. Includes hardening `MailCore.batchFetch`: a property Mail refuses
+is padded with nulls rather than taking the whole listing down, while a fetch
+where *nothing* was readable still raises — an unreadable mailbox must never
+read as "0 messages".
 
-**C3** `set_flag(ids, color?)` mit allen sieben Apple-Farben (`msg.flagIndex`: rot 0 …
-grau 6) und `set_read_status(ids, read?)`. Einzeln oder Batch (max. 500), Rückgabe in
-Eimern `{updated, unchanged, not_found, skipped_hidden}` — **ein Batch scheitert nie als
-Ganzes**. `applyToMessage()` verifiziert `msg.id() === targetId` vor dem Schreiben;
-No-Ops werden übersprungen; aufgelöste und gescannte Gruppen laufen in getrennten
-`osascript`-Aufrufen; ausgeschlossene Konten (#90) gehen nie an JXA. Ein
-Regressionstest erzwingt das Read-only-Gate für jeden künftigen
-`set_`/`flag_`/`mark_`-Tool-Namen.
-*Aufhänger: euer `APPLE_MAIL_READ_ONLY` aus #80 bewacht damit endlich etwas.*
+**C3** `set_flag(ids, color?)` with all seven Apple colours (`msg.flagIndex`:
+red 0 … gray 6) and `set_read_status(ids, read?)`. Single or batch (max 500),
+returning per-reference buckets `{updated, unchanged, not_found,
+skipped_hidden}` — **a batch never fails as a whole**. `applyToMessage()`
+verifies `msg.id() === targetId` before writing; no-ops are skipped; located
+and scanned groups run in separate `osascript` calls so a slow scan cannot
+discard the fast writes; excluded accounts (#90) never reach JXA. A regression
+test enforces the read-only gate for any future `set_`/`flag_`/`mark_` tool.
+*Hook: your `APPLE_MAIL_READ_ONLY` from #80 finally has something to guard.*
 
-**C4** Die Tools nehmen den Header als Referenz an. **Kein Header wird je in eine ROWID
-zurückübersetzt und dann geglaubt** — beim Schreiben wählt der Index nur Konto und
-Scan-Reihenfolge, verglichen wird in JXA gegen `msg.messageId()`; beim Lesen wird jeder
-Fundort geholt und der Header geprüft, bei Abweichung der nächste versucht, am Ende ein
-Fehler statt fremder Post.
+**C4** the tools accept the header as a reference. **A header is never
+translated back into a ROWID and then trusted** — writing matches
+`msg.messageId()` in JXA, reading fetches each candidate and verifies the
+header on what came back, moving to the next on a mismatch and raising rather
+than returning a stranger's mail.
 
 ---
 
-# Vorgehen
+# Sequencing
 
-Nicht alle 17 auf einmal aufmachen — das ist für einen einzelnen Maintainer eine Lawine
-und erreicht das Gegenteil von „detailliert entscheiden können".
+Do not open all 17 at once — for a single maintainer that is an avalanche, and
+it achieves the opposite of "decide in detail".
 
-1. **Erste Welle: A1, A3, A4.** Drei kleine, risikoarme Fehlerbehebungen, in Minuten
-   prüfbar. Zeigt, dass wir das Projekt verstanden haben und sauber arbeiten.
-2. **Zweite Welle nach erstem Feedback: A2, A5–A8.** Der `manager.py`-Stapel, mit
-   Hinweis auf ihr offenes #106.
-3. **Dann ein Sammel-Issue** („Fork von X: was wir gebaut haben und in welchen Stücken
-   wir es anbieten") mit der Tabelle aus diesem Dokument. Der Maintainer sagt, was er
-   sehen will — PRs aus Track B und C entstehen erst danach.
+1. **First wave: A1, A3, A4.** Three small, low-risk fixes, reviewable in
+   minutes.
+2. **Second wave after the first feedback: A2, A5–A8** — the `manager.py` stack,
+   pointing at their open #106.
+3. **Then an umbrella issue** carrying the table above. The maintainer says what
+   they want to see; tracks B and C become PRs only after that.
 
-# Vorarbeiten vor dem ersten Diff
+# Preparation before the first diff
 
-1. **Tests umverteilen.** Alles Neue liegt in `tests/test_write_ops.py` (3059 Zeilen),
-   benannt nach unserem Branch. Upstream erwartet Tests bei ihrem Code: `test_disk.py`,
-   `test_manager.py`, `test_server.py`, `test_sync.py`, `test_watcher.py`,
-   `test_config.py`.
-2. **Branches vom Endzustand neu schneiden, nicht cherry-picken.** Unsere Historie
-   verschränkt Themen (mehrere „fix: N defects found by review" korrigieren jeweils
-   Früheres). Jeder Branch entsteht von `upstream/main` aus mit dem Endzustand der
-   betroffenen Stellen.
-3. **Fork-Spezifika ausbauen** (Tabelle oben).
-4. **CLAUDE.md anteilig aufteilen** — unsere Fassung ist um 104 Zeilen gewachsen; jeder
-   PR bringt seinen Doku-Anteil mit, statt am Ende einen Doku-Klotz.
+1. **Redistribute the tests.** Everything new sits in `tests/test_write_ops.py`,
+   named after our branch. Upstream expects tests next to their code:
+   `test_disk.py`, `test_manager.py`, `test_server.py`, `test_sync.py`,
+   `test_watcher.py`, `test_config.py`.
+2. **Cut branches from the end state, do not cherry-pick.** Our history
+   interleaves topics (several "fix: N defects found by review" commits each
+   correct earlier ones).
+3. **Strip the fork-specific pieces** (table above).
+4. **Split CLAUDE.md proportionally** — each PR carries its own share of the
+   documentation instead of one lump at the end.
 
-# Freigabe
+# Release gate
 
-Nichts geht Richtung `imdinu`, bevor Christian es ausdrücklich freigibt — weder PR noch
-Issue noch Push.
+Nothing goes towards `imdinu` before Christian explicitly approves it — no PR,
+no issue, no push.
