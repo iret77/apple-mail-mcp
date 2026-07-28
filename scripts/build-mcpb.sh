@@ -24,6 +24,22 @@ VERSION="$(node -p "require('$REPO/mcpb/manifest.json').version")"
 OUT="${1:-$REPO/dist/apple-mail-mcp-$VERSION.mcpb}"
 mkdir -p "$(dirname "$OUT")"
 
+# Pre-flight. Twice in one day a bundle was built from a tree whose
+# tests could not even be collected — once with merge markers still in
+# a test file. Care did not catch it; this does. Set MCPB_SKIP_CHECKS=1
+# only when you know exactly why.
+if [ "${MCPB_SKIP_CHECKS:-0}" != "1" ]; then
+  if grep -rlE '^(<<<<<<<|>>>>>>>) ' "$REPO/src" "$REPO/tests" 2>/dev/null | head -1 | grep -q .; then
+    echo "[build] REFUSED: merge conflict markers in src/ or tests/" >&2
+    exit 1
+  fi
+  echo "[build] running checks..."
+  uv run ruff check "$REPO/src" >/dev/null || { echo "[build] REFUSED: lint" >&2; exit 1; }
+  uv run ruff format --check "$REPO/src" >/dev/null || { echo "[build] REFUSED: format" >&2; exit 1; }
+  uv run pytest -q >/dev/null 2>&1 || { echo "[build] REFUSED: tests fail" >&2; exit 1; }
+  echo "[build] checks passed"
+fi
+
 if command -v mcpb >/dev/null 2>&1; then
   MCPB=(mcpb)
 else

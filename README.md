@@ -107,17 +107,56 @@ for the full schema and precedence rules.
 |------|---------|
 | `list_accounts()` | List email accounts |
 | `list_mailboxes(account?)` | List mailboxes |
-| `get_emails(filter?, limit?)` | Get emails — all, unread, flagged, today, last_7_days |
-| `get_email(message_id)` | Get single email with full content, attachments, and its current account/mailbox |
+| `get_emails(filter?, account?, limit?)` | Get emails — all, unread, flagged, today, last_7_days. `account="all"` lists across **every** visible account in one call |
+| `get_email(ref)` | Get an email with full content, attachments, flag colour, and its current account/mailbox. Takes a **list** (max 50) to fetch a whole page in one round-trip |
 | — | *Every tool above takes either the numeric id or the RFC822 `Message-ID` header. Prefer the header: the numeric id is a per-mailbox ROWID and stops resolving as soon as another device files the mail elsewhere.* |
 | `search(query, scope?, before?, after?, highlight?)` | Search — all, subject, sender, body, attachments |
 | `get_email_links(message_id)` | Extract links from an email |
 | `get_email_attachment(message_id, filename)` | Extract attachment content |
 | `get_attachment(message_id, filename)` | *Deprecated* — use `get_email_attachment()` |
-| `set_flag(message_ids, color?)` | **Write** — flag/unflag one email or a batch, optionally by color (red, orange, yellow, green, blue, purple, gray) |
-| `set_read_status(message_ids, read?)` | **Write** — mark one email or a batch read (seen) or unread (unseen) |
+| `set_flag(refs, color?)` | **Write** — flag/unflag one email or a batch (max 500), optionally by color (red, orange, yellow, green, blue, purple, gray) |
+| `set_read_status(refs, read?)` | **Write** — mark one email or a batch read (seen) or unread (unseen) |
 | `get_index_status()` | Index health and setup diagnostics — build state, progress, and whether Full Disk Access is missing |
 | `refresh_index(full?)` | Update the index on demand — the index otherwise syncs only at server start |
+
+### Fewer round-trips
+
+Two things make surveys and triage cheap, because the cost of reading
+mail here is the round-trip, not the read — a single message comes off
+disk in 1-5 ms:
+
+- **`get_emails(account="all")`** answers across every account at once.
+  Without it you need one call per account, and you have to know their
+  names first.
+- **`get_email([ref, ref, ...])`** fetches up to 50 messages in one
+  call. The result is one entry per reference, in order, each either
+  `{"ref", "email"}` or `{"ref", "error"}` — one unreadable message
+  never sinks the batch. The cap is about how much text fits in a
+  model's context, not about speed.
+- **Listings already carry `flag_color`** for flagged messages,
+  resolved for the whole page in one call. Reading a colour scheme back
+  needs no per-message follow-up.
+
+A survey that used to take 58 tool calls now takes one.
+
+### Flag colours carry no meaning
+
+`set_flag` writes Apple Mail's seven colours and nothing more. This
+server attaches **no** semantics to any of them — red as urgent, red as
+read-later, red as one particular client are all equally valid, and
+which one applies is the user's own convention. It belongs wherever
+they keep their instructions, not in this tool. A model that does not
+know what a colour means here is told to ask rather than invent a
+scheme.
+
+### An incomplete search is never reported as absence
+
+A message is reported missing only when the search actually covered
+everywhere it could be. A mailbox cap, a mailbox Mail refused to read,
+a skipped trash folder, a timeout, a denied Automation permission — all
+of these leave the question open, and the result says so instead of
+implying the mail is gone. Write results carry a `diagnostics` block
+naming what was searched and what was not.
 
 ### Write operations
 
