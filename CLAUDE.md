@@ -102,6 +102,20 @@ as well. The RFC822 `Message-ID` header survives that. Therefore:
     (`WriteBuilder.applyByHeader`), so a stale row can misdirect the
     scan but can never write the wrong message. Header groups run in
     their own `osascript` call and are echoed back as headers.
+  - **The index orders the search; it never limits it.** A header is
+    looked for in the account the index points at FIRST, then in every
+    other visible account. A row says where the message *was*: it can
+    be stale, and a miss there used to end the search in silence while
+    the message sat one account over. Group order is insertion order —
+    sorting the groups by name once threw that priority away.
+  - **A header the index cannot place searches EVERY visible account**,
+    not just the default one. That case is not exotic: it is every
+    message that arrived after the last sync. Measured — in one mailbox
+    the 2013 message flagged fine while the newest one (27 min past the
+    last sync) came back `not_found`. The JXA script retires a header
+    globally (`settled`) the moment it lands, so fanning out never
+    writes two copies and never reports a miss another account already
+    settled.
   - Reads: `_get_email_by_header()` / `_resolve_emlx_path_by_header()`
     fetch each candidate the index offers and **verify** the header on
     what came back, moving to the next candidate on a mismatch and
@@ -128,6 +142,39 @@ as well. The RFC822 `Message-ID` header survives that. Therefore:
   refuses is padded with nulls instead of taking the whole listing
   down. It still raises when *no* property could be read, so an
   unreadable mailbox never reads as "0 messages".
+
+## Well-known mailboxes: resolve by role, never by name
+
+A mailbox name is the weakest handle in this codebase. It changes with
+the system language (`Posteingang`), with the macOS version (Apple's own
+docs still say `Eingang`), and with the provider (`Deleted Items`,
+`[Gmail]/Sent Mail`, `INBOX.Trash`). Defaulting to the string `INBOX`
+therefore failed outright on a German install.
+
+`MailCore.getMailbox()` resolves in this order, most reliable first:
+
+1. **Exact name** — cheap, and right when it hits.
+2. **Mail's own notion of the role** — `specialMailbox()` probes
+   `sentMailbox` / `draftsMailbox` / `trashMailbox` / `junkMailbox` on
+   the account and then the application. Language- and
+   provider-independent where the property exists; the probe never
+   throws, it returns null and the chain continues.
+3. **Normalized match** — `normalizeMailboxName()` lowercases and drops
+   provider hierarchy (`[Gmail]/…`, a leading `INBOX.`), then compares
+   the last path segment. This is what makes `INBOX.Sent` answer a
+   request for `Sent`.
+4. **The role table** (`MAILBOX_ROLES`) — localized and legacy names.
+   **Every entry is sourced from Apple's localized Mail user guide or is
+   a documented provider/legacy name.** Do not add a translation you
+   have not verified: a wrong name here is worse than a missing one,
+   because it can match somebody's real folder.
+5. **Fail loudly** — the error names the role and lists the mailboxes
+   that actually exist, so the caller can act on it.
+
+`isDiscardMailbox()` (trash or junk) rides on the same role logic, so
+the rule "a recovered write never lands in a discard mailbox" holds on
+a German, Japanese or Exchange account too — the write builder no
+longer keeps a word list of its own.
 
 ## MCP Resources (1 total)
 

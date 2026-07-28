@@ -35,6 +35,27 @@ Add to your MCP client:
 }
 ```
 
+**Claude Desktop / Cowork:** a double-click `.mcpb` bundle is available —
+see [`mcpb/README.md`](mcpb/README.md). Build it with
+`./scripts/build-mcpb.sh`.
+
+### Three things worth knowing before you start
+
+1. **The first start builds a search index in the background.** It takes
+   minutes on a large mailbox and shows nothing while it runs. That is
+   normal, not a hang — the server answers the whole time.
+2. **It needs Full Disk Access, granted to the app that launches it** —
+   Claude Desktop, not this package, and not your terminal. That single
+   point is the most common reason nothing gets indexed.
+3. **When anything looks wrong, ask your assistant for the index
+   status** rather than digging yourself. It reports the running build,
+   what the index is doing, whether `~/Library/Mail` is readable, and
+   what to do next — in plain language, and that report is what makes a
+   bug report useful:
+
+   > Ask the Apple Mail integration for its index status and show me the
+   > result.
+
 ### Permissions: who needs Full Disk Access?
 
 Building the index reads `~/Library/Mail`, which macOS protects. TCC
@@ -88,6 +109,7 @@ for the full schema and precedence rules.
 | `list_mailboxes(account?)` | List mailboxes |
 | `get_emails(filter?, limit?)` | Get emails — all, unread, flagged, today, last_7_days |
 | `get_email(message_id)` | Get single email with full content, attachments, and its current account/mailbox |
+| — | *Every tool above takes either the numeric id or the RFC822 `Message-ID` header. Prefer the header: the numeric id is a per-mailbox ROWID and stops resolving as soon as another device files the mail elsewhere.* |
 | `search(query, scope?, before?, after?, highlight?)` | Search — all, subject, sender, body, attachments |
 | `get_email_links(message_id)` | Extract links from an email |
 | `get_email_attachment(message_id, filename)` | Extract attachment content |

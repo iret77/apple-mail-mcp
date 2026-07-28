@@ -1307,11 +1307,26 @@ class IndexManager:
         if bare.startswith("<") and bare.endswith(">"):
             bare = bare[1:-1]
         conn = self._get_conn()
+        sql = "SELECT account, mailbox, message_id FROM emails WHERE "
+        order = " ORDER BY indexed_at DESC"
+        # Fast path: an exact hit on the indexed column.
         rows = conn.execute(
-            "SELECT account, mailbox, message_id FROM emails "
-            "WHERE rfc822_message_id IN (?, ?) ORDER BY indexed_at DESC",
+            sql + "rfc822_message_id IN (?, ?)" + order,
             (f"<{bare}>", bare),
         ).fetchall()
+        if not rows:
+            # Nothing matched, so the stored value carries something the
+            # two canonical forms do not — stray whitespace, a folded
+            # header, a stray bracket. Strict comparison here fails
+            # silently and the caller then searches the wrong account,
+            # so fall back to a normalized scan. Costs a table scan,
+            # which only happens when the fast path already missed.
+            # trim() alone drops spaces but NOT tabs or newlines, and a
+            # folded header brings exactly those.
+            norm = "rfc822_message_id"
+            for ch in ("char(10)", "char(13)", "char(9)", "' '", "'<'", "'>'"):
+                norm = f"replace({norm}, {ch}, '')"
+            rows = conn.execute(sql + norm + " = ?" + order, (bare,)).fetchall()
         return [(r["account"], r["mailbox"], r["message_id"]) for r in rows]
 
     def find_email_path(

@@ -1876,15 +1876,20 @@ class TestReviewFindings:
         )
 
     def test_recovery_never_writes_into_trash_or_junk(self):
+        """Still true — but decided by role, so it survives a locale.
+
+        The script used to carry its own lowercase word list, which
+        held only for English installs. See
+        TestWellKnownMailboxesResolveByRole for the matrix.
+        """
         from apple_mail_mcp.builders import WriteBuilder
 
         script = WriteBuilder.set_flag(
             [{"account": "W", "headers": ["<a@b>"], "by_header": True}],
             flagged=True,
         ).build()
-        assert "DISCARD_MAILBOXES" in script
-        for name in ("trash", "junk", "deleted messages", "spam"):
-            assert f'"{name}"' in script
+        assert "MailCore.isDiscardMailbox(nm)" in script
+        assert "isDiscard && !isPreferred" in script
 
     def test_header_is_retired_only_after_a_successful_apply(self):
         """Retiring on match meant a failed apply consumed the header
@@ -3133,10 +3138,10 @@ class TestFailedWritesAreNotReportedAsNotFound:
 class TestJunkIsAWritableLocation:
     """A message that lives in Junk is a legitimate target.
 
-    The discard-mailbox skip exists so a *recovered* write never lands on
-    the Trash copy of a message that was re-filed. Applying it
-    unconditionally made "flag this junk mail" impossible — exactly what
-    the triage task tried first.
+    The discard rule exists so a *recovered* write never lands on the
+    Trash copy of a message that was re-filed. Applying it
+    unconditionally made "flag this junk mail" impossible — exactly
+    what the triage task tried first.
     """
 
     def _script(self, prefer):
@@ -3160,11 +3165,11 @@ class TestJunkIsAWritableLocation:
         assert "isDiscard && !isPreferred" in js
         assert '"prefer_mailboxes": ["Junk"]' in js
 
-    def test_discard_mailbox_is_still_skipped_when_not_expected(self):
-        """Recovery must not flag the Trash copy of a re-filed message."""
+    def test_discard_is_decided_by_role_not_by_a_local_word_list(self):
+        """Duplicating the names here would rot on the first locale."""
         js = self._script(["Archiv"])
-        assert "isDiscard && !isPreferred" in js
-        assert "DISCARD_MAILBOXES" in js
+        assert "MailCore.isDiscardMailbox(nm)" in js
+        assert "DISCARD_MAILBOXES" not in js
 
 
 class TestJxaFailuresCarryTheirReason:
@@ -3308,53 +3313,74 @@ class TestAngleBracketsDoNotBreakIdentity:
         # Raw comparisons must be gone.
         assert "headers.indexOf(target)" not in js
 
-    def test_index_lookup_matches_either_form(self, tmp_path):
+    def test_index_lookup_matches_either_form(self):
+        """Brackets, and any stray whitespace a folded header brings.
+
+        A strict comparison here fails silently and the caller then
+        searches the wrong account — the failure mode that cost a full
+        debugging session.
+        """
+        import os
         import sqlite3
+        import tempfile
 
         from apple_mail_mcp.index.manager import IndexManager
 
-        calls = {}
-
-        class FakeConn:
-            def execute(self, sql, params):
-                calls["sql"] = sql
-                calls["params"] = params
-                return FakeCur()
-
-        class FakeCur:
-            def fetchall(self):
-                return []
+        path = tempfile.mktemp(suffix=".db")
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE emails (account TEXT, mailbox TEXT, "
+            "message_id INT, rfc822_message_id TEXT, indexed_at TEXT)"
+        )
+        stored_forms = [
+            "<a@x.com>",  # as the .emlx header carries it
+            "b@x.com",  # as Apple Mail reports it
+            " <c@x.com>\n",  # folded / padded
+            "\t<d@x.com>\r\n",
+        ]
+        for i, stored in enumerate(stored_forms):
+            conn.execute(
+                "INSERT INTO emails VALUES ('U','Posteingang',?,?,'2026')",
+                (i, stored),
+            )
+        conn.commit()
 
         mgr = IndexManager.__new__(IndexManager)
-        mgr._get_conn = lambda: FakeConn()  # type: ignore[assignment]
+        mgr._get_conn = lambda: conn  # type: ignore[assignment]
+        try:
+            for i, stored in enumerate(stored_forms):
+                bare = stored.strip().strip("<>").strip()
+                for probe in (bare, f"<{bare}>"):
+                    found = mgr.find_by_rfc822(probe)
+                    assert found, f"{probe!r} missed stored {stored!r}"
+                    assert found[0][2] == i
+        finally:
+            conn.close()
+            os.unlink(path)
 
-        mgr.find_by_rfc822("a@b.com")
-        assert calls["params"] == ("<a@b.com>", "a@b.com")
 
-        mgr.find_by_rfc822("<a@b.com>")
-        assert calls["params"] == ("<a@b.com>", "a@b.com")
-        assert "IN (?, ?)" in calls["sql"]
-        del sqlite3
+class TestWellKnownMailboxesResolveByRole:
+    """A mailbox name is the weakest possible handle.
 
-
-class TestLocalizedMailboxNames:
-    """Mail.app names its mailboxes in the system language.
-
-    A German install has no "INBOX" — it has "Posteingang". The default
-    mailbox therefore did not resolve at all, and every JXA path failed
-    with a bare -1728. Same class of defect as the angle brackets: a
-    silent assumption about a name.
+    It changes with the system language ("Posteingang"), with the macOS
+    version ("Eingang" in Apple's own docs), and with the provider
+    ("Deleted Items", "[Gmail]/Sent Mail", "INBOX.Trash"). Resolution
+    therefore goes by role, with the name table as the last stage —
+    every entry in it taken from Apple's localized Mail user guide, not
+    from a translation of our own.
     """
 
-    def _resolve(self, names, want):
+    def _mailcore_call(self, expr, names=None):
         import re
         import subprocess
         from pathlib import Path
 
         src = Path("src/apple_mail_mcp/jxa/mail_core.js").read_text()
         body = re.search(r"const MailCore = (\{[\s\S]*?\n\});", src).group(1)
-        js = f"""
-const MailCore = {body};
+        setup = ""
+        if names is not None:
+            setup = f"""
 const names = {names!r};
 const mailboxes = {{}};
 Object.defineProperty(mailboxes, 'name', {{ value: () => names }});
@@ -3362,27 +3388,390 @@ mailboxes.byName = (n) => {{
     if (names.includes(n)) return {{ name: () => n }};
     throw new Error('-1728');
 }};
-console.log(MailCore.getMailbox({{ mailboxes }}, {want!r}).name());
-""".replace("'", '"')
+const account = {{ mailboxes }};
+"""
+        js = f"var Mail = {{}};\nconst MailCore = {body};\n{setup}\n{expr}"
         out = subprocess.run(["node", "-e", js], capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
         return out.stdout.strip()
 
-    def test_german_inbox_resolves(self):
-        names = ["Posteingang", "Gesendet", "Papierkorb", "Werbung"]
-        assert self._resolve(names, "INBOX") == "Posteingang"
+    def _resolve(self, names, want):
+        return self._mailcore_call(
+            f"try {{ console.log(MailCore.getMailbox(account, {want!r}).name()); }}"
+            f" catch (e) {{ console.log('MISSING'); }}",
+            names=names,
+        )
 
-    def test_german_junk_and_trash_resolve(self):
-        names = ["Posteingang", "Papierkorb", "Werbung"]
-        assert self._resolve(names, "Junk") == "Werbung"
-        assert self._resolve(names, "Trash") == "Papierkorb"
+    @pytest.mark.parametrize(
+        "label,names,want,expected",
+        [
+            # Language: Apple's own localized guide names.
+            (
+                "de",
+                ["Posteingang", "Gesendet", "Papierkorb"],
+                "INBOX",
+                "Posteingang",
+            ),
+            ("de-old", ["Eingang", "Gesendet"], "INBOX", "Eingang"),
+            ("fr", ["Boîte de réception", "Corbeille"], "Trash", "Corbeille"),
+            ("ja", ["受信", "ゴミ箱", "迷惑メール"], "Junk", "迷惑メール"),
+            ("pl", ["Przychodzące", "Kosz"], "INBOX", "Przychodzące"),
+            ("ru", ["Входящие", "Корзина"], "Trash", "Корзина"),
+            # Provider: hierarchy and vocabulary, not language.
+            (
+                "exchange",
+                ["Inbox", "Sent Items", "Deleted Items", "Junk Email"],
+                "Trash",
+                "Deleted Items",
+            ),
+            (
+                "gmail",
+                ["INBOX", "[Gmail]/Sent Mail", "[Gmail]/Trash"],
+                "Sent",
+                "[Gmail]/Sent Mail",
+            ),
+            (
+                "dovecot",
+                ["INBOX", "INBOX.Sent", "INBOX.Trash"],
+                "Trash",
+                "INBOX.Trash",
+            ),
+            # Older macOS wording.
+            (
+                "legacy",
+                ["INBOX", "Sent Messages", "Deleted Messages"],
+                "Sent",
+                "Sent Messages",
+            ),
+        ],
+    )
+    def test_resolution(self, label, names, want, expected):
+        assert self._resolve(names, want) == expected
 
-    def test_discard_list_covers_localized_names(self):
+    def test_missing_mailbox_names_what_is_there(self):
+        """A failure the caller can act on beats a bare -1728."""
+        out = self._mailcore_call(
+            "try { MailCore.getMailbox(account, 'Junk'); }"
+            " catch (e) { console.log(String(e.message)); }",
+            names=["Posteingang", "Gesendet"],
+        )
+        assert "Available: Posteingang, Gesendet" in out
+        assert "role: junk" in out
+
+    @pytest.mark.parametrize(
+        "name,discard",
+        [
+            ("Papierkorb", True),
+            ("[Gmail]/Spam", True),
+            ("INBOX.Trash", True),
+            ("Deleted Items", True),
+            ("迷惑メール", True),
+            ("Posteingang", False),
+            ("Archiv", False),
+            ("Projekte/Rechnungen", False),
+        ],
+    )
+    def test_discard_detection(self, name, discard):
+        got = self._mailcore_call(
+            f"console.log(MailCore.isDiscardMailbox({name!r}));"
+        )
+        assert got == ("true" if discard else "false")
+
+
+class TestUnsupportedLanguageDegradesUsefully:
+    """A language we do not cover must not be a dead end.
+
+    Nothing crashes: reads and search run off the index and never touch
+    a mailbox name, writes report the failure with a reason, and a JXA
+    listing says which mailboxes the account actually has — which is
+    all a caller needs to retry correctly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_listing_names_the_real_mailboxes(self):
+        async def turkish(*a, **kw):
+            raise RuntimeError(
+                'No mailbox matching "INBOX" (role: inbox). '
+                "Available: Gelen Kutusu, Gönderilmiş, Çöp Kutusu"
+            )
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_query_async",
+                side_effect=turkish,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="Work"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            with pytest.raises(ValueError) as err:
+                await get_emails()
+
+        text = str(err.value)
+        assert "Gelen Kutusu" in text  # the actual names are handed over
+        assert "list_mailboxes" in text  # and a way to act on them
+        assert "system language" in text
+
+    @pytest.mark.asyncio
+    async def test_write_reports_it_as_failed_not_as_missing_mail(self):
+        mgr = _mock_index(location=("uuid-work", "INBOX"))
+        amap = _mock_acct_map()
+
+        async def jxa(script, **kw):
+            return {
+                "updated": [],
+                "unchanged": [],
+                "not_found": [],
+                "failures": [
+                    {
+                        "target": 5,
+                        "reason": (
+                            "cannot open mailbox INBOX in account Work "
+                            "(No mailbox matching)"
+                        ),
+                    }
+                ],
+            }
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=jxa,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            result = await set_flag(5, color="red")
+
+        assert result["failed"] == [5]
+        assert result["not_found"] == []
+        assert "Message-ID" in result["hint"]  # the name-free route
+
+
+class TestFlagColourIsReadable:
+    """Writing a colour you cannot read back is a one-way door.
+
+    Reported from a live triage run: ~99 existing flags could not be
+    migrated because the API exposed only flagged yes/no. Re-flagging
+    blind would have destroyed the very scheme it was meant to
+    preserve, so the run correctly refused to touch them.
+    """
+
+    def _flag_color_name(self, value):
+        import json
+        import re
+        import subprocess
+        from pathlib import Path
+
+        src = Path("src/apple_mail_mcp/jxa/mail_core.js").read_text()
+        body = re.search(r"const MailCore = (\{[\s\S]*?\n\});", src).group(1)
+        js = (
+            f"var Mail = {{}};\nconst MailCore = {body};\n"
+            f"console.log(JSON.stringify("
+            f"MailCore.flagColorName({json.dumps(value)})));"
+        )
+        out = subprocess.run(["node", "-e", js], capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout.strip())
+
+    @pytest.mark.parametrize(
+        "index,expected",
+        [
+            (0, "red"),
+            (1, "orange"),
+            (2, "yellow"),
+            (3, "green"),
+            (4, "blue"),
+            (5, "purple"),
+            (6, "gray"),
+            (-1, None),  # Apple's value for "not flagged"
+            (7, None),  # out of range — never invent a colour
+            (None, None),
+            ("", None),
+        ],
+    )
+    def test_index_maps_to_a_colour_name(self, index, expected):
+        assert self._flag_color_name(index) == expected
+
+    def test_null_is_not_coerced_to_red(self):
+        """Number(null) is 0. Coercing would flag an unflagged mail."""
+        assert self._flag_color_name(None) is None
+
+    def test_colour_names_round_trip_with_the_write_side(self):
+        from apple_mail_mcp.builders import FLAG_COLOR_INDEX
+
+        for name, index in FLAG_COLOR_INDEX.items():
+            assert self._flag_color_name(index) == name
+
+    def test_listings_fetch_the_colour(self):
+        from apple_mail_mcp.builders import PROPERTY_SETS, QueryBuilder
+
+        assert "flag_color" in PROPERTY_SETS["standard"]
+        script = QueryBuilder().from_mailbox("W", "INBOX").build()
+        assert "flagIndex" in script
+        assert "MailCore.flagColorName(data.flagIndex[i])" in script
+
+
+class TestUnindexedHeaderSearchesEveryAccount:
+    """A message that arrived after the last sync must still be writable.
+
+    Measured live: in one mailbox the OLDEST message (2013) flagged
+    fine while the NEWEST (27 minutes after the last sync) came back
+    not_found. The index could not place it, and the code then searched
+    exactly one account — the default. Anything living elsewhere was
+    unreachable, and said so as a mute "not found".
+    """
+
+    @pytest.mark.asyncio
+    async def test_all_visible_accounts_are_searched(self):
+        mgr = _mock_index(location=None)
+        mgr.find_by_rfc822.return_value = []  # not indexed yet
+        amap = _mock_acct_map()
+        amap.get_cached_accounts.return_value = [
+            {"name": "byte5"},
+            {"name": "Privat"},
+            {"name": "Verein"},
+        ]
+        captured = {}
+
+        async def fake_exec(script, **kw):
+            captured["script"] = script
+            return {"updated": ["<new@x.com>"], "not_found": []}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            result = await set_flag("<new@x.com>", color="green")
+
+        assert result["updated"] == ["<new@x.com>"]
+        for name in ("byte5", "Privat", "Verein"):
+            assert f'"account": "{name}"' in captured["script"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_account_is_still_honoured(self):
+        """Pinning an account must not fan out to the others."""
+        mgr = _mock_index(location=None)
+        mgr.find_by_rfc822.return_value = []
+        amap = _mock_acct_map()
+        amap.get_cached_accounts.return_value = [
+            {"name": "byte5"},
+            {"name": "Privat"},
+        ]
+        captured = {}
+
+        async def fake_exec(script, **kw):
+            captured["script"] = script
+            return {"updated": ["<a@x.com>"], "not_found": []}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="byte5"),
+            ),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            await set_flag("<a@x.com>", color="green", account="byte5")
+
+        assert '"account": "byte5"' in captured["script"]
+        assert '"Privat"' not in captured["script"]
+
+    def test_a_header_is_written_once_across_accounts(self):
+        """Fanning out must not flag two copies or invent a miss."""
         from apple_mail_mcp.builders import WriteBuilder
 
         js = WriteBuilder(
-            groups=[{"account": "W", "headers": ["<a@b>"], "by_header": True}],
+            groups=[
+                {"account": "A", "headers": ["<x@y>"], "by_header": True},
+                {"account": "B", "headers": ["<x@y>"], "by_header": True},
+            ],
             apply_js="msg.flaggedStatus = true;",
             needs_change_js="msg.flaggedStatus() === true",
         ).build()
-        for name in ("papierkorb", "werbung", "corbeille", "cestino"):
-            assert name in js
+
+        assert "const settled = new Set();" in js
+        assert "settled.add(String(target));" in js
+        # A miss in one account must not survive a hit in another.
+        assert "notFound.filter((t) => !settled.has(String(t)))" in js
+
+
+class TestIndexOrdersTheSearchButNeverLimitsIt:
+    """A stale index row must not end the search in silence.
+
+    Measured: the index placed a message in account byte5 / Posteingang
+    and Apple Mail agreed it was there — yet set_flag reported
+    not_found. Whatever the index says, it is at best where the message
+    WAS. It now decides the ORDER of the search; the other visible
+    accounts follow, and cost nothing once the header has been settled.
+    """
+
+    @pytest.mark.asyncio
+    async def test_indexed_account_comes_first_others_follow(self):
+        mgr = _mock_index(location=None)
+        mgr.find_by_rfc822.return_value = [("uuid-byte5", "Posteingang", 1)]
+        amap = _mock_acct_map(uuid_to_name="byte5")
+        amap.get_cached_accounts.return_value = [
+            {"name": "iCloud"},
+            {"name": "byte5"},
+            {"name": "freenea"},
+        ]
+        captured = {}
+
+        async def fake_exec(script, **kw):
+            captured["script"] = script
+            return {"updated": ["<a@x.com>"], "not_found": []}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            await set_flag("<a@x.com>", color="green")
+
+        script = captured["script"]
+        order = [
+            script.index(f'"account": "{n}"')
+            for n in ("byte5", "iCloud", "freenea")
+        ]
+        assert order[0] < order[1] < order[2]  # index hint leads
+        assert '"prefer_mailboxes": ["Posteingang"]' in script
+
+    def test_a_settled_header_skips_the_remaining_accounts(self):
+        """Broader search must stay free when the first account hits."""
+        from apple_mail_mcp.builders import WriteBuilder
+
+        js = WriteBuilder(
+            groups=[
+                {"account": "A", "headers": ["<x@y>"], "by_header": True},
+                {"account": "B", "headers": ["<x@y>"], "by_header": True},
+            ],
+            apply_js="msg.flaggedStatus = true;",
+            needs_change_js="msg.flaggedStatus() === true",
+        ).build()
+        assert "if (remaining.size === 0) continue;" in js
