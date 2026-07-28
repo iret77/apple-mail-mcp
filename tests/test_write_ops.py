@@ -3775,8 +3775,6 @@ class TestIndexOrdersTheSearchButNeverLimitsIt:
             needs_change_js="msg.flaggedStatus() === true",
         ).build()
         assert "if (remaining.size === 0) continue;" in js
-<<<<<<< HEAD
-=======
 
 
 class TestJsonEncodedListParameter:
@@ -3848,4 +3846,3 @@ class TestJsonEncodedListParameter:
 
         assert result["updated"] == [header]
         assert '\\"' not in captured["script"]  # no JSON text as an id
->>>>>>> feat/write-ops-flag-read
