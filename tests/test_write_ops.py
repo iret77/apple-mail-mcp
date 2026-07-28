@@ -3775,3 +3775,74 @@ class TestIndexOrdersTheSearchButNeverLimitsIt:
             needs_change_js="msg.flaggedStatus() === true",
         ).build()
         assert "if (remaining.size === 0) continue;" in js
+
+
+class TestJsonEncodedListParameter:
+    """`'["<a@b>"]'` is a list the client stringified, not a Message-ID.
+
+    Observed live on 0.13.1: set_flag returned not_found for a message
+    Apple Mail demonstrably had, and the echoed reference was the whole
+    JSON array as one string. Widening the parameter from int to str is
+    what made this possible — an int parameter rejected such input
+    loudly, while a str parameter accepts any nonsense as an identifier
+    and then reports a mute miss for a message sitting right there.
+    """
+
+    def test_stringified_list_is_unwrapped(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids('["<a@b.com>"]') == ["<a@b.com>"]
+        assert _normalize_message_ids('["<a@b>", "<c@d>"]') == [
+            "<a@b>",
+            "<c@d>",
+        ]
+        assert _normalize_message_ids("[123, 456]") == [123, 456]
+
+    def test_stray_quotes_are_stripped(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids('"<a@b.com>"') == ["<a@b.com>"]
+
+    def test_empty_stringified_list_is_refused(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        with pytest.raises(ValueError, match="empty"):
+            _normalize_message_ids("[]")
+
+    @pytest.mark.parametrize(
+        "bad", ["<a b@c>", 'has "quotes"', "line\nbreak", "tab\there"]
+    )
+    def test_malformed_reference_is_refused_loudly(self, bad):
+        """Better a clear error than a silent hunt for a ghost."""
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        with pytest.raises(ValueError, match="not a usable message"):
+            _normalize_message_ids(bad)
+
+    @pytest.mark.asyncio
+    async def test_the_reported_case_now_reaches_apple_mail(self):
+        header = "<327950738.3015094.1785178460649@allianz.de>"
+        mgr = _mock_index(location=None)
+        mgr.find_by_rfc822.return_value = [("uuid-byte5", "Posteingang", 1)]
+        amap = _mock_acct_map(uuid_to_name="byte5")
+        amap.get_cached_accounts.return_value = [{"name": "byte5"}]
+        captured = {}
+
+        async def fake_exec(script, **kw):
+            captured["script"] = script
+            return {"updated": [header], "not_found": []}
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake_exec,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import set_flag
+
+            result = await set_flag(f'["{header}"]', color="green")
+
+        assert result["updated"] == [header]
+        assert '\\"' not in captured["script"]  # no JSON text as an id

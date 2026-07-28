@@ -428,7 +428,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # Bumped on every shipped change. The package version alone cannot
 # answer "which build is answering me" when a bundle tracks a moving
 # branch — and that question had to be guessed twice.
-SERVER_REVISION = "2026-07-28.2"
+SERVER_REVISION = "2026-07-28.3"
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -752,6 +752,35 @@ def _normalize_message_ids(
             if not item:
                 raise ValueError(
                     "message reference must not be an empty string."
+                )
+            # Some clients serialize a list parameter as JSON text, so
+            # what arrives is the string '["<a@b>"]' rather than a list.
+            # Taken literally that is a Message-ID nothing will ever
+            # match, and the caller gets a mute not_found for a message
+            # sitting right there. Unwrap it instead.
+            if item.startswith("[") and item.endswith("]"):
+                try:
+                    unwrapped = json.loads(item)
+                except ValueError:
+                    unwrapped = None
+                if isinstance(unwrapped, list):
+                    if not unwrapped:
+                        raise ValueError(
+                            "message_ids is empty; provide at least one "
+                            "reference."
+                        )
+                    raw.extend(unwrapped)
+                    continue
+            # A stray pair of quotes around the value is the same class
+            # of accident.
+            if len(item) > 1 and item[0] == item[-1] and item[0] in "\"'":
+                item = item[1:-1].strip()
+            if any(c in item for c in '"\n\r\t') or " " in item:
+                raise ValueError(
+                    f"{item!r} is not a usable message reference: a "
+                    f"Message-ID contains no quotes or whitespace. Pass "
+                    f"the `message_id` field from a search or get_emails "
+                    f"result, or a list of them."
                 )
         if item not in seen:
             seen.add(item)
