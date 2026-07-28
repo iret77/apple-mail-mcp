@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-28
+
+Fork release (iret77). Adds write tools, stable message identity and
+diagnostics on top of upstream 0.4.2.
+
+### Added
+- **Write tools** `set_flag(refs, color?)` and `set_read_status(refs, read?)`
+  — single or batch (max 500), with per-reference outcome buckets
+  (`updated`, `unchanged`, `not_found`, `failed`, `skipped_hidden`) so a
+  batch never fails as a whole. Both honour `APPLE_MAIL_READ_ONLY`.
+- **RFC822 Message-ID as a first-class reference.** Schema v6 stores
+  `rfc822_message_id`; every read path returns it and every tool that
+  takes a message accepts it. A header is never translated back into a
+  ROWID and then trusted.
+- **`flag_color`** in `get_email` and in listings, resolved for a whole
+  page in one call.
+- **`get_emails(account="all")`** lists across every visible account in
+  one call; **`get_email([...])`** fetches up to 50 messages per call.
+- **`get_index_status()`** and **`refresh_index(full?)`** — an MCP
+  server's stderr reaches nobody, so the state has to be askable.
+- Rotating file log at `~/.apple-mail-mcp/server.log`, owner-only.
+- `APPLE_MAIL_INDEX_AUTO_BUILD`, `APPLE_MAIL_INDEX_MAX_EMAIL_MB`.
+- Claude Desktop `.mcpb` bundle.
+
+### Fixed
+- An undecodable header (`Header` object instead of `str`) aborted the
+  entire index sync.
+- Oversized `.emlx` files were skipped silently; now recorded in the DLQ.
+- `get_email` reported stale read/flagged state from the `.emlx` footer.
+- Timestamps were emitted in UTC while Mail.app shows local time.
+- Four causes of "database is locked": an open transaction after a failed
+  sync, a shared SQLite connection across threads, a thread-only write
+  lock where two processes contend, and one FTS trigger firing per row.
+- Well-known mailboxes resolve by role, not by name — a German install has
+  no "INBOX", it has "Posteingang".
+- Message-ID matching ignores angle brackets and stray whitespace; the
+  `.emlx` header keeps them, Apple's `messageId` property does not.
+- **An incomplete search is no longer reported as absence.** A mailbox cap,
+  an unreadable mailbox, a skipped trash folder, a timeout, a denied Apple
+  Events permission or an unfinished recovery all leave the question open,
+  and the result says so.
+
 ## [0.4.2] - 2026-07-02
 
 ### Added
