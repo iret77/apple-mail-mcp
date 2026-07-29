@@ -1649,3 +1649,148 @@ class TestGetAttachmentLinksMode:
             assert result["links"][0]["url"] == "https://example.com"
             assert result["links"][0]["text"] == "Example"
             assert "file_path" not in result
+
+
+class TestBacklogCanBeWalkedBackwards:
+    """`get_emails` only ever returned the newest N per mailbox.
+
+    A cursor deep in a mailbox could not be approached at all, and
+    `search()` requires keywords, so it is no substitute for a gapless
+    reverse scan.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_window_and_offset_reach_the_sql_layer(self):
+        seen = {}
+
+        def fetch(env_path, **kw):
+            seen.update(kw)
+            return []
+
+        amap = MagicMock()
+        amap.ensure_loaded = AsyncMock()
+        amap.names_to_uuids.return_value = set()
+        amap.name_to_uuid.return_value = "uuid-work"
+        amap.get_cached_accounts.return_value = [
+            {"name": "Work", "id": "uuid-work"}
+        ]
+        with (
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                side_effect=fetch,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            await get_emails(
+                account="Work", before="2026-01-15T10:00:00", offset=20
+            )
+
+        assert seen["before"] is not None
+        assert seen["offset"] == 20
+        assert seen["after"] is None
+
+    def test_a_bad_date_says_what_is_expected(self):
+        from apple_mail_mcp.server import _parse_date_bound
+
+        assert _parse_date_bound(None, "before") is None
+        assert _parse_date_bound("", "before") is None
+        assert _parse_date_bound("2026-07-28", "before") > 0
+        with pytest.raises(ValueError, match="ISO date"):
+            _parse_date_bound("last tuesday", "before")
+
+    @pytest.mark.asyncio
+    async def test_the_jxa_fallback_refuses_rather_than_ignoring(self):
+        """Dropping the window would page the same newest N forever, and
+        the caller would conclude the backlog is empty."""
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="Work"),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=FileNotFoundError("no mail dir"),
+            ),
+            pytest.raises(ValueError, match="Envelope Index"),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            await get_emails(before="2026-01-15")
+
+
+class TestEnvelopeWindowSql:
+    """The window and offset in the SQL itself."""
+
+    def _db(self, tmp_path):
+        """A minimal Envelope Index with four dated messages."""
+        import sqlite3
+
+        path = tmp_path / "Envelope Index"
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE messages (
+                ROWID INTEGER PRIMARY KEY, message_id INTEGER,
+                subject INTEGER, sender INTEGER, date_received INTEGER,
+                mailbox INTEGER, read INTEGER, flagged INTEGER,
+                deleted INTEGER DEFAULT 0
+            );
+            CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
+            CREATE TABLE addresses (
+                ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT
+            );
+            CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);
+            INSERT INTO mailboxes VALUES (1, 'imap://uuid-work/INBOX');
+            INSERT INTO addresses VALUES (1, 'a@x', '');
+        """)
+        for i, ts in enumerate([4000, 3000, 2000, 1000], start=1):
+            conn.execute("INSERT INTO subjects VALUES (?, ?)", (i, f"msg {ts}"))
+            conn.execute(
+                "INSERT INTO messages (ROWID, message_id, subject, sender,"
+                " date_received, mailbox, read, flagged, deleted)"
+                " VALUES (?, ?, ?, 1, ?, 1, 0, 0, 0)",
+                (i, i, i, ts),
+            )
+        conn.commit()
+        conn.close()
+        return path
+
+    def _fetch(self, path, **kw):
+        from apple_mail_mcp.index.envelope_direct import fetch_recent_messages
+
+        return fetch_recent_messages(
+            path,
+            account_uuid=None,
+            mailbox_name=None,
+            filter_kind="all",
+            limit=10,
+            **kw,
+        )
+
+    def test_before_is_exclusive_and_ordered_newest_first(self, tmp_path):
+        rows = self._fetch(self._db(tmp_path), before=3000)
+        assert [r.subject for r in rows] == ["msg 2000", "msg 1000"]
+
+    def test_after_is_exclusive(self, tmp_path):
+        rows = self._fetch(self._db(tmp_path), after=3000)
+        assert [r.subject for r in rows] == ["msg 4000"]
+
+    def test_offset_skips_from_the_newest(self, tmp_path):
+        rows = self._fetch(self._db(tmp_path), offset=2)
+        assert [r.subject for r in rows] == ["msg 2000", "msg 1000"]
+
+    def test_a_window_and_offset_compose(self, tmp_path):
+        rows = self._fetch(self._db(tmp_path), before=4000, offset=1)
+        assert [r.subject for r in rows] == ["msg 2000", "msg 1000"]

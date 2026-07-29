@@ -118,6 +118,29 @@ def _validate_pagination(limit: int, offset: int = 0) -> tuple[int, int]:
     return max(1, min(limit, MAX_RESULT_LIMIT)), max(0, offset)
 
 
+def _parse_date_bound(value: str | None, name: str) -> float | None:
+    """ISO date/datetime -> Unix timestamp for the Envelope Index.
+
+    Naive input is read as local time, because that is what a caller
+    typing a date means; the column stores Unix epoch.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(
+            f"`{name}` must be an ISO date or datetime "
+            f"(2026-07-28 or 2026-07-28T09:30), got {value!r}."
+        ) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.timestamp()
+
+
 def _validate_date(value: str | None, param: str) -> str | None:
     """Require YYYY-MM-DD. Malformed dates would otherwise flow into
     SQL string comparisons and silently return wrong results; an
@@ -392,6 +415,9 @@ async def get_emails(
         "all", "unread", "flagged", "today", "last_7_days", "this_week"
     ] = "all",
     limit: int = 50,
+    before: str | None = None,
+    after: str | None = None,
+    offset: int = 0,
 ) -> list[EmailSummary]:
     """
     Get emails from a specific mailbox with optional filtering.
@@ -412,6 +438,14 @@ async def get_emails(
             - "last_7_days": Emails received in the last 7 days
             - "this_week": Alias for last_7_days
         limit: Maximum number of emails to return (default: 50)
+        before: Only messages received BEFORE this ISO date/datetime
+            ("2026-07-28" or "2026-07-28T09:30"). This is the cursor for
+            walking a mailbox backwards: pass the oldest
+            `date_received` you have seen to get the next page. Stable
+            while new mail arrives, which `offset` is not.
+        after: Only messages received AFTER this ISO date/datetime.
+        offset: Rows to skip before returning `limit`. Fine within one
+            snapshot; prefer `before` for a long walk.
 
     Returns:
         List of email dictionaries sorted by date (newest first).
@@ -420,8 +454,11 @@ async def get_emails(
         >>> get_emails()  # All emails from default mailbox
         >>> get_emails(filter="unread", limit=10)  # Unread emails
         >>> get_emails("Work", "INBOX", filter="today")  # Today's work emails
+        >>> get_emails(before="2026-01-01")  # walk into the backlog
     """
-    limit, _ = _validate_pagination(limit)
+    limit, offset = _validate_pagination(limit, offset)
+    before_ts = _parse_date_bound(before, "before")
+    after_ts = _parse_date_bound(after, "after")
     if _hidden_account(account):
         # Hidden account explicitly requested: return nothing and do
         # NOT fall through to JXA (which would surface its mail).
@@ -489,6 +526,9 @@ async def get_emails(
                     mailbox_name=target_mailbox,
                     filter_kind=filter,
                     limit=limit,
+                    before=before_ts,
+                    after=after_ts,
+                    offset=offset,
                 )
                 return [
                     EmailSummary(
@@ -512,6 +552,17 @@ async def get_emails(
         logger.debug(
             "Envelope Index fast path unavailable (%s); falling back to JXA",
             exc,
+        )
+
+    if before_ts is not None or after_ts is not None or offset:
+        # The JXA fallback has no date window and no offset. Silently
+        # dropping them would answer a different question than the one
+        # asked — the caller would page through the same newest N
+        # forever and conclude the backlog is empty.
+        raise ValueError(
+            "`before`, `after` and `offset` need Apple's Envelope Index, "
+            "which is not readable right now (Full Disk Access, or an "
+            "unsupported Mail.app layout)."
         )
 
     # Strategy 1: JXA batchFetch fallback. Preserves correctness

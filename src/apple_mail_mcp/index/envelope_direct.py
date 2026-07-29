@@ -178,6 +178,9 @@ def fetch_recent_messages(
     mailbox_name: str | None,
     filter_kind: str,
     limit: int,
+    before: float | None = None,
+    after: float | None = None,
+    offset: int = 0,
 ) -> list[EnvelopeMessageRow]:
     """Read up to `limit` recent messages via direct SQL.
 
@@ -202,6 +205,13 @@ def fetch_recent_messages(
         filter_kind: One of "all", "unread", "flagged", "today",
             "last_7_days", "this_week".
         limit: Maximum rows to return.
+        before: Only messages received strictly before this Unix
+            timestamp. The stable cursor for walking a mailbox
+            backwards.
+        after: Only messages received strictly after this Unix
+            timestamp.
+        offset: Rows to skip. Fine within one snapshot; `before` is
+            the cursor that survives new mail arriving mid-walk.
 
     Returns:
         List of EnvelopeMessageRow ordered by date_received DESC.
@@ -222,6 +232,9 @@ def fetch_recent_messages(
             mailbox_name=mailbox_name,
             filter_kind=filter_kind,
             limit=limit,
+            before=before,
+            after=after,
+            offset=offset,
         )
     finally:
         conn.close()
@@ -234,6 +247,9 @@ def _fetch_recent_messages(
     mailbox_name: str | None,
     filter_kind: str,
     limit: int,
+    before: float | None = None,
+    after: float | None = None,
+    offset: int = 0,
 ) -> list[EnvelopeMessageRow]:
     """Body of fetch_recent_messages, on an open connection."""
     where_clauses: list[str] = ["m.deleted = 0"]
@@ -275,6 +291,16 @@ def _fetch_recent_messages(
         params.append(now_ts - delta_seconds)
     # "all": no extra clause
 
+    # Explicit window, for walking backwards through a mailbox. Without
+    # it a caller only ever sees the newest N per mailbox and cannot
+    # reach a backlog at all.
+    if before is not None:
+        where_clauses.append("m.date_received < ?")
+        params.append(before)
+    if after is not None:
+        where_clauses.append("m.date_received > ?")
+        params.append(after)
+
     where_sql = " AND ".join(where_clauses)
     # We return `m.ROWID`, not `m.message_id`. Mail.app's
     # JXA `msg.id()` returns the SQLite ROWID (a small,
@@ -300,9 +326,10 @@ def _fetch_recent_messages(
         LEFT JOIN mailboxes mb ON m.mailbox = mb.ROWID
         WHERE {where_sql}
         ORDER BY m.date_received DESC
-        LIMIT ?
+        LIMIT ? OFFSET ?
     """
     params.append(int(limit))
+    params.append(max(0, int(offset)))
 
     cur = conn.execute(sql, params)
     rows: list[EnvelopeMessageRow] = []
