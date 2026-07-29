@@ -693,6 +693,56 @@ class IndexManager:
                 ]
         return out
 
+    def find_by_rfc822(
+        self, rfc822_message_id: str
+    ) -> list[tuple[str, str, int]]:
+        """Locate every indexed copy of a message by its stable header.
+
+        A message can legitimately exist more than once — the same mail
+        in INBOX and in an archive, or across two accounts — so this
+        returns all matches rather than guessing. Newest indexed first,
+        so the most recent location is tried first.
+
+        Returns:
+            List of ``(account, mailbox, message_id)``.
+        """
+        # The index stores the header as it appears in the .emlx, i.e.
+        # WITH angle brackets. Callers routinely hold the bare form,
+        # because Apple Mail's messageId property drops them. Match
+        # either, or the lookup silently returns nothing.
+        bare = rfc822_message_id.strip()
+        if bare.startswith("<") and bare.endswith(">"):
+            bare = bare[1:-1]
+        conn = self._get_conn()
+        sql = "SELECT account, mailbox, message_id FROM emails WHERE "
+        order = " ORDER BY indexed_at DESC"
+        # Fast path: an exact hit on the indexed column.
+        rows = conn.execute(
+            sql + "rfc822_message_id IN (?, ?)" + order,
+            (f"<{bare}>", bare),
+        ).fetchall()
+        if not rows:
+            # Nothing matched, so the stored value carries something the
+            # two canonical forms do not — stray whitespace, a folded
+            # header, a stray bracket. A strict comparison fails
+            # silently here and the caller then searches the wrong
+            # account, so fall back to a normalized scan. That costs a
+            # table scan, which only happens once the fast path missed.
+            # trim() alone drops spaces but NOT tabs or newlines, and a
+            # folded header brings exactly those.
+            norm = "rfc822_message_id"
+            for ch in (
+                "char(10)",
+                "char(13)",
+                "char(9)",
+                "' '",
+                "'<'",
+                "'>'",
+            ):
+                norm = f"replace({norm}, {ch}, '')"
+            rows = conn.execute(sql + norm + " = ?" + order, (bare,)).fetchall()
+        return [(r["account"], r["mailbox"], r["message_id"]) for r in rows]
+
     def find_email_location(
         self,
         message_id: int,

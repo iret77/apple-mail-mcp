@@ -363,6 +363,12 @@ const MAX_SCAN = {max_scan};
 const updated = [];
 const unchanged = [];
 const notFound = [];
+// One header can be handed to several account groups (the index could
+// not place it, so every visible account is searched). Retire it
+// globally the moment it lands, or the same message would be written
+// twice and a later group would report a mute "not found" for a header
+// that was already done.
+const settled = new Set();
 // Why a target could not be reached. `notFound` must stay a statement
 // about the MESSAGE ("Mail was open, it wasn't there"); anything that
 // went wrong on the way — no such account, mailbox unreadable — is a
@@ -375,6 +381,19 @@ const failures = [];
 // did not get to look everywhere".
 let cappedBoxes = 0;
 let unreadableBoxes = 0;
+let skippedDiscard = 0;
+
+// The .emlx header keeps its angle brackets ("<a@b>"), Apple Mail's
+// messageId property drops them ("a@b"). A strict comparison between
+// the two can never match, which would make every Message-ID write
+// report a mute "not found" while the message sat right there. Compare
+// on the bare addr-spec, and always echo back what the caller passed.
+function normHeader(v) {{
+    let s = String(v == null ? "" : v).trim();
+    if (s.charAt(0) === "<") s = s.slice(1);
+    if (s.charAt(s.length - 1) === ">") s = s.slice(0, -1);
+    return s;
+}}
 
 function fail(targets, reason) {{
     for (const t of targets) failures.push({{target: t, reason: reason}});
@@ -409,15 +428,119 @@ function applyToMessage(collection, idx, targetId) {{
     return "updated";
 }}
 
+// Same contract as applyToMessage, but identity is the RFC822
+// Message-ID: the handle that survives the message being filed
+// elsewhere, which is when the ROWID stops being valid.
+function applyByHeader(collection, idx, targetHeader) {{
+    const msg = collection[idx];
+    try {{
+        if (normHeader(msg.messageId()) !== normHeader(targetHeader)) {{
+            return "failed";
+        }}
+    }} catch (e) {{
+        return "failed";
+    }}
+    try {{
+        if (!({self.needs_change_js})) return "unchanged";
+    }} catch (e) {{
+        // Current state unreadable — write rather than silently skip.
+    }}
+    {self.apply_js}
+    return "updated";
+}}
+
 for (const g of groups) {{
     let account;
     try {{
         account = MailCore.getAccount(g.account);
     }} catch (e) {{
+        // Group shapes differ: located/scan carry `ids`, header groups
+        // carry `headers`. Reading the wrong one throws INSIDE a catch,
+        // which escapes and kills the whole batch.
         fail(
-            g.ids || [],
+            g.ids || g.headers || [],
             "no such account: " + String(g.account) + " (" + e + ")"
         );
+        continue;
+    }}
+
+    if (g.by_header) {{
+        // Match on the RFC822 Message-ID, never on a ROWID looked up
+        // from it: an index row can be stale, and by then its ROWID may
+        // belong to a different message. Batch-fetch headers per
+        // mailbox — one IPC call each, never per message.
+        let mailboxes;
+        try {{
+            mailboxes = account.mailboxes();
+        }} catch (e) {{
+            fail(g.headers, "cannot list mailboxes of account " +
+                 String(g.account) + " (" + e + ")");
+            continue;
+        }}
+        const remaining = new Set(
+            g.headers.filter((h) => !settled.has(String(h)))
+        );
+        if (remaining.size === 0) continue;
+        // Prefer the mailboxes the index associates with these
+        // messages. A discard mailbox is skipped ONLY when it is not one
+        // of those: the same message often still sits in Trash after
+        // being re-filed, and flagging that copy would leave the visible
+        // one untouched. But a message that genuinely LIVES in Junk (or
+        // in Trash) is a legitimate target — skipping it unconditionally
+        // would make "flag this junk mail" impossible to satisfy.
+        const preferred = g.prefer_mailboxes || [];
+        const ordered = [];
+        const rest = [];
+        for (let m = 0; m < mailboxes.length; m++) {{
+            let nm = "";
+            try {{ nm = String(mailboxes[m].name()); }} catch (e) {{}}
+            const isPreferred = preferred.indexOf(nm) !== -1;
+            const isDiscard = MailCore.isDiscardMailbox(nm);
+            if (isDiscard && !isPreferred) {{
+                // Deliberately not searched — but "not searched" all the
+                // same. Counting it as covered would let a message that
+                // only sits in Trash or Junk be declared deleted.
+                skippedDiscard++;
+                continue;
+            }}
+            if (isPreferred) ordered.push(mailboxes[m]);
+            else rest.push(mailboxes[m]);
+        }}
+        const candidates = ordered.concat(rest);
+        const limit = Math.min(candidates.length, MAX_SCAN);
+        cappedBoxes += Math.max(0, candidates.length - limit);
+        for (let m = 0; m < limit && remaining.size > 0; m++) {{
+            let headers;
+            try {{
+                headers = candidates[m].messages.messageId();
+            }} catch (e) {{
+                unreadableBoxes++;
+                continue;  // skip inaccessible mailbox
+            }}
+            const normed = headers.map(normHeader);
+            for (const target of Array.from(remaining)) {{
+                const idx = normed.indexOf(normHeader(target));
+                if (idx === -1) continue;
+                let r = "failed";
+                try {{
+                    r = applyByHeader(candidates[m].messages, idx, target);
+                }} catch (e) {{
+                    r = "failed";
+                }}
+                // Only retire the header once it actually landed;
+                // otherwise a later mailbox may still hold a good copy.
+                if (r === "updated") {{
+                    remaining.delete(target);
+                    settled.add(String(target));
+                    updated.push(target);
+                }} else if (r === "unchanged") {{
+                    remaining.delete(target);
+                    settled.add(String(target));
+                    unchanged.push(target);
+                }}
+            }}
+        }}
+        for (const h of remaining) notFound.push(h);
         continue;
     }}
 
@@ -502,10 +625,13 @@ for (const g of groups) {{
 JSON.stringify({{
     updated: updated,
     unchanged: unchanged,
-    not_found: notFound,
-    failures: failures,
+    // A header missing from one account is not missing overall: drop the
+    // ones another account already settled.
+    not_found: notFound.filter((t) => !settled.has(String(t))),
+    failures: failures.filter((f) => !settled.has(String(f.target))),
     scan_capped: cappedBoxes,
     scan_unreadable: unreadableBoxes,
+    scan_skipped_discard: skippedDiscard,
 }});
 """
 

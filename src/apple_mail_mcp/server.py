@@ -219,6 +219,30 @@ class EmailFull(TypedDict, total=False):
 
 # ========== Write-Tool Helpers ==========
 
+
+def _header_key(value: str | None) -> str:
+    """Comparison key for an RFC822 Message-ID.
+
+    The `.emlx` header carries its angle brackets ("<a@b>"); Apple
+    Mail's `messageId` property hands back the bare addr-spec ("a@b").
+    Both name the same message, and a strict comparison between them
+    never matches — which is exactly how a Message-ID lookup comes back
+    "not found" while the message sits in the mailbox. Compare through
+    this, never on the raw strings.
+    """
+    if not value:
+        return ""
+    key = str(value).strip()
+    if key.startswith("<") and key.endswith(">"):
+        key = key[1:-1]
+    return key
+
+
+# A message reference is either Mail.app's numeric id or the RFC822
+# Message-ID header. The header is the stable one; see _header_key.
+MessageRef = int | str
+
+
 # Ceiling on one write batch. A batch is one osascript call per
 # (account, mailbox) group, so the cost is in the ids, not the call;
 # the cap exists so a runaway list cannot hold Mail.app hostage.
@@ -236,57 +260,155 @@ class WriteResult(TypedDict, total=False):
     partial success is reportable rather than an exception.
     """
 
-    updated: list[int]
-    unchanged: list[int]
-    not_found: list[int]
-    skipped_hidden: list[int]
-    failed: list[int]
+    updated: list[MessageRef]
+    unchanged: list[MessageRef]
+    not_found: list[MessageRef]
+    skipped_hidden: list[MessageRef]
+    failed: list[MessageRef]
     error: str
     hint: str
     diagnostics: dict
 
 
 def _normalize_message_ids(
-    message_ids: int | list[int],
-) -> list[int]:
-    """Coerce a single id or a list into a validated, unique list.
+    message_ids: MessageRef | list[MessageRef],
+) -> list[MessageRef]:
+    """Coerce a single reference or list into a validated, unique list.
 
-    Order is preserved so the answer reads in the order asked. A
-    non-integer id is refused by name rather than silently dropped: a
-    caller that mistyped one reference must not read the result as "that
-    message does not exist".
+    A reference is either a Mail.app id (int) or an RFC822 Message-ID
+    header (str, e.g. ``"<abc@example.com>"``). The header is the stable
+    one: an int stops resolving the moment any device files the message
+    elsewhere, so anything held across calls should be a header.
+
+    Rejects bools (``True``/``False`` are not ids even though ``bool`` is
+    an ``int`` subclass) and blank strings. Raises on an empty batch or
+    one larger than :data:`MAX_WRITE_BATCH` — a write must never silently
+    drop targets. Order is preserved; duplicates collapse.
     """
-    raw = (
-        list(message_ids)
-        if isinstance(message_ids, (list, tuple))
-        else [message_ids]
-    )
-    if not raw:
-        raise ValueError("No message ids given.")
-    if len(raw) > MAX_WRITE_BATCH:
+    if isinstance(message_ids, bool):
+        raise ValueError("message_ids must not be a bool.")
+    if isinstance(message_ids, (int, str)):
+        raw: list = [message_ids]
+    elif isinstance(message_ids, (list, tuple)):
+        raw = list(message_ids)
+    else:
         raise ValueError(
-            f"Too many ids ({len(raw)}); max {MAX_WRITE_BATCH} per call."
+            f"message_ids must be an id, a Message-ID header, or a list "
+            f"of them; got {type(message_ids).__name__}."
         )
-    out: list[int] = []
+
+    ids: list[MessageRef] = []
+    seen: set[MessageRef] = set()
     for item in raw:
-        if isinstance(item, bool) or not isinstance(item, int):
-            try:
-                item = int(item)
-            except (TypeError, ValueError):
+        if isinstance(item, bool) or not isinstance(item, (int, str)):
+            raise ValueError(
+                f"message reference must be an int id or a Message-ID "
+                f"string, got {item!r} ({type(item).__name__})."
+            )
+        if isinstance(item, str):
+            item = item.strip()
+            if not item:
                 raise ValueError(
-                    f"Invalid message id {item!r}: expected an integer."
-                ) from None
-        if item not in out:
-            out.append(item)
-    return out
+                    "message reference must not be an empty string."
+                )
+            # HTML-escaped brackets are another shape the same reference
+            # arrives in: "&lt;a@b&gt;", sometimes wrapping a stringified
+            # list as well. Nothing in it trips the checks below, so it
+            # would sail through and miss in silence. Unescape FIRST: an
+            # escaped list has to become a list before it can be
+            # unwrapped as one.
+            #
+            # Only the three entities that carry STRUCTURE are decoded.
+            # `&amp;` is deliberately left alone: `&` is legal in a
+            # Message-ID local part, so "<a&amp;b@x>" and "<a&b@x>" can
+            # both exist as distinct messages, and decoding would aim
+            # the write at the other one while reporting success. A
+            # reference that then fails to match is answered with a
+            # miss, which is recoverable; a write to the wrong message is
+            # not.
+            if "&lt;" in item or "&gt;" in item or "&quot;" in item:
+                item = (
+                    item.replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", '"')
+                    .strip()
+                )
+            # Some clients serialize a list parameter as JSON text, so
+            # what arrives is the string '["<a@b>"]' rather than a list.
+            # Taken literally that is a Message-ID nothing will ever
+            # match, and the caller gets a mute not_found for a message
+            # sitting right there. Unwrap it instead.
+            if item.startswith("[") and item.endswith("]"):
+                try:
+                    unwrapped = json.loads(item)
+                except ValueError:
+                    unwrapped = None
+                if isinstance(unwrapped, list):
+                    if not unwrapped:
+                        raise ValueError(
+                            "message_ids is empty; provide at least one "
+                            "reference."
+                        )
+                    raw.extend(unwrapped)
+                    continue
+            # A stray pair of quotes around the value is the same class
+            # of accident.
+            if len(item) > 1 and item[0] == item[-1] and item[0] in "\"'":
+                item = item[1:-1].strip()
+            if any(c in item for c in '"\n\r\t') or " " in item:
+                raise ValueError(
+                    f"{item!r} is not a usable message reference: a "
+                    f"Message-ID contains no quotes or whitespace. Pass "
+                    f"the `message_id` field from a search or get_emails "
+                    f"result, or a list of them."
+                )
+        if item not in seen:
+            seen.add(item)
+            ids.append(item)
+
+    if not ids:
+        raise ValueError(
+            "message_ids is empty; provide at least one reference."
+        )
+    if len(ids) > MAX_WRITE_BATCH:
+        raise ValueError(
+            f"Too many references ({len(ids)}); max {MAX_WRITE_BATCH} "
+            f"per call. Split into smaller batches."
+        )
+    return ids
+
+
+async def _visible_account_names() -> list[str]:
+    """Every account the caller is allowed to see, in Mail's order.
+
+    A header the index cannot place must not be looked for in ONE
+    account only. A message that simply has not been indexed yet — it
+    arrived after the last sync — would then be unreachable in every
+    other account and come back as a mute not_found.
+    """
+    acct_map = _get_account_map()
+    excluded = _excluded_account_names()
+    cached = acct_map.get_cached_accounts()
+    if cached is None:
+        try:
+            await acct_map.ensure_loaded()
+            cached = acct_map.get_cached_accounts()
+        except Exception as exc:
+            logger.debug("account enumeration failed: %s", exc)
+            cached = None
+    return [
+        a.get("name")
+        for a in (cached or [])
+        if a.get("name") and a.get("name") not in excluded
+    ]
 
 
 async def _resolve_write_targets(
-    ids: list[int],
+    ids: list[MessageRef],
     account: str | None,
     mailbox: str | None,
-) -> tuple[list[dict], list[int], list[int]]:
-    """Resolve message ids to JXA write groups, honoring the account gate.
+) -> tuple[list[dict], list[MessageRef], list[MessageRef]]:
+    """Resolve references to JXA write groups, honoring the account gate.
 
     A Mail.app id is a per-mailbox ROWID, not a globally addressable
     handle: `Mail.messages.byId()` needs to know which mailbox to look
@@ -301,9 +423,20 @@ async def _resolve_write_targets(
     `skipped_hidden` and is never dispatched to JXA. Only ids with no
     visible account to scan land in `not_found`.
 
+    A reference given as an RFC822 Message-ID header takes a different
+    route entirely: **it is never translated back into a ROWID.** The
+    index is consulted only to pick the account and to order the mailbox
+    scan (`prefer_mailboxes`); the write itself matches
+    `msg.messageId()` in JXA, so a stale index row can misdirect the
+    search but can never cause the wrong message to be written. A header
+    the index cannot place is searched for in EVERY visible account —
+    that case is not exotic, it is every message that arrived after the
+    last sync.
+
     Returns ``(groups, not_found, skipped_hidden)``. Located groups are
     ``{"account", "mailbox", "ids"}``; the optional scan group is
-    ``{"account", "ids", "scan": True}``.
+    ``{"account", "ids", "scan": True}``; header groups are
+    ``{"account", "headers", "prefer_mailboxes", "by_header": True}``.
     """
     # Explicit hidden account: refuse the whole batch up front, exactly
     # as the read tools do at their entry gate.
@@ -333,10 +466,83 @@ async def _resolve_write_targets(
 
     grouped: dict[tuple[str, str], list[int]] = {}
     scan_ids: list[int] = []
-    not_found: list[int] = []
-    skipped_hidden: list[int] = []
+    not_found: list[MessageRef] = []
+    skipped_hidden: list[MessageRef] = []
+    # account name -> {"headers": [...], "prefer": {mailbox, ...}}
+    header_groups: dict[str | None, dict] = {}
 
-    for mid in ids:
+    int_ids = [m for m in ids if isinstance(m, int)]
+    headers = [m for m in ids if isinstance(m, str)]
+
+    for header in headers:
+        matches = (
+            await asyncio.to_thread(manager.find_by_rfc822, header)
+            if has_index
+            else []
+        )
+        if account:
+            # An explicit account both scopes and disambiguates.
+            matches = [
+                m
+                for m in matches
+                if idx_acct_uuid is not None and m[0] == idx_acct_uuid
+            ]
+        visible = [m for m in matches if m[0] not in excluded_uuids]
+        if matches and not visible:
+            # Every known copy lives in a hidden account (#90).
+            skipped_hidden.append(header)
+            continue
+
+        if visible:
+            # find_by_rfc822 returns newest-indexed first. A header found
+            # in two accounts (a forward, a list subscribed twice) is
+            # written in the most recently indexed one; pass `account` to
+            # pin it. Mailboxes of that account seed the scan order.
+            target_acct = acct_map.uuid_to_name(visible[0][0])
+            prefer = {mb for acct, mb, _ in visible if acct == visible[0][0]}
+            # The index says where it WAS. Treat that as the first place
+            # to look, not as the only one: a row can be stale, and a
+            # miss there would otherwise end the search in silence while
+            # the message sat in another account. Later accounts cost
+            # nothing once the header has been settled.
+            others = [
+                a
+                for a in await _visible_account_names()
+                if a and a != target_acct
+            ]
+            targets = [target_acct, *others]
+        elif account:
+            # Caller pinned the account: honour it, scan nothing else.
+            targets = [await _resolve_visible_account(account)]
+            if excluded_names and (
+                targets[0] is None or targets[0] in excluded_names
+            ):
+                not_found.append(header)
+                continue
+            prefer = {mailbox} if mailbox else set()
+        else:
+            # The index cannot place it — most often because it arrived
+            # after the last sync. Search EVERY visible account: scoped
+            # to one, a message outside it is unreachable and comes back
+            # as a mute "not found".
+            targets = await _visible_account_names()
+            if not targets:
+                targets = [await _resolve_visible_account(None)]
+            if excluded_names and not [
+                t for t in targets if t and t not in excluded_names
+            ]:
+                not_found.append(header)
+                continue
+            prefer = {mailbox} if mailbox else set()
+
+        for target_acct in targets:
+            entry = header_groups.setdefault(
+                target_acct, {"headers": [], "prefer": set()}
+            )
+            entry["headers"].append(header)
+            entry["prefer"] |= prefer
+
+    for mid in int_ids:
         located: tuple[str, str] | None = None
         if has_index:
             loc = manager.find_email_location(
@@ -360,6 +566,18 @@ async def _resolve_write_targets(
         {"account": acct, "mailbox": mb, "ids": mids}
         for (acct, mb), mids in grouped.items()
     ]
+    groups += [
+        {
+            "account": acct,
+            "headers": entry["headers"],
+            "prefer_mailboxes": sorted(entry["prefer"]),
+            "by_header": True,
+        }
+        # Insertion order, NOT alphabetical: the account the index points
+        # at was inserted first and has to be searched first. Sorting the
+        # groups by name would throw that priority away.
+        for acct, entry in header_groups.items()
+    ]
 
     if scan_ids:
         scan_account = await _resolve_visible_account(account)
@@ -378,7 +596,9 @@ async def _resolve_write_targets(
     return groups, not_found, skipped_hidden
 
 
-def _absorb_failures(res: dict, failed: list, errors: list) -> None:
+def _absorb_failures(
+    res: dict, failed: list, errors: list, as_int: bool
+) -> None:
     """Move JXA-reported failures out of the caller's success path.
 
     The write script distinguishes "Mail was open and the message was
@@ -390,55 +610,63 @@ def _absorb_failures(res: dict, failed: list, errors: list) -> None:
         target = item.get("target")
         if target is None:
             continue
-        failed.append(int(target))
+        failed.append(int(target) if as_int else str(target))
         reason = str(item.get("reason", "")).strip()
         if reason:
             errors.append(reason)
 
 
 async def _apply_write(
-    message_ids: int | list[int],
+    message_ids: MessageRef | list[MessageRef],
     account: str | None,
     mailbox: str | None,
     make_builder,
 ) -> WriteResult:
     """Shared orchestration for the batch write tools.
 
-    Normalizes ids, resolves targets (with the account gate), then runs
-    the located groups and any scan group in *separate* osascript calls
-    — so a slow or timed-out mailbox scan cannot discard the fast,
-    precise located writes — and merges every id's outcome.
-    `make_builder` maps ``groups -> WriteBuilder``: the only per-tool
-    difference.
+    Normalizes references, resolves targets (with the account gate), then
+    runs the located groups, any scan group and any Message-ID group in
+    *separate* osascript calls — so a slow or timed-out mailbox scan
+    cannot discard the fast, precise located writes — and merges every
+    reference's outcome. `make_builder` maps ``groups -> WriteBuilder``:
+    the only per-tool difference.
 
-    Every id comes back in exactly one bucket.
+    Every reference comes back in exactly one bucket, reported in the
+    same form the caller passed it: ints as ints, Message-ID headers as
+    headers.
     """
     ids = _normalize_message_ids(message_ids)
     groups, not_found, skipped_hidden = await _resolve_write_targets(
         ids, account, mailbox
     )
 
-    located = [g for g in groups if not g.get("scan")]
+    located = [
+        g for g in groups if not g.get("scan") and not g.get("by_header")
+    ]
     scan = [g for g in groups if g.get("scan")]
-    updated: list[int] = []
-    unchanged: list[int] = []
+    by_header = [g for g in groups if g.get("by_header")]
+    updated: list[MessageRef] = []
+    unchanged: list[MessageRef] = []
     # A write that never reached Apple Mail is NOT evidence that the
     # message is gone. Reporting it as not_found would send the caller
     # hunting for a message that was there all along.
-    failed: list[int] = []
+    failed: list[MessageRef] = []
     errors: list[str] = []
-    # Mailboxes the scan never reached: a miss that follows one of these
+    # Places the search never reached: a miss that follows one of these
     # is not evidence that the message is gone.
     unsearched = 0
 
-    def _merge(res: dict) -> None:
+    def _merge(res: dict, as_int: bool = True) -> None:
         nonlocal unsearched
-        updated.extend(int(x) for x in res.get("updated", []))
-        unchanged.extend(int(x) for x in res.get("unchanged", []))
-        not_found.extend(int(x) for x in res.get("not_found", []))
-        _absorb_failures(res, failed, errors)
-        unsearched += int(res.get("scan_capped") or 0) + int(
-            res.get("scan_unreadable") or 0
+        cast = int if as_int else str
+        updated.extend(cast(x) for x in res.get("updated", []))
+        unchanged.extend(cast(x) for x in res.get("unchanged", []))
+        not_found.extend(cast(x) for x in res.get("not_found", []))
+        _absorb_failures(res, failed, errors, as_int=as_int)
+        unsearched += (
+            int(res.get("scan_capped") or 0)
+            + int(res.get("scan_unreadable") or 0)
+            + int(res.get("scan_skipped_discard") or 0)
         )
 
     if located:
@@ -470,6 +698,24 @@ async def _apply_write(
             failed += [i for g in scan for i in g["ids"]]
             errors.append(str(exc))
 
+    if by_header:
+        # Caller-supplied Message-IDs. A bounded mailbox walk, so it gets
+        # the scan budget rather than the located one — it is looking for
+        # the message, not addressing it.
+        builder = make_builder(by_header)
+        builder.max_scan_mailboxes = STRATEGY3_MAX_MAILBOXES
+        try:
+            _merge(
+                await execute_with_core_async(
+                    builder.build(), timeout=STRATEGY3_TIMEOUT
+                ),
+                as_int=False,
+            )
+        except Exception as exc:
+            logger.warning("Message-ID write failed: %s", exc, exc_info=True)
+            failed += [h for g in by_header for h in g["headers"]]
+            errors.append(str(exc))
+
     result: WriteResult = {
         "updated": updated,
         "unchanged": unchanged,
@@ -485,6 +731,17 @@ async def _apply_write(
                 f"{g['account']}/{g['mailbox']}" for g in located
             ],
             "accounts_scanned": [g.get("account") for g in scan],
+            "accounts_searched_by_header": [
+                g.get("account") for g in by_header
+            ],
+            "mailboxes_preferred": sorted(
+                {
+                    mb
+                    for g in by_header
+                    for mb in (g.get("prefer_mailboxes") or [])
+                }
+            ),
+            "references_as_received": [str(i) for i in ids],
             "mailboxes_not_searched": unsearched,
         }
     if failed:
@@ -526,13 +783,26 @@ async def _apply_write(
             f"files, not from Apple Events."
         )
         return result
-    if not_found and unsearched:
+    missing_headers = [m for m in not_found if isinstance(m, str)]
+    missing_ints = [m for m in not_found if isinstance(m, int)]
+    if missing_headers and not missing_ints and not unsearched:
+        # A Message-ID write was matched against the live mailboxes of
+        # every visible account, and nothing was left out. This is the
+        # ONE place where absence has actually been established.
         result["hint"] = (
-            f"{len(not_found)} id(s) were not found, but {unsearched} "
-            f"mailbox(es) were never searched (scan limit, or a mailbox "
-            f"Mail refused to read). This is NOT evidence that the "
-            f"messages are gone — pass `account` and `mailbox` to aim the "
-            f"write."
+            f"{len(missing_headers)} message(s) with that Message-ID were "
+            f"not found in any visible account. Apple Mail was reachable "
+            f"and every mailbox was searched, so the message is most "
+            f"likely deleted."
+        )
+    elif not_found and unsearched:
+        result["hint"] = (
+            f"{len(not_found)} reference(s) were not found, but "
+            f"{unsearched} place(s) were never searched (scan limit, a "
+            f"mailbox Mail refused to read, or a trash/junk mailbox that "
+            f"is skipped unless the index expects the message there). "
+            f"This is NOT evidence that the messages are gone — pass "
+            f"`account` and `mailbox` to aim the write."
         )
     elif not_found and not _get_index_manager().has_index():
         result["hint"] = (
@@ -546,14 +816,15 @@ async def _apply_write(
         # it cannot be searched for across accounts at all: the same
         # number is a different message elsewhere, and widening the
         # search would risk writing to a stranger's mail. The honest
-        # answer is to state the limit.
+        # answer is to state the limit and point at the reference that
+        # IS searched everywhere.
         result["hint"] = (
             f"{len(not_found)} id(s) were not found where the index "
             f"expected them. A Mail.app id is only unique within its "
-            f"mailbox, so it cannot be searched for in other accounts. "
-            f"The message may have been filed elsewhere (from another "
-            f"device), in which case its id has changed: re-index and "
-            f"look it up again."
+            f"mailbox, so it cannot be searched for in other accounts — "
+            f"pass the `message_id` header instead, which is searched in "
+            f"every visible account and survives the message being filed "
+            f"elsewhere."
         )
     return result
 
@@ -998,7 +1269,7 @@ JSON.stringify({{
 
 @mcp.tool
 async def get_email(
-    message_id: int,
+    message_id: MessageRef,
     account: str | None = None,
     mailbox: str | None = None,
 ) -> EmailFull:
@@ -1006,25 +1277,28 @@ async def get_email(
     Get a single email with full content.
 
     Looks up the email across all accounts using a cascade strategy.
-    Just pass the message_id — account/mailbox are optional hints
-    that speed up lookup but are not required.
+    Just pass the reference — account/mailbox are optional hints that
+    speed up lookup but are not required.
 
     Args:
-        message_id: The email's unique ID (from search results)
+        message_id: Either the numeric id or the RFC822 `message_id`
+            header from a read result. Prefer the header: the numeric id
+            is a per-mailbox ROWID and stops resolving as soon as any
+            device files the message elsewhere.
         account: Optional hint (speeds up lookup, not required)
         mailbox: Optional hint (speeds up lookup, not required)
 
     Returns:
         Email dictionary with full content including:
-        - id: the numeric id — a per-mailbox ROWID, valid only while
-          the message stays where it is
-        - message_id: the RFC822 Message-ID header. Hold on to THIS
-          between calls; it keeps naming the same message after it is
-          filed elsewhere from another device.
+        - id: the numeric id — valid only while the message stays put
+        - message_id: the RFC822 Message-ID header, stable across moves
+        - account, mailbox: where the message is right NOW. Addressing a
+          message by its header makes this the one thing the caller
+          cannot derive — and after a move the most useful.
         - subject, sender, date_received, date_sent
         - content: Full plain text body
         - read, flagged status
-        - reply_to, message_id (email Message-ID header)
+        - reply_to
         - attachments: List of {filename, mime_type, size}
 
     Note:
@@ -1035,9 +1309,24 @@ async def get_email(
         with a known filename for reliable extraction from disk.
 
     Example:
-        >>> get_email(12345)
-        {"id": 12345, "subject": "Meeting notes",
-         "content": "Hi team,\\n\\nHere are the notes...", ...}
+        >>> get_email("<a1b2@example.com>")  # stable, preferred
+        >>> get_email(12345)  # numeric id also works
+        {"id": 12345, "subject": "Meeting notes", ...}
+    """
+    if isinstance(message_id, str):
+        return await _get_email_by_header(message_id, account, mailbox)
+    return await _get_email_by_id(message_id, account, mailbox)
+
+
+async def _get_email_by_id(
+    message_id: int,
+    account: str | None = None,
+    mailbox: str | None = None,
+) -> EmailFull:
+    """The numeric-id cascade (Strategies 0-3). See ``get_email``.
+
+    Split out so the header route can drive it per candidate and verify
+    the header on what comes back.
     """
     if _hidden_account(account):
         # Hidden account: surface as a plain "not found" so a hidden
@@ -1052,6 +1341,21 @@ async def get_email(
         # strategies would scan Mail.accounts()[0] — a hidden one.
         raise ValueError(f"Email {message_id} not found.")
     resolved_mailbox = _resolve_mailbox(mailbox)
+
+    def _with_location(
+        result: dict, acct: str | None, mbox: str | None
+    ) -> dict:
+        """Record where the message was actually found.
+
+        Addressing a message by its stable header makes its current
+        location the one thing the caller cannot derive — and after a
+        move it is the most useful thing to know.
+        """
+        if acct and not result.get("account"):
+            result["account"] = acct
+        if mbox and not result.get("mailbox"):
+            result["mailbox"] = mbox
+        return result
 
     def _enrich_attachments(result: dict) -> dict:
         """Replace JXA attachments with richer index data when available."""
@@ -1089,6 +1393,16 @@ async def get_email(
             emlx_path = manager.find_email_path(
                 message_id, account=idx_acct, mailbox=mailbox
             )
+            # Where the index actually placed it — reported back, since
+            # a caller addressing a message by its header cannot derive
+            # the location itself.
+            found_account, found_mbox = account, mailbox
+            located = manager.find_email_location(
+                message_id, account=idx_acct, mailbox=mailbox
+            )
+            if located:
+                found_account = acct_map.uuid_to_name(located[0])
+                found_mbox = located[1]
             if emlx_path:
                 # A stale index row (account excluded after indexing,
                 # before re-sync) could still resolve here.
@@ -1121,7 +1435,9 @@ async def get_email(
                                 for a in (parsed.attachments or [])
                             ],
                         }
-                        return _enrich_attachments(result)
+                        return _enrich_attachments(
+                            _with_location(result, found_account, found_mbox)
+                        )
                 else:
                     stale_index_entry = (idx_acct, mailbox)
     except _AccountHiddenError:
@@ -1167,7 +1483,9 @@ async def get_email(
 
     try:
         result = await execute_with_core_async(script)
-        return _enrich_attachments(result)
+        return _enrich_attachments(
+            _with_location(result, resolved_account, resolved_mailbox)
+        )
     except Exception:
         pass  # Fall through to strategy 2
 
@@ -1206,7 +1524,9 @@ async def get_email(
                 script = _build_get_email_script(message_id, setup)
                 try:
                     result = await execute_with_core_async(script)
-                    return _enrich_attachments(result)
+                    return _enrich_attachments(
+                        _with_location(result, friendly_account, idx_mailbox)
+                    )
                 except _AccountHiddenError:
                     raise
                 except Exception:
@@ -1278,16 +1598,204 @@ class AttachmentContent(TypedDict, total=False):
     links: list[LinkResult]
 
 
+class _LiveLookupIncomplete(RuntimeError):
+    """The live search did not cover everything it would have needed to.
+
+    Distinct from "the message is not there": a capped scan, a mailbox
+    Mail refused to read, a timeout or a denied Automation permission all
+    leave the question OPEN. Reporting them as a missing message turns an
+    incomplete search into a verdict.
+    """
+
+
+async def _locate_header_via_jxa(header: str) -> tuple[str, str, int] | None:
+    """Find a message by its RFC822 header without using the index.
+
+    Returns ``(account, mailbox, id)``, or None when every mailbox of
+    every visible account was searched and the header was genuinely
+    absent.
+
+    Raises:
+        _LiveLookupIncomplete: when the search could not be completed —
+            which is NOT the same answer as "not found".
+    """
+    accounts = await _visible_account_names()
+    if not accounts:
+        one = await _resolve_visible_account(None)
+        accounts = [one] if one else []
+    if not accounts:
+        raise _LiveLookupIncomplete("no visible account could be resolved")
+    script = f"""
+const targets = {json.dumps(accounts)};
+const needle = MailCore.normHeaderValue({json.dumps(header)});
+let hit = null;
+let capped = 0;      // mailboxes past the scan limit
+let unreadable = 0;  // mailboxes Mail refused
+for (const name of targets) {{
+    if (hit) break;
+    let account;
+    try {{ account = MailCore.getAccount(name); }}
+    catch (e) {{ unreadable++; continue; }}
+    let boxes;
+    try {{ boxes = account.mailboxes(); }}
+    catch (e) {{ unreadable++; continue; }}
+    const limit = Math.min(boxes.length, {STRATEGY3_MAX_MAILBOXES});
+    capped += Math.max(0, boxes.length - limit);
+    for (let m = 0; m < limit && !hit; m++) {{
+        let ids;
+        try {{ ids = boxes[m].messages.messageId(); }}
+        catch (e) {{ unreadable++; continue; }}
+        for (let i = 0; i < ids.length; i++) {{
+            if (MailCore.normHeaderValue(ids[i]) === needle) {{
+                hit = {{
+                    account: name,
+                    mailbox: String(boxes[m].name()),
+                    id: boxes[m].messages[i].id(),
+                }};
+                break;
+            }}
+        }}
+    }}
+}}
+JSON.stringify({{hit: hit, capped: capped, unreadable: unreadable}});
+"""
+    try:
+        res = await execute_with_core_async(script, timeout=STRATEGY3_TIMEOUT)
+    except Exception as exc:
+        # Timeout, refused Apple Events, Mail not running: the search
+        # never happened. Saying "not found" here would be a lie.
+        raise _LiveLookupIncomplete(str(exc)) from exc
+    if not isinstance(res, dict):
+        raise _LiveLookupIncomplete("the live search returned no answer")
+    hit = res.get("hit")
+    if hit:
+        return hit["account"], hit["mailbox"], int(hit["id"])
+    skipped = int(res.get("capped") or 0) + int(res.get("unreadable") or 0)
+    if skipped:
+        raise _LiveLookupIncomplete(
+            f"{skipped} mailbox(es) were not searched (scan limit or "
+            f"unreadable), so the message may still exist in one of them"
+        )
+    return None
+
+
+async def _resolve_header_to_location(
+    header: str,
+    account: str | None,
+    mailbox: str | None,
+) -> list[tuple[str, str, int]]:
+    """Candidate ``(account, mailbox, id)`` locations for a header.
+
+    The index answers first, newest-indexed location first, filtered by
+    the account gate. When it has no row at all — the normal state for
+    anything that arrived after the last sync — Apple Mail is asked
+    directly rather than declaring a message missing that is sitting in
+    a mailbox.
+
+    Every candidate is a *hypothesis*: the row may be stale and its
+    ROWID may by now belong to a different message, so the caller has to
+    verify the header on whatever it fetches.
+    """
+    header = header.strip()
+    manager = _get_index_manager()
+    acct_map = _get_account_map()
+    excluded = _excluded_account_names()
+
+    candidates: list[tuple[str, str, int]] = []
+    if manager.has_index():
+        rows = await asyncio.to_thread(manager.find_by_rfc822, header)
+        if rows and excluded:
+            await acct_map.ensure_loaded()
+        for acct_uuid, mbox, rowid in rows:
+            acct_name = acct_map.uuid_to_name(acct_uuid)
+            if acct_name in excluded:
+                continue
+            if account and acct_name != account:
+                continue
+            candidates.append((acct_name, mbox, rowid))
+    if candidates:
+        return candidates
+
+    live = await _locate_header_via_jxa(header)
+    if live is None:
+        return []
+    acct_name, mbox, rowid = live
+    if acct_name in excluded or (account and acct_name != account):
+        return []
+    return [(acct_name, mbox, rowid)]
+
+
+async def _get_email_by_header(
+    header: str,
+    account: str | None,
+    mailbox: str | None,
+) -> EmailFull:
+    """Fetch by RFC822 Message-ID, verifying what comes back.
+
+    The index maps the header to an ``(account, mailbox, ROWID)``, but
+    that row may be stale — the message may since have been filed
+    elsewhere, and the ROWID now belong to a *different* message. So
+    every candidate is fetched and then checked against the header that
+    was asked for; a mismatch moves on to the next candidate rather than
+    returning a stranger's mail.
+    """
+    header = header.strip()
+    try:
+        candidates = await _resolve_header_to_location(header, account, mailbox)
+    except _LiveLookupIncomplete as exc:
+        raise ValueError(
+            f"Email {header!r} is not in the index, and the live search "
+            f"could not be completed: {exc}. This says nothing about "
+            f"whether the message exists — retry, or pass `account` to "
+            f"narrow the search."
+        ) from None
+
+    if not candidates:
+        raise ValueError(
+            f"Email {header!r} was not found in the index and not in any "
+            f"visible account; every mailbox was searched, so it was most "
+            f"likely deleted."
+        )
+
+    last_error: Exception | None = None
+    for acct_name, mbox, rowid in candidates:
+        try:
+            result = await _get_email_by_id(rowid, acct_name, mbox)
+        except Exception as exc:  # try the next known copy
+            last_error = exc
+            continue
+        if _header_key(result.get("message_id")) == _header_key(header):
+            return result
+        # Stale row: that ROWID is somebody else's message now.
+        logger.debug(
+            "Stale index row for %s in %s/%s — ROWID %s now holds %r",
+            header,
+            acct_name,
+            mbox,
+            rowid,
+            result.get("message_id"),
+        )
+
+    if last_error is not None:
+        logger.debug("header lookup last error: %s", last_error)
+    raise ValueError(
+        f"Email {header!r} could not be retrieved: every location on "
+        f"record is stale. Re-index and try again."
+    )
+
+
 async def _resolve_emlx_path(
-    message_id: int,
+    message_id: MessageRef,
     account: str | None = None,
     mailbox: str | None = None,
 ) -> _Path:
-    """Resolve a message ID to an .emlx file path via the index.
+    """Resolve a message reference to an .emlx file path via the index.
 
     Raises:
         ValueError: If the index is missing or email not found.
     """
+    if isinstance(message_id, str):
+        return await _resolve_emlx_path_by_header(message_id, account, mailbox)
     if _hidden_account(account):
         # Hidden account: links/attachment extractors must not reach it.
         raise ValueError(f"Email {message_id} not found.")
@@ -1318,9 +1826,62 @@ async def _resolve_emlx_path(
     return emlx_path
 
 
+async def _resolve_emlx_path_by_header(
+    header: str,
+    account: str | None = None,
+    mailbox: str | None = None,
+) -> _Path:
+    """The .emlx path for a message named by its RFC822 header.
+
+    Same rule as the read cascade: a candidate location is a hypothesis.
+    The file is parsed and its Message-ID compared before the path is
+    handed back, so a stale index row yields the next candidate rather
+    than a stranger's attachment.
+    """
+    from .index.disk import parse_emlx
+
+    header = header.strip()
+    try:
+        candidates = await _resolve_header_to_location(header, account, mailbox)
+    except _LiveLookupIncomplete as exc:
+        raise ValueError(
+            f"Email {header!r} could not be located: {exc}. This says "
+            f"nothing about whether the message exists."
+        ) from None
+    if not candidates:
+        raise ValueError(f"Email {header!r} not found.")
+
+    manager = _get_index_manager()
+    acct_map = _get_account_map()
+    excluded_uuids = await _excluded_account_uuids()
+    for acct_name, mbox, rowid in candidates:
+        acct_uuid = acct_map.name_to_uuid(acct_name) or acct_name
+        path = manager.find_email_path(rowid, account=acct_uuid, mailbox=mbox)
+        if not path or _path_in_excluded_account(path, excluded_uuids):
+            continue
+        candidate = _Path(path)
+        if not candidate.exists():
+            continue
+        parsed = await asyncio.to_thread(parse_emlx, candidate)
+        if parsed is None:
+            continue
+        if _header_key(parsed.message_id_header) == _header_key(header):
+            return candidate
+        logger.debug(
+            "Stale index row for %s: %s holds %r",
+            header,
+            candidate,
+            parsed.message_id_header,
+        )
+    raise ValueError(
+        f"Email {header!r} could not be read: every location on record "
+        f"is stale. Re-index and try again."
+    )
+
+
 @mcp.tool
 async def get_email_links(
-    message_id: int,
+    message_id: MessageRef,
     account: str | None = None,
     mailbox: str | None = None,
 ) -> dict:
@@ -1355,7 +1916,7 @@ async def get_email_links(
 
 @mcp.tool
 async def get_email_attachment(
-    message_id: int,
+    message_id: MessageRef,
     filename: str,
     account: str | None = None,
     mailbox: str | None = None,
@@ -1423,7 +1984,7 @@ async def get_email_attachment(
 
 @mcp.tool
 async def get_attachment(
-    message_id: int,
+    message_id: MessageRef,
     filename: str | None = None,
     account: str | None = None,
     mailbox: str | None = None,
@@ -1714,7 +2275,7 @@ async def search(
 
 @mcp.tool
 async def set_flag(
-    message_ids: int | list[int],
+    message_ids: MessageRef | list[MessageRef],
     color: Literal[
         "default",
         "none",
@@ -1733,9 +2294,14 @@ async def set_flag(
     Flag or unflag one or many messages, optionally in a given color.
 
     Args:
-        message_ids: One id, or a list of them (max 500). A batch is one
-            osascript call per (account, mailbox) group rather than one
-            per message.
+        message_ids: One reference, or a list of them (max 500). A
+            reference is either the numeric `id` or — preferably — the
+            `message_id` header from a read result. The header keeps
+            naming the same message after another device files it
+            elsewhere; the numeric id does not, and cannot even be
+            searched for in another account. A batch is one osascript
+            call per (account, mailbox) group rather than one per
+            message.
         color: "default" flags without forcing a color, "none" unflags,
             and the seven names set that flag color. The server attaches
             NO meaning to any color — what a color stands for is the
@@ -1746,17 +2312,19 @@ async def set_flag(
 
     Returns:
         Per-id buckets: `updated`, `unchanged` (already in that state),
-        `not_found`, `skipped_hidden` (ids in an excluded account), and
-        on trouble `failed` + `error` + `hint`. A batch never fails as a
-        whole — every id you passed appears in exactly one bucket.
+        `not_found`, `skipped_hidden` (references in an excluded
+        account), and on trouble `failed` + `error` + `hint`. A batch
+        never fails as a whole — every reference you passed appears in
+        exactly one bucket, in the form you passed it.
 
         `unchanged` is not a failure: the state was already what you
         asked for, and a no-op write is a server round-trip on
         IMAP/Exchange accounts, so it is deliberately skipped.
 
     Example:
-        >>> set_flag(12345, color="red")
-        {"updated": [12345], "unchanged": [], "not_found": [], ...}
+        >>> set_flag("<a1b2@example.com>", color="red")  # preferred
+        {"updated": ["<a1b2@example.com>"], "unchanged": [], ...}
+        >>> set_flag(12345, color="red")  # numeric id also works
         >>> set_flag([1, 2, 3], color="none")  # unflag a batch
     """
     _ensure_writable()
@@ -1776,7 +2344,7 @@ async def set_flag(
 
 @mcp.tool
 async def set_read_status(
-    message_ids: int | list[int],
+    message_ids: MessageRef | list[MessageRef],
     read: bool = True,
     account: str | None = None,
     mailbox: str | None = None,
@@ -1785,7 +2353,9 @@ async def set_read_status(
     Mark one or many messages as read (seen) or unread (unseen).
 
     Args:
-        message_ids: One id, or a list of them (max 500).
+        message_ids: One reference, or a list of them (max 500) —
+            numeric id or `message_id` header. Prefer the header; see
+            `set_flag`.
         read: True marks as read (default), False as unread.
         account: Optional hint. Speeds up resolution and is required
             (together with `mailbox`) for ids the index cannot place.

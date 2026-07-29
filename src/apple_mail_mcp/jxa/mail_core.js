@@ -229,6 +229,21 @@ const MailCore = {
     },
 
     /**
+     * Message-ID without its angle brackets.
+     *
+     * The `.emlx` header keeps them ("<a@b>"); Apple Mail's messageId
+     * property drops them ("a@b"). Both sides must normalize the same
+     * way or a comparison between them never matches — and a lookup
+     * that never matches reports a missing message that is right there.
+     */
+    normHeaderValue(v) {
+        let s = String(v == null ? "" : v).trim();
+        if (s.charAt(0) === "<") s = s.slice(1);
+        if (s.charAt(s.length - 1) === ">") s = s.slice(0, -1);
+        return s;
+    },
+
+    /**
      * Batch fetch multiple properties from a messages collection.
      * This is THE critical optimization - one IPC call per property
      * instead of one per message.

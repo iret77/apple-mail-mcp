@@ -971,3 +971,58 @@ class TestBatchedStableIdLookup:
 
         out = m.get_rfc822_ids([("acct", "INBOX", i) for i in range(400)])
         assert len(out) == 400
+
+
+class TestFindByRfc822:
+    """Locating an indexed message by its stable header."""
+
+    def _insert(self, m, mid, account, mailbox, header):
+        from apple_mail_mcp.index.schema import (
+            INSERT_EMAIL_SQL,
+            email_to_row,
+        )
+
+        conn = m._get_conn()
+        conn.execute(
+            INSERT_EMAIL_SQL,
+            email_to_row(
+                {"id": mid, "subject": "s", "message_id_header": header},
+                account,
+                mailbox,
+                f"/tmp/{mid}.emlx",
+            ),
+        )
+        conn.commit()
+
+    def test_either_stored_form_matches(self, temp_db_path):
+        """The .emlx keeps the angle brackets, Apple Mail's messageId
+        drops them. A strict comparison finds nothing."""
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "<bracketed@x>")
+        self._insert(m, 2, "acct", "INBOX", "bare@x")
+
+        assert m.find_by_rfc822("bracketed@x")
+        assert m.find_by_rfc822("<bracketed@x>")
+        assert m.find_by_rfc822("bare@x")
+        assert m.find_by_rfc822("<bare@x>")
+
+    def test_a_folded_header_still_matches(self, temp_db_path):
+        """trim() drops spaces but not tabs or newlines, and a folded
+        header brings exactly those."""
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "<\n\tfolded@x >")
+
+        assert m.find_by_rfc822("folded@x")
+
+    def test_every_copy_is_returned(self, temp_db_path):
+        """The same mail legitimately exists in INBOX and an archive, or
+        across accounts — guessing one would be wrong half the time."""
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "<dup@x>")
+        self._insert(m, 2, "acct", "Archive", "<dup@x>")
+
+        assert len(m.find_by_rfc822("<dup@x>")) == 2
+
+    def test_an_unknown_header_returns_nothing(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        assert m.find_by_rfc822("<nope@x>") == []
