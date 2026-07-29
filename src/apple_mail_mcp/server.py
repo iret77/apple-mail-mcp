@@ -214,6 +214,162 @@ def _get_index_manager():
     return IndexManager.get_instance()
 
 
+def _server_version() -> str:
+    """Installed package version, or 'unknown' if not resolvable."""
+    try:
+        from importlib.metadata import version
+
+        return version("apple-mail-mcp")
+    except Exception:
+        return "unknown"
+
+
+def _index_command() -> str:
+    """A copy-pasteable command that builds the index."""
+    return "apple-mail-mcp index --verbose"
+
+
+def _index_guidance(
+    *,
+    state: str,
+    mail_dir_accessible: bool,
+    auto_build: bool,
+    stalled: bool = False,
+    phase: str | None = None,
+) -> tuple[str | None, str | None, list[str], str]:
+    """Turn raw index state into instructions a user can follow.
+
+    macOS grants Full Disk Access to the *responsible app* — whichever
+    process launches the server — so the fix differs by setup. Returns
+    ``(problem, note, next_steps, user_message)``: ``problem`` when
+    something needs fixing, ``note`` when the setup is fine but worth
+    explaining, and always a plain-language message plus GUI-first
+    steps. The terminal command appears only where it is unavoidable.
+    """
+    cmd = _index_command()
+    app = "the app running this"
+
+    if state == "building":
+        if stalled:
+            return (
+                "Index build is stuck — nothing written for a long time.",
+                None,
+                [
+                    f"Quit {app} completely (Cmd-Q) and reopen it — that "
+                    "ends the stuck build and starts a fresh one.",
+                    "If it stalls again, say so: the log records where "
+                    "the build stopped.",
+                ],
+                "The index build looks stuck — nothing has been written "
+                "for a while. Restarting should clear it.",
+            )
+        if phase == "reading_metadata":
+            return (
+                None,
+                "Index build starting: reading Mail's metadata.",
+                [
+                    "No action needed. Nothing is written during this "
+                    "phase, so a count of zero is expected — on a large "
+                    "mailbox it can last several minutes.",
+                    "Ask again in a few minutes; the count starts rising "
+                    "once indexing begins.",
+                ],
+                "The index build is in its warm-up phase — it's reading "
+                "Mail's metadata before it can write anything, so zero "
+                "indexed so far is normal.",
+            )
+        return (
+            None,
+            "Index build in progress.",
+            [
+                "No action needed — the index is building in the background.",
+                "Body search will be incomplete until it finishes; the "
+                "live tools already work.",
+                "Ask for the index status again in a few minutes.",
+            ],
+            "I'm still building the mail search index — the live tools "
+            "work already, full-text search will follow shortly.",
+        )
+
+    if mail_dir_accessible:
+        if state == "ready":
+            return (None, None, [], "The mail index is ready.")
+        # Readable Mail but nothing indexed yet.
+        if auto_build:
+            return (
+                "No usable index yet; it builds automatically on server start.",
+                None,
+                [
+                    f"Quit {app} completely (Cmd-Q) and reopen it to "
+                    "trigger the build.",
+                    "Then ask for the index status again.",
+                ],
+                "There's no mail search index yet. Restarting will build "
+                "it automatically.",
+            )
+        return (
+            "No usable index, and automatic building is switched off.",
+            None,
+            [
+                "Either set APPLE_MAIL_INDEX_AUTO_BUILD=true and restart "
+                f"{app},",
+                f"or open Terminal and run:  {cmd}",
+            ],
+            "There's no mail search index yet, and automatic building is "
+            "turned off — so it has to be built once.",
+        )
+
+    # Mail is unreadable from here: this process has no Full Disk Access.
+    if state == "ready":
+        # Manual setup working exactly as intended.
+        return (
+            None,
+            "Running without Full Disk Access, using an index built elsewhere.",
+            [
+                "Nothing is broken — search uses the existing index, and "
+                "the live tools work normally.",
+                f"To pick up newer mail, run in Terminal:  {cmd}",
+            ],
+            "Everything works. Search uses the index that was built "
+            "outside this app; re-run the index command when you want it "
+            "refreshed.",
+        )
+
+    if auto_build:
+        return (
+            "Cannot read Mail (no Full Disk Access) and there is no index.",
+            None,
+            [
+                "Open System Settings.",
+                "Go to Privacy & Security > Full Disk Access.",
+                f"Switch on {app} in that list.",
+                f"Quit {app} completely (Cmd-Q) and reopen it — the index "
+                "then builds itself.",
+                "Prefer not to grant that? Set "
+                "APPLE_MAIL_INDEX_AUTO_BUILD=false and run this in "
+                f"Terminal instead:  {cmd}",
+            ],
+            "I can't read your mail archive: this app doesn't have Full "
+            "Disk Access, so there's no search index yet. The live tools "
+            "still work.",
+        )
+
+    return (
+        "No index, and this app has no Full Disk Access (manual mode).",
+        None,
+        [
+            "Open Terminal.",
+            "Give the Terminal app Full Disk Access: System Settings > "
+            "Privacy & Security > Full Disk Access.",
+            f"Run:  {cmd}",
+            "After it finishes, search works here — no permission needed "
+            "for this app.",
+        ],
+        "The index still has to be built once from Terminal — that's the "
+        "trade-off for not granting this app full disk access.",
+    )
+
+
 def _get_account_map():
     """Get the AccountMap singleton, lazily imported."""
     from .index.accounts import AccountMap
@@ -1311,6 +1467,174 @@ async def search(
             for e in emails
         ]
     )
+
+
+@mcp.tool
+async def get_index_status() -> dict:
+    """
+    Diagnose the mail index: readiness, build progress, and setup
+    problems — with step-by-step instructions to fix them.
+
+    Call this whenever email tooling behaves unexpectedly, without
+    waiting to be asked: search returns nothing, or the user asks "is it
+    working / how far along is it / why can't you find my mail". Reads
+    state only; changes nothing.
+
+    When the result contains `problem` or `next_steps`, do not just dump
+    the JSON: tell the user what is wrong in their own language and walk
+    them through the steps. Most users have never opened a terminal —
+    `next_steps` is ordered and written for them, so follow it as given.
+
+    Returns:
+        Dict with, among others:
+        - state: "building" | "ready" | "empty" | "absent"
+        - user_message: one plain sentence to relay to the user
+        - next_steps: ordered, non-technical instructions (may be empty)
+        - problem / note: what's wrong, or why the setup is fine anyway
+        - indexed_emails / disk_emails / progress_percent: build
+          progress (counts rise continuously while a build runs)
+        - build_phase / build_appears_stalled / seconds_since_progress:
+          whether a running build is working or wedged
+        - mail_dir_accessible: False means macOS Full Disk Access is
+          missing for the app running this server — the most common
+          cause of an empty index
+        - index_command: the exact command that builds the index
+        - index_mode ("automatic"/"manual"), server_version, read_only
+        - recent_events: what the server actually did, newest first
+          (build/sync started, finished, failed). Under a desktop client
+          this is the only diagnostic channel the user can reach — quote
+          from it when explaining unexpected behaviour.
+        - last_error, failed_parse_jobs, last_sync, staleness_hours,
+          db_size_mb, excluded_accounts: health details
+    """
+    manager = _get_index_manager()
+
+    # Probe Mail access directly: this is the single most common
+    # failure (no Full Disk Access) and it must be reported even when
+    # no index exists yet.
+    mail_dir_accessible = True
+    mail_dir: str | None = None
+    try:
+        from .index.disk import find_mail_directory
+
+        mail_dir = str(await asyncio.to_thread(find_mail_directory))
+    except Exception as exc:
+        mail_dir_accessible = False
+        mail_dir = None
+        logger.debug("Mail directory probe failed: %s", exc)
+
+    building = manager.is_building()
+    has_index = manager.has_index()
+    indexed = await asyncio.to_thread(manager.indexed_email_count)
+
+    if building:
+        state = "building"
+    elif not has_index:
+        state = "absent"
+    elif indexed == 0:
+        # An index file with no rows: an interrupted or permission-denied
+        # first build leaves one behind, and syncing it never fills it.
+        state = "empty"
+    else:
+        state = "ready"
+
+    from .config import get_index_auto_build
+
+    auto_build = get_index_auto_build()
+
+    result: dict = {
+        "state": state,
+        "indexed_emails": indexed,
+        "mail_dir_accessible": mail_dir_accessible,
+        "mail_directory": mail_dir,
+        "index_mode": "automatic" if auto_build else "manual",
+        "server_version": _server_version(),
+        "read_only": get_read_only_mode(),
+        "index_command": _index_command(),
+        "last_error": manager.last_error,
+    }
+
+    # While a build runs, report progress from the cached disk count:
+    # the counts rise as batches commit, and this is exactly when a
+    # percentage is wanted. A fresh disk walk would compete with the
+    # build for I/O, so only the cached denominator is used here.
+    if building:
+        # Heartbeat first: it answers "working or wedged?", which the
+        # raw count cannot when a slow mailbox is being parsed.
+        progress = manager.build_progress()
+        if progress is not None:
+            result["build_phase"] = progress["phase"]
+            result["build_emails_done"] = progress["emails_done"]
+            result["build_files_seen"] = progress["files_seen"]
+            result["seconds_since_progress"] = progress[
+                "seconds_since_progress"
+            ]
+            result["build_appears_stalled"] = progress["appears_stalled"]
+        cached_total = manager.cached_disk_count()
+        if cached_total:
+            result["disk_emails"] = cached_total
+            result["progress_percent"] = round(
+                min(100.0, 100.0 * indexed / cached_total), 1
+            )
+
+    # Richer stats need a disk walk; skip them when Mail is unreachable
+    # (they would only fail) or while a build is running (see above).
+    if has_index and not building and mail_dir_accessible:
+        try:
+            stats = await asyncio.to_thread(manager.get_stats)
+            result.update(
+                {
+                    "disk_emails": stats.disk_email_count,
+                    "mailboxes": stats.mailbox_count,
+                    "attachments": stats.attachment_count,
+                    "db_size_mb": round(stats.db_size_mb, 2),
+                    "failed_parse_jobs": stats.failed_jobs_count,
+                    "excluded_accounts": stats.excluded_accounts,
+                    "last_sync": (
+                        stats.last_sync.isoformat() if stats.last_sync else None
+                    ),
+                    "staleness_hours": (
+                        round(stats.staleness_hours, 2)
+                        if stats.staleness_hours is not None
+                        else None
+                    ),
+                }
+            )
+            if stats.disk_email_count:
+                pct = 100.0 * indexed / stats.disk_email_count
+                result["progress_percent"] = round(min(pct, 100.0), 1)
+        except Exception as exc:
+            logger.debug("get_stats failed: %s", exc, exc_info=True)
+            result["stats_error"] = str(exc)
+
+    # Raw fields alone leave a non-technical user stranded: derive an
+    # explicit diagnosis plus ordered, GUI-first steps the assistant can
+    # read out verbatim.
+    problem, note, next_steps, user_message = _index_guidance(
+        state=state,
+        mail_dir_accessible=mail_dir_accessible,
+        auto_build=auto_build,
+        stalled=bool(result.get("build_appears_stalled")),
+        phase=result.get("build_phase"),
+    )
+    if problem:
+        result["problem"] = problem
+    if note:
+        result["note"] = note
+    if next_steps:
+        result["next_steps"] = next_steps
+    result["user_message"] = user_message
+    # Under a desktop client the server's stderr is unreachable, so this
+    # ring is the only place a user can see what it just did.
+    result["recent_events"] = manager.recent_events()
+    result["assistant_instructions"] = (
+        "Relay `user_message` in the user's language, then walk them "
+        "through `next_steps` one at a time. Assume no terminal "
+        "experience: prefer the System Settings steps, and only offer a "
+        "command if the steps include one — then give it verbatim in a "
+        "code block and explain what it does."
+    )
+    return result
 
 
 # ========== MCP Resources ==========

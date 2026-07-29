@@ -1649,3 +1649,194 @@ class TestGetAttachmentLinksMode:
             assert result["links"][0]["url"] == "https://example.com"
             assert result["links"][0]["text"] == "Example"
             assert "file_path" not in result
+
+
+class TestIndexStatusTool:
+    """`get_index_status()` — the diagnostic channel.
+
+    Under a desktop client the server's stderr reaches nobody: the user
+    sees "it doesn't work" and the assistant has nothing to go on.
+    """
+
+    def _mgr(self, **over):
+        from unittest.mock import MagicMock
+
+        m = MagicMock()
+        m.is_building.return_value = over.pop("building", False)
+        m.has_index.return_value = over.pop("has_index", True)
+        m.indexed_email_count.return_value = over.pop("indexed", 100)
+        m.cached_disk_count.return_value = over.pop("cached", None)
+        m.build_progress.return_value = over.pop("progress", None)
+        m.last_error = over.pop("last_error", None)
+        m.recent_events.return_value = over.pop("events", [])
+        stats = MagicMock()
+        stats.disk_email_count = 120
+        stats.mailbox_count = 4
+        stats.attachment_count = 7
+        stats.db_size_mb = 1.234
+        stats.failed_jobs_count = 0
+        stats.excluded_accounts = []
+        stats.last_sync = None
+        stats.staleness_hours = None
+        m.get_stats.return_value = stats
+        for k, v in over.items():
+            setattr(m, k, v)
+        return m
+
+    async def _status(self, mgr, tmp_path, accessible=True):
+        from unittest.mock import patch
+
+        mail_dir = (
+            {"return_value": tmp_path}
+            if accessible
+            else {"side_effect": PermissionError("no FDA")}
+        )
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.index.disk.find_mail_directory", **mail_dir),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            return await get_index_status()
+
+    @pytest.mark.asyncio
+    async def test_ready_index_reports_ready(self, tmp_path):
+        r = await self._status(self._mgr(), tmp_path)
+
+        assert r["state"] == "ready"
+        assert r["indexed_emails"] == 100
+        assert r["disk_emails"] == 120
+        assert "problem" not in r
+        assert r["user_message"]
+
+    @pytest.mark.asyncio
+    async def test_an_index_file_with_no_rows_is_not_ready(self, tmp_path):
+        """An interrupted or permission-denied first build leaves an
+        empty database behind; syncing it forever never fills it."""
+        r = await self._status(self._mgr(indexed=0), tmp_path)
+
+        assert r["state"] == "empty"
+        assert r["problem"]
+        assert r["next_steps"]
+
+    @pytest.mark.asyncio
+    async def test_unreadable_mail_names_full_disk_access(self, tmp_path):
+        r = await self._status(
+            self._mgr(has_index=False, indexed=0), tmp_path, accessible=False
+        )
+
+        assert r["mail_dir_accessible"] is False
+        assert "Full Disk Access" in r["problem"]
+        assert any("Full Disk Access" in s for s in r["next_steps"])
+
+    @pytest.mark.asyncio
+    async def test_an_index_built_elsewhere_is_not_a_problem(self, tmp_path):
+        """No Full Disk Access plus a working index is a valid setup, not
+        a fault: reporting it as broken sends the user chasing nothing."""
+        r = await self._status(self._mgr(), tmp_path, accessible=False)
+
+        assert "problem" not in r
+        assert r["note"]
+
+    @pytest.mark.asyncio
+    async def test_progress_reported_from_the_cached_disk_count(self, tmp_path):
+        """A fresh walk during a build competes with it for I/O; a count
+        from before it started is a perfectly good denominator."""
+        mgr = self._mgr(
+            building=True,
+            indexed=17_500,
+            cached=70_000,
+            progress={
+                "phase": "indexing",
+                "emails_done": 17_500,
+                "files_seen": 17_500,
+                "seconds_since_progress": 2.0,
+                "appears_stalled": False,
+            },
+        )
+        r = await self._status(mgr, tmp_path)
+
+        assert r["state"] == "building"
+        assert r["progress_percent"] == 25.0
+        mgr.get_stats.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_denominator_means_no_percentage(self, tmp_path):
+        mgr = self._mgr(
+            building=True,
+            indexed=42,
+            cached=None,  # never walked yet
+            progress={
+                "phase": "indexing",
+                "emails_done": 42,
+                "files_seen": 42,
+                "seconds_since_progress": 1.0,
+                "appears_stalled": False,
+            },
+        )
+        r = await self._status(mgr, tmp_path)
+
+        assert r["indexed_emails"] == 42
+        assert "progress_percent" not in r  # honest: no denominator
+
+    @pytest.mark.asyncio
+    async def test_warm_up_phase_explains_a_count_of_zero(self, tmp_path):
+        """Zero indexed during metadata reading is expected. Without the
+        phase, "warming up" and "wedged" are the same observation."""
+        mgr = self._mgr(
+            building=True,
+            indexed=0,
+            cached=63_953,
+            progress={
+                "phase": "reading_metadata",
+                "emails_done": 0,
+                "files_seen": 0,
+                "seconds_since_progress": 150.0,
+                "appears_stalled": False,
+            },
+        )
+        r = await self._status(mgr, tmp_path)
+
+        assert r["build_phase"] == "reading_metadata"
+        assert "problem" not in r  # 150s of no writes is normal here
+        assert "warm-up" in r["user_message"]
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_build_is_called_stuck(self, tmp_path):
+        mgr = self._mgr(
+            building=True,
+            indexed=500,
+            cached=70_000,
+            progress={
+                "phase": "indexing",
+                "emails_done": 500,
+                "files_seen": 500,
+                "seconds_since_progress": 600.0,
+                "appears_stalled": True,
+            },
+        )
+        r = await self._status(mgr, tmp_path)
+
+        assert r["build_appears_stalled"] is True
+        assert "stuck" in r["problem"].lower()
+        assert any("Cmd-Q" in s for s in r["next_steps"])
+
+    @pytest.mark.asyncio
+    async def test_recent_events_are_relayed(self, tmp_path):
+        events = [
+            {"at": "x", "level": "error", "message": "Index build failed"}
+        ]
+        r = await self._status(self._mgr(events=events), tmp_path)
+
+        assert r["recent_events"][0]["message"] == "Index build failed"
+
+    @pytest.mark.asyncio
+    async def test_a_failing_stats_walk_does_not_sink_the_report(
+        self, tmp_path
+    ):
+        mgr = self._mgr()
+        mgr.get_stats.side_effect = RuntimeError("walk exploded")
+        r = await self._status(mgr, tmp_path)
+
+        assert r["state"] == "ready"
+        assert "walk exploded" in r["stats_error"]
