@@ -1649,3 +1649,83 @@ class TestGetAttachmentLinksMode:
             assert result["links"][0]["url"] == "https://example.com"
             assert result["links"][0]["text"] == "Example"
             assert "file_path" not in result
+
+
+class TestAnIncompleteSearchIsNotAnAbsence:
+    """A message may be called missing only when the search covered
+    everywhere it could be.
+
+    A mailbox cap, a mailbox Mail refuses to read, an account that
+    cannot be enumerated — all of them produce the identical empty
+    answer, which is what makes the defect expensive: three different
+    causes are indistinguishable from outside.
+    """
+
+    def test_the_scan_counts_what_it_skipped(self):
+        from apple_mail_mcp.builders import GetEmailBuilder
+
+        js = GetEmailBuilder(message_id=42, account="Work").build()
+        assert "let unsearched = Math.max(0, allMailboxes.length" in js
+        assert "unsearched++" in js
+        assert "INCOMPLETE:" in js
+
+    def test_an_unreadable_account_is_marked_incomplete(self):
+        from apple_mail_mcp.builders import GetEmailBuilder
+
+        js = GetEmailBuilder(message_id=42, account="Work").build()
+        assert "the account could not be read at all" in js
+        # The throw must sit before any per-mailbox loop.
+        assert js.index("could not be read at all") < js.index("mbLimit =")
+
+    @pytest.mark.asyncio
+    async def test_incomplete_scan_does_not_claim_absence(self):
+        from unittest.mock import MagicMock, patch
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+
+        async def incomplete(script, **kw):
+            raise RuntimeError(
+                "Error: Message not found with ID: 42 "
+                "(INCOMPLETE: 9 mailbox(es) not searched)"
+            )
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=incomplete,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+        ):
+            from apple_mail_mcp.server import get_email
+
+            with pytest.raises(ValueError) as err:
+                await get_email(42)
+
+        text = str(err.value)
+        assert "search was incomplete" in text
+        assert "9 mailbox" in text
+        assert "does not mean the message is gone" in text
+
+    @pytest.mark.asyncio
+    async def test_a_complete_scan_may_still_report_not_found(self):
+        """The distinction only helps if a real miss stays a real miss."""
+        from unittest.mock import MagicMock, patch
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+
+        async def clean_miss(script, **kw):
+            raise RuntimeError("Error: Message not found with ID: 42")
+
+        with (
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=clean_miss,
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+        ):
+            from apple_mail_mcp.server import get_email
+
+            with pytest.raises(ValueError, match="not found"):
+                await get_email(42)

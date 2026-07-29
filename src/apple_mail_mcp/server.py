@@ -864,7 +864,20 @@ async def get_email(
         # doubled-up "...Error: Error: Message not found... (-1728)".
         # Surface a clean, model-friendly not-found for that case;
         # re-raise anything else (Mail.app down, permissions) intact.
-        msg = str(exc).lower()
+        raw = str(exc)
+        msg = raw.lower()
+        if "incomplete:" in msg:
+            # The scan stopped early — a mailbox cap, one Mail would not
+            # read, or an account that could not be enumerated. Absence
+            # was never established, so do not claim it: the caller can
+            # act on this, on "not found" it cannot.
+            detail = raw.split("INCOMPLETE:", 1)[-1].rstrip(")").strip()
+            raise ValueError(
+                f"Message {message_id} was not found, but the search was "
+                f"incomplete ({detail} not searched). This does not mean "
+                f"the message is gone — pass `account` and `mailbox` to "
+                f"look in the right place."
+            ) from None
         if "not found" in msg or "-1728" in msg or "can't get object" in msg:
             raise ValueError(f"Message {message_id} not found.") from None
         raise
