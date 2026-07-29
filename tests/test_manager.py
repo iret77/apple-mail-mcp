@@ -240,10 +240,13 @@ class TestClose:
         manager._get_conn()
 
         manager.close()
-        assert manager._conn is None
+        assert manager._open_conns == []
 
         manager.close()  # Should not raise
-        assert manager._conn is None
+        assert manager._open_conns == []
+
+        # A connection is handed out again afterwards.
+        assert manager._get_conn() is not None
 
 
 class TestGetIndexedMessageIds:
@@ -975,9 +978,22 @@ class TestFailedSyncDoesNotWedgeTheIndex:
         same open transaction. `except Exception` does not catch it."""
         from unittest.mock import MagicMock, patch
 
+class TestConnectionsArePerThread:
+    """A shared connection made a background rebuild block the server.
+
+    SQLite connections are not safe to share across threads, and the
+    single instance-level one meant every request needing the index
+    waited behind a rebuild — from outside, the server simply looked
+    frozen.
+    """
+
+    def test_each_thread_gets_its_own(self, temp_db_path):
+        import threading
+
         from apple_mail_mcp.index.manager import IndexManager
 
         mgr = IndexManager(db_path=temp_db_path)
+<<<<<<< HEAD
         conn = MagicMock()
         with (
             patch.object(mgr, "_get_conn", return_value=conn),
@@ -995,3 +1011,37 @@ class TestFailedSyncDoesNotWedgeTheIndex:
             mgr.sync_updates()
 
         conn.rollback.assert_called_once()
+=======
+        seen = []
+
+        def grab():
+            seen.append(id(mgr._get_conn()))
+
+        main = id(mgr._get_conn())
+        t = threading.Thread(target=grab)
+        t.start()
+        t.join()
+
+        assert seen and seen[0] != main
+
+    def test_the_same_thread_keeps_its_connection(self, temp_db_path):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        assert mgr._get_conn() is mgr._get_conn()
+
+    def test_close_releases_every_thread_connection(self, temp_db_path):
+        import threading
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        mgr._get_conn()
+        t = threading.Thread(target=mgr._get_conn)
+        t.start()
+        t.join()
+
+        assert len(mgr._open_conns) == 2
+        mgr.close()
+        assert mgr._open_conns == []
+>>>>>>> c413578 (fix: one SQLite connection per thread, not one per manager)
