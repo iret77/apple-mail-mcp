@@ -1,6 +1,7 @@
 """Tests for disk reading functionality."""
 
 from __future__ import annotations
+import pytest
 
 import email
 from pathlib import Path
@@ -1683,3 +1684,54 @@ class TestGetEmailLinks:
             _synthetic_inline_name("logo.png", "image/jpeg")
             == "inline_logo.png.jpg"
         )
+
+
+class TestOversizedEmailsAreVisible:
+    """A skipped message must never be silently missing from search."""
+
+    def test_limit_is_configurable(self, monkeypatch):
+        from apple_mail_mcp.index.disk import max_emlx_size
+
+        monkeypatch.delenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", raising=False)
+        assert max_emlx_size() == 25 * 1024 * 1024
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "100")
+        assert max_emlx_size() == 100 * 1024 * 1024
+
+    def test_too_large_detection(self, tmp_path, monkeypatch):
+        from apple_mail_mcp.index.disk import emlx_too_large
+
+        f = tmp_path / "big.emlx"
+        f.write_bytes(b"x" * 2048)
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "1")
+        assert emlx_too_large(f) is False  # 2 KB under a 1 MB cap
+
+        # 1 KB cap expressed in MB
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", str(1 / 1024))
+        assert emlx_too_large(f) is True
+
+    def test_scan_reports_the_skip_instead_of_swallowing_it(
+        self, tmp_path, monkeypatch
+    ):
+        from apple_mail_mcp.index import disk
+
+        mail_dir = tmp_path
+        big = tmp_path / "big.emlx"
+        big.write_bytes(b"x" * 4096)
+
+        monkeypatch.setattr(
+            disk, "scan_emlx_files", lambda *a, **k: iter([big])
+        )
+        monkeypatch.setattr(disk, "read_envelope_index", lambda d: {})
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", str(1 / 1024))
+
+        skips: list = []
+        results = list(
+            disk.scan_all_emails(
+                mail_dir, on_skip=lambda p, r: skips.append((p, r))
+            )
+        )
+
+        assert results == []
+        assert skips == [(big, "too_large")]

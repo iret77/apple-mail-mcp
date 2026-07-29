@@ -396,3 +396,31 @@ config_version = 1
 # CLI: apple-mail-mcp serve -r
 # read_only = false
 """
+
+
+def get_index_max_email_mb() -> float:
+    """
+    Largest ``.emlx`` file the indexer will parse, in megabytes.
+
+    Resolution: ``APPLE_MAIL_INDEX_MAX_EMAIL_MB`` env, then
+    ``[index] max_email_mb`` in ``config.toml``, then ``25``.
+
+    The cap exists so one malformed or enormous message cannot exhaust
+    memory. Messages above it are recorded as skipped (visible in
+    ``get_index_status``) rather than silently dropped; raise it if you
+    need very large mail to be searchable.
+    """
+    env = os.environ.get("APPLE_MAIL_INDEX_MAX_EMAIL_MB")
+    if env is not None and env != "":
+        try:
+            parsed = float(env)
+        except ValueError:
+            parsed = 0.0
+        # A non-positive ceiling would skip every message and flood the
+        # dead letter queue; treat it as "unset" rather than obey it.
+        if parsed > 0:
+            return parsed
+    val = _from_toml("index", "max_email_mb")
+    if val is not None and float(val) > 0:
+        return float(val)
+    return 25.0
