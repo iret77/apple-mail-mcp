@@ -151,7 +151,7 @@ no channel at all.
 | # | Branch | Diff | Dep. |
 |---|---|---|---|
 | B1 | `feat/build-progress-and-phases` | `manager.py` | ↑ A6 |
-| B2 | `feat/index-status-tool` | `server.py`, `manager.py` | ↑ B1 |
+| B2 | `feat/index-status-tool` | `server.py`, `manager.py` | ↑ B1, B5 |
 | B3 | `feat/refresh-index-tool` | `server.py` | ⊘ |
 | B4 | `feat/server-log-file` | `cli.py`, `config.py` | ⊘ |
 | B5 | `feat/optional-auto-build` | `cli.py`, `config.py` | ⊘ |
@@ -164,6 +164,10 @@ even if B2 is declined.
 **B2** `get_index_status()` — state, progress, whether `~/Library/Mail` is
 readable (the Full Disk Access test), DLQ counts, actionable `next_steps`.
 *Strip before the PR: `install_mode`, `source_ref`, `SERVER_REVISION`.*
+**Depends on B5 as well as B1** (discovered while cutting): the guidance has to
+know whether the server would build the index itself on restart, or the steps
+it reads out are wrong. Without B5 it would tell the user to run a command that
+auto-build already runs for them.
 
 **B3** `refresh_index(full=False)` — sync on demand, `full=True` rebuilds in the
 background. Two details earned the hard way: it reports `already_running` /
@@ -190,7 +194,7 @@ mailbox. Flipping it is one line, and we deliberately left it off.
 | C1 | `feat/stable-identity-schema` | `schema.py`, `manager.py`, `sync.py`, `disk.py`, `watcher.py` | ⊘ |
 | C2 | `feat/expose-message-id-in-reads` | `search.py`, `server.py`, `builders.py`, `mail_core.js` | ↑ C1 |
 | C3 | `feat/write-tools` | `builders.py`, `server.py` | ⊘ |
-| C4 | `feat/message-id-as-write-reference` | `server.py`, `builders.py` | ↑ C2, C3 |
+| C4 | `feat/message-id-as-write-reference` | `server.py`, `builders.py`, `mail_core.js` | ↑ C2, C3, A9 |
 
 **C1** schema v6: an `rfc822_message_id` column plus index, migration v5→v6 as
 an in-place `ALTER`. Pure storage, no behaviour change — but the prerequisite
@@ -216,7 +220,10 @@ discard the fast writes; excluded accounts (#90) never reach JXA. A regression
 test enforces the read-only gate for any future `set_`/`flag_`/`mark_` tool.
 *Hook: your `APPLE_MAIL_READ_ONLY` from #80 finally has something to guard.*
 
-**C4** the tools accept the header as a reference. **A header is never
+**C4** the tools accept the header as a reference. **Depends on A9 as well**
+(discovered while cutting): the recovery path must not land a write in a
+trash/junk mailbox, and deciding which mailbox that is by role rather than by a
+word list of its own is exactly what A9 provides. **A header is never
 translated back into a ROWID and then trusted** — writing matches
 `msg.messageId()` in JXA, reading fetches each candidate and verifies the
 header on what came back, moving to the next on a mismatch and raising rather
@@ -259,7 +266,7 @@ every page and let the caller conclude the backlog is empty.
 
 # Sequencing
 
-Do not open all 17 at once — for a single maintainer that is an avalanche, and
+Do not open all 22 at once — for a single maintainer that is an avalanche, and
 it achieves the opposite of "decide in detail".
 
 1. **First wave: A1, A3, A4.** Three small, low-risk fixes, reviewable in
@@ -273,18 +280,43 @@ it achieves the opposite of "decide in detail".
 5. **Then an umbrella issue** carrying the table above. The maintainer says what
    they want to see; tracks B and C become PRs only after that.
 
-# Preparation before the first diff
+# Preparation — done
 
-1. **Redistribute the tests.** Everything new sits in `tests/test_write_ops.py`,
-   named after our branch. Upstream expects tests next to their code:
-   `test_disk.py`, `test_manager.py`, `test_server.py`, `test_sync.py`,
-   `test_watcher.py`, `test_config.py`.
-2. **Cut branches from the end state, do not cherry-pick.** Our history
+1. **Tests redistributed.** They sat in `tests/test_write_ops.py`, named after
+   our branch; upstream expects them next to the code they exercise. Split by
+   subject into `test_disk.py`, `test_manager.py`, `test_config.py`,
+   `test_jxa_core.py`, `test_server.py`, with the write surface left in
+   `test_write_ops.py` — verified by comparing test names before and after.
+2. **Branches cut from the end state, not cherry-picked.** Our history
    interleaves topics (several "fix: N defects found by review" commits each
-   correct earlier ones).
-3. **Strip the fork-specific pieces** (table above).
-4. **Split CLAUDE.md proportionally** — each PR carries its own share of the
-   documentation instead of one lump at the end.
+   correct earlier ones), so each unit was transplanted into a worktree branched
+   from `ee655d4` and verified there.
+3. **Fork-specific pieces stripped** via `scripts/fork-only.py strip`.
+4. **CLAUDE.md split proportionally** — each unit carries its own share.
+
+# The 22 branches (in this fork, nothing pushed to upstream)
+
+Every branch is based on `ee655d4` (upstream HEAD) or, where a dependency is
+named above, on the branch it builds on. Each was verified in its own worktree
+with `ruff check src/`, `ruff format --check`, and the full `pytest` run.
+
+```
+Track A  fix/emlx-header-decoding                fix/oversized-emails-visible
+         fix/stale-emlx-flags                    fix/local-timestamps
+         fix/sync-transaction-rollback           fix/per-thread-connections
+         perf/rebuild-fts-delete-all             fix/cross-process-write-lock
+         fix/mailbox-roles-not-names             fix/incomplete-search-is-not-absence
+Track B  feat/build-progress-and-phases          feat/index-status-tool
+         feat/refresh-index-tool                 feat/server-log-file
+         feat/optional-auto-build
+Track C  feat/stable-identity-schema             feat/expose-message-id-in-reads
+         feat/write-tools                        feat/message-id-as-write-reference
+Track D  feat/batch-reads                        feat/cross-account-listing
+         feat/mailbox-pagination
+```
+
+Two units grew a dependency that only became visible once they were cut in
+isolation — both are recorded in the tables above rather than worked around.
 
 # Release gate
 
