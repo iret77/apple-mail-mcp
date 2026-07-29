@@ -58,6 +58,8 @@ surface; all repair demonstrably broken behaviour.
 | A6 | `fix/per-thread-connections` | `manager.py` | ↑ A5 |
 | A7 | `perf/rebuild-fts-delete-all` | `manager.py` | ↑ A6 |
 | A8 | `fix/cross-process-write-lock` | `manager.py`, `watcher.py` | ↑ A6 |
+| A9 | `fix/mailbox-roles-not-names` | `jxa/mail_core.js` | ⊘ |
+| A10 | `fix/incomplete-search-is-not-absence` | `server.py`, `builders.py` | ⊘ |
 
 **A1 — an undecodable header aborts the entire sync.** A non-ASCII `Subject`,
 `Received`, `Content-ID` or attachment filename makes Python's `email` module
@@ -99,6 +101,33 @@ separable; they all live in `manager.py` and therefore stack textually:
 - **A8 cross-process lock** (`fcntl.flock`). A `threading.Lock` is not enough:
   Claude Desktop starts the server **twice** — your open issue **#106**. Falls
   back to thread-only locking when the lock file cannot be created.
+
+**A9 — a mailbox name is the weakest handle there is.** It changes with the
+system language (`Posteingang`), with the macOS version (Apple's own German docs
+still say `Eingang`), and with the provider (`Deleted Items`,
+`[Gmail]/Sent Mail`, `INBOX.Trash`). Defaulting to the string `INBOX` fails
+outright on a localized install. `getMailbox()` resolves by role instead: exact
+name → Mail's own special-mailbox property → a normalized match that ignores
+case and provider hierarchy → a table of localized and legacy names → and if
+nothing matches, an error naming the role **and listing the mailboxes that do
+exist**. The table covers seventeen languages, every entry taken from Apple's
+localized Mail user guide or a documented provider/legacy name. Verified against
+a matrix of account shapes (Exchange, Gmail, dovecot, older macOS wording).
+
+**A10 — an incomplete search is not a verdict.** A tool may report a message
+absent only when the search actually covered everywhere it could be. A mailbox
+cap, a mailbox Mail refuses to read, a timeout, a denied Apple Events
+permission, an account that could not be enumerated — all leave the question
+open and produce the *identical* empty answer, which is what makes the defect so
+expensive. An external review found twelve instances in one pass. Each scan
+branch now counts what it left out, the read paths raise instead of returning
+None, and a stale `.emlx` path continues into the live strategies rather than
+claiming "deleted or moved" on an assumption that was never checked. A guard
+test allows the word "deleted" exactly once, in the branch where a complete
+search establishes it.
+
+*A10 is partly independent of tracks B and C: `get_email`'s Strategy 3 scan and
+the stale-path shortcut exist in upstream today.*
 
 ## Track B — diagnostics (additive, the tool surface grows)
 
@@ -180,6 +209,39 @@ translated back into a ROWID and then trusted** — writing matches
 header on what came back, moving to the next on a mismatch and raising rather
 than returning a stranger's mail.
 
+## Track D — fewer round-trips
+
+The cost of reading mail here is the round-trip, not the read: a single message
+comes off disk in 1-5 ms. These three remove call counts that scale with the
+number of messages.
+
+| # | Branch | Diff | Dep. |
+|---|---|---|---|
+| D1 | `feat/batch-reads` | `server.py` | ⊘ |
+| D2 | `feat/cross-account-listing` | `server.py` | ⊘ |
+| D3 | `feat/mailbox-pagination` | `server.py`, `envelope_direct.py` | ⊘ |
+
+**D1** `get_email` accepts a list of up to 50 references and returns one entry
+per reference, in order, each either `{"ref", "email"}` or `{"ref", "error"}` —
+one unreadable message never sinks the batch. A single reference keeps its old
+single-object shape. The cap is about how much text fits in a model's context,
+not about speed, and the error says so.
+
+**D2** `get_emails(account="all")` lists across every visible account in one
+call. The Envelope Index query already means "every account" when given no
+UUID; only the tool's defaulting stood in the way — and with it an `INBOX`
+default that narrows the result to whichever account happens to have a mailbox
+by that name (on a localized Mail, none). Exclusions still hold, by UUID. The
+JXA fallback refuses rather than quietly answering a one-account question.
+
+**D3** `get_emails(before=, after=, offset=)` makes a mailbox walkable
+backwards. Without it only the newest N per mailbox are reachable, so a backlog
+cannot be approached at all and `search()` — which requires keywords — is no
+substitute for a gapless reverse scan. `before` is the stable cursor: hand it
+the oldest `date_received` seen. The JXA fallback refuses these parameters
+rather than dropping them; ignoring a window would return the same newest N on
+every page and let the caller conclude the backlog is empty.
+
 ---
 
 # Sequencing
@@ -191,7 +253,11 @@ it achieves the opposite of "decide in detail".
    minutes.
 2. **Second wave after the first feedback: A2, A5–A8** — the `manager.py` stack,
    pointing at their open #106.
-3. **Then an umbrella issue** carrying the table above. The maintainer says what
+3. **A9 and A10 fit the first or second wave** — both are bug fixes against
+   code upstream already has, and A9 in particular makes the server usable at
+   all on a non-English Mail.
+4. **Track D can follow at any point**; none of it depends on B or C.
+5. **Then an umbrella issue** carrying the table above. The maintainer says what
    they want to see; tracks B and C become PRs only after that.
 
 # Preparation before the first diff
