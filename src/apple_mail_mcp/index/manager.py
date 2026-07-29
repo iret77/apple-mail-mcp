@@ -97,7 +97,11 @@ class IndexManager:
             db_path: Custom database path (uses config default if None)
         """
         self._db_path = db_path or get_index_path()
-        self._conn: sqlite3.Connection | None = None
+        # One connection PER THREAD. A single shared connection meant a
+        # background rebuild blocked every request that needed the
+        # index, and the server looked frozen from outside.
+        self._local = threading.local()
+        self._open_conns: list[sqlite3.Connection] = []
         self._conn_lock = threading.Lock()
         self._watcher: IndexWatcher | None = None
         self._watcher_callback: Callable[[int, int], None] | None = None
@@ -132,16 +136,24 @@ class IndexManager:
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get or create the database connection (thread-safe)."""
-        with self._conn_lock:
-            if self._conn is None:
-                self._conn = init_database(self._db_path)
-            return self._conn
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = init_database(self._db_path)
+            self._local.conn = conn
+            with self._conn_lock:
+                self._open_conns.append(conn)
+        return conn
 
     def close(self) -> None:
         """Close the database connection."""
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        with self._conn_lock:
+            conns, self._open_conns = self._open_conns, []
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("Closing a pooled connection failed")
+        self._local = threading.local()
 
     def has_index(self) -> bool:
         """Check if an index database exists."""
