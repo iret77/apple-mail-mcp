@@ -520,12 +520,25 @@ class IndexManager:
 
         exclude_account_uuids = self._resolve_exclusions()
 
-        result = sync_from_disk(
-            self._get_conn(),
-            mail_dir,
-            progress_callback,
-            exclude_account_uuids=exclude_account_uuids,
-        )
+        conn = self._get_conn()
+        try:
+            result = sync_from_disk(
+                conn,
+                mail_dir,
+                progress_callback,
+                exclude_account_uuids=exclude_account_uuids,
+            )
+        except Exception:
+            # A sync that raises mid-run leaves its write transaction
+            # open, and every later write then fails with "database is
+            # locked" until the process restarts. The index looks dead
+            # while nothing is actually wrong with it.
+            try:
+                conn.rollback()
+            except Exception:
+                logger.debug("Rollback after failed sync failed too")
+            logger.exception("Sync failed")
+            raise
         # Disk inventory just changed (or was just verified) — drop
         # the get_stats cache so the next status call reflects truth.
         self.invalidate_disk_count_cache()

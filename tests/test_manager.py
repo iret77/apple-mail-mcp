@@ -906,3 +906,62 @@ class TestWatcher:
         assert manager.watcher_running is False
         manager.stop_watcher()  # Should not raise
         assert manager.watcher_running is False
+
+
+class TestFailedSyncDoesNotWedgeTheIndex:
+    """A sync that raises must not leave its transaction open.
+
+    It did: every later write then failed with "database is locked"
+    until the process restarted, and the index looked dead while
+    nothing was actually wrong with it. Two other causes were chased
+    first because the symptom is identical.
+    """
+
+    def test_rollback_runs_and_the_error_propagates(self, temp_db_path):
+        from unittest.mock import MagicMock, patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        conn = MagicMock()
+        with (
+            patch.object(mgr, "_get_conn", return_value=conn),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch(
+                "apple_mail_mcp.index.sync.sync_from_disk",
+                side_effect=RuntimeError("disk went away mid-run"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            mgr.sync_updates()
+
+        conn.rollback.assert_called_once()
+
+    def test_a_failing_rollback_does_not_mask_the_real_error(
+        self, temp_db_path
+    ):
+        from unittest.mock import MagicMock, patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        conn = MagicMock()
+        conn.rollback.side_effect = RuntimeError("rollback failed too")
+        with (
+            patch.object(mgr, "_get_conn", return_value=conn),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch(
+                "apple_mail_mcp.index.sync.sync_from_disk",
+                side_effect=RuntimeError("the original failure"),
+            ),
+            pytest.raises(RuntimeError, match="the original failure"),
+        ):
+            mgr.sync_updates()
