@@ -280,6 +280,7 @@ class IndexManager:
     def build_from_disk(
         self,
         progress_callback: Callable[[int, int | None, str], None] | None = None,
+        on_started: Callable[[], None] | None = None,
     ) -> int:
         """
         Build the index by reading .emlx files directly from disk.
@@ -305,6 +306,12 @@ class IndexManager:
         # Resolve excluded account names -> UUIDs (one JXA call, only
         # when exclusions are configured) so the JXA-free disk walk can
         # skip whole accounts. Excluded accounts never enter the index.
+        if on_started is not None:
+            # Signals that the build really began. A caller that reports
+            # "started" without this cannot tell a running build from
+            # one that was refused on its first line.
+            on_started()
+
         exclude_account_uuids = self._resolve_exclusions()
 
         conn = self._get_conn()

@@ -1649,3 +1649,77 @@ class TestGetAttachmentLinksMode:
             assert result["links"][0]["url"] == "https://example.com"
             assert result["links"][0]["text"] == "Example"
             assert "file_path" not in result
+
+
+class TestRefreshIndexTool:
+    """Update the index without restarting the server.
+
+    The index syncs at startup. Anyone searching for a message that
+    arrived during the session did not find it and had no way to change
+    that short of restarting the client.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sync_reports_the_change_count(self):
+        from unittest.mock import MagicMock, patch
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.sync_updates.return_value = 7
+
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index()
+
+        assert r["status"] == "completed"
+        assert r["changes"] == 7
+
+    @pytest.mark.asyncio
+    async def test_a_failed_sync_is_not_reported_as_success(self):
+        from unittest.mock import MagicMock, patch
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.sync_updates.side_effect = RuntimeError("disk went away")
+
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index()
+
+        assert r["status"] == "failed"
+        assert "disk went away" in r["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_rebuild_does_not_claim_it_started(self):
+        """ "started" for a build refused on its first line reads as
+        success and sends the caller off waiting for nothing."""
+        from unittest.mock import MagicMock, patch
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.build_from_disk.side_effect = RuntimeError("already running")
+
+        with patch(
+            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        ):
+            from apple_mail_mcp.server import refresh_index
+
+            r = await refresh_index(full=True)
+
+        assert r["status"] != "started"
+
+    def test_the_docstring_claims_the_rebuild_vocabulary(self):
+        """Without it a model sends the user to Mail.app's own rebuild."""
+        import inspect
+
+        from apple_mail_mcp import server
+
+        doc = (inspect.getdoc(server.refresh_index) or "").lower()
+        assert "rebuild" in doc
+        assert "mailbox > rebuild" in doc or "envelope index" in doc

@@ -30,6 +30,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path as _Path
@@ -136,6 +137,13 @@ def _validate_date(value: str | None, param: str) -> str | None:
             f"(e.g. 2026-01-31)"
         ) from e
     return value
+
+
+# How long refresh_index(full=True) waits for the background build to
+# actually start before answering. Without the wait it reported
+# "started" for a build that had already been refused on its first
+# line, which reads as success.
+BUILD_START_TIMEOUT = 5.0
 
 
 # ========== Response Type Definitions ==========
@@ -1311,6 +1319,113 @@ async def search(
             for e in emails
         ]
     )
+
+
+@mcp.tool
+async def refresh_index(full: bool = False) -> dict:
+    """
+    Update or completely rebuild THIS server's mail search index.
+
+    Use this for any request to refresh, update, re-index, rebuild or
+    recreate the mail index or mail search — including "rebuild the mail
+    index from scratch" and its equivalents in other languages (e.g.
+    German "bau den Mail-Index neu auf"). Pass full=True whenever the
+    user says rebuild, from scratch, completely or similar.
+
+    This is the FTS5 index this server maintains at
+    ~/.apple-mail-mcp/index.db. It is NOT Apple Mail's own envelope
+    index, and it has nothing to do with Mail.app's "Mailbox > Rebuild"
+    menu item — never send the user there for this; you can do it here.
+
+    The index otherwise syncs only when the server starts, so a
+    long-running client drifts out of date. Also call it when
+    `get_index_status` reports a large `staleness_hours`, or when a
+    message the user just received cannot be found.
+
+    This touches only the local index — never the mail itself — so it is
+    allowed in read-only mode.
+
+    Args:
+        full: False (default) syncs changes since the last run — fast,
+            returns when done. True discards the index and rebuilds from
+            scratch; that takes minutes, so it runs in the background and
+            returns immediately. Only use it when the index is suspected
+            to be corrupt.
+
+    Returns:
+        Dict with `status` ("completed", "started", "already_running" or
+        "failed"), a `message` to relay, and `changes` (added + deleted +
+        moved) for a completed sync.
+    """
+    manager = _get_index_manager()
+
+    # A full rebuild is far too slow to block an MCP call on, and so is
+    # the first build of a large mailbox — run both detached.
+    if full or not manager.has_index():
+        # Confirm the build actually begins before claiming it did.
+        # Reporting "started" for a thread that died on the first line
+        # is how a refused build looked like a running one: the status
+        # then said "ready" forever and nothing explained the mismatch.
+        started = threading.Event()
+        outcome: list[BaseException] = []
+
+        def _build() -> None:
+            try:
+                manager.build_from_disk(on_started=started.set)
+            except BaseException as exc:
+                outcome.append(exc)
+                logger.warning("Background index build failed", exc_info=True)
+            finally:
+                started.set()  # never leave the caller waiting
+
+        threading.Thread(target=_build, daemon=True).start()
+        await asyncio.to_thread(started.wait, BUILD_START_TIMEOUT)
+
+        if outcome:
+            exc = outcome[0]
+            if "already running" in str(exc).lower():
+                return {
+                    "status": "already_running",
+                    "message": (
+                        "An index update is already running, so a rebuild "
+                        "could not start. Ask for the index status to see "
+                        "how far along it is, then try again."
+                    ),
+                }
+            return {
+                "status": "failed",
+                "message": "The index rebuild could not be started.",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        return {
+            "status": "started",
+            "message": (
+                "Building the index in the background. This can take "
+                "several minutes on a large mailbox — ask for the index "
+                "status to see progress."
+            ),
+        }
+
+    try:
+        changes = await asyncio.to_thread(manager.sync_updates)
+    except Exception as exc:
+        # A raw traceback is useless to the user this tool exists for.
+        logger.warning("Index sync failed", exc_info=True)
+        return {
+            "status": "failed",
+            "message": "The index could not be updated.",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "status": "completed",
+        "changes": changes,
+        "message": (
+            f"Index updated: {changes} change(s)."
+            if changes
+            else "Index was already up to date."
+        ),
+    }
 
 
 # ========== MCP Resources ==========
