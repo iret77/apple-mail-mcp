@@ -1683,3 +1683,59 @@ class TestGetEmailLinks:
             _synthetic_inline_name("logo.png", "image/jpeg")
             == "inline_logo.png.jpg"
         )
+
+
+class TestContentIdHeaderCrash:
+    """The one file the log showed still failing after the first header
+    fix: an inline image with a non-ASCII Content-ID."""
+
+    def _emlx(self, tmp_path, mime: bytes):
+        p = tmp_path / "1.emlx"
+        p.write_bytes(
+            f"{len(mime)}\n".encode()
+            + mime
+            + b"<?xml version='1.0'?><plist><dict></dict></plist>"
+        )
+        return p
+
+    def test_non_ascii_content_id_parses(self, tmp_path):
+        from apple_mail_mcp.index.disk import parse_emlx
+
+        mime = (
+            b"From: a@b.com\r\nSubject: t\r\n"
+            b"Date: Mon, 1 Jan 2026 10:00:00 +0100\r\n"
+            b'Content-Type: multipart/mixed; boundary="B"\r\n\r\n--B\r\n'
+            b"Content-Type: text/plain\r\n\r\nbody\r\n--B\r\n"
+            b"Content-Type: image/png\r\nContent-ID: <H\xe4ndler>\r\n\r\n"
+            b"XX\r\n--B--\r\n"
+        )
+        parsed = parse_emlx(self._emlx(tmp_path, mime))
+        assert parsed is not None
+        assert len(parsed.attachments or []) == 1
+
+    def test_non_ascii_attachment_filename_parses(self, tmp_path):
+        from apple_mail_mcp.index.disk import parse_emlx
+
+        mime = (
+            b"From: a@b.com\r\nSubject: t\r\n"
+            b"Date: Mon, 1 Jan 2026 10:00:00 +0100\r\n"
+            b'Content-Type: multipart/mixed; boundary="B"\r\n\r\n--B\r\n'
+            b"Content-Type: text/plain\r\n\r\nbody\r\n--B\r\n"
+            b"Content-Type: application/pdf\r\n"
+            b"Content-Disposition: attachment; "
+            b'filename="H\xe4ndler.pdf"\r\n\r\n'
+            b"XX\r\n--B--\r\n"
+        )
+        parsed = parse_emlx(self._emlx(tmp_path, mime))
+        assert parsed is not None
+        assert len(parsed.attachments or []) == 1
+
+    def test_no_raw_header_access_remains_in_the_parser(self):
+        """Every header must go through header_text/_filename_text —
+        two rounds of this bug came from a missed raw access."""
+        from pathlib import Path as _P
+
+        src = _P("src/apple_mail_mcp/index/disk.py").read_text()
+        body = src[src.index("def parse_emlx") :]
+        for pattern in ('msg["', 'part.get("Content-ID")', "get_filename()"):
+            assert pattern not in body, pattern

@@ -283,7 +283,12 @@ def sync_from_disk(
 
                 added += 1
                 mailbox_counts[mb_key] = current_count + 1
-        except (OSError, ValueError, UnicodeDecodeError) as e:
+        # One unparseable message must never abort the whole sync: a
+        # single mail with an undecodable header stopped every later
+        # message from being indexed for a full day. The narrow tuple
+        # this replaced could not catch the AttributeError raised when
+        # a Header object turns up where a str was expected.
+        except Exception as e:
             logger.debug("Failed to parse %s: %s", path, e)
             errors += 1
             # Record into the DLQ for visibility / future retry.
