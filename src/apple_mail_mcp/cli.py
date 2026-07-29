@@ -86,6 +86,58 @@ def _progress_bar(current: int, total: int | None, width: int = 40) -> str:
     return f"[{bar}] {pct * 100:.0f}%"
 
 
+def _setup_file_logging() -> Path | None:
+    """Send this process's logs to a file we control.
+
+    Under a desktop client the server's stderr reaches nobody, so a
+    build that dies leaves nothing behind without this. Rotating and
+    small: diagnostics must not grow without bound. Returns the active
+    path, or None when file logging is disabled or unavailable.
+    """
+    import logging
+    import os as _os
+    from logging.handlers import RotatingFileHandler
+
+    from .config import get_log_path
+
+    class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
+        """Rotating handler that recreates the file 0600 every time.
+
+        A one-shot chmod cannot hold this: on rollover the handler
+        reopens the path with plain open(), i.e. 0644 under the usual
+        umask, and the live log — which carries mail paths and account
+        names — would silently become world-readable from the first
+        rotation onward.
+        """
+
+        def _open(self):
+            fd = _os.open(
+                self.baseFilename,
+                _os.O_APPEND | _os.O_CREAT | _os.O_WRONLY,
+                0o600,
+            )
+            return _os.fdopen(fd, self.mode, encoding=self.encoding)
+
+    path = get_log_path()
+    if path is None:
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = _OwnerOnlyRotatingFileHandler(
+            path, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        root = logging.getLogger("apple_mail_mcp")
+        root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        return path
+    except OSError as e:
+        print(f"Warning: could not open log file: {e}", file=sys.stderr)
+        return None
+
+
 def _run_serve(watch: bool = False, read_only: bool = False) -> None:
     """Internal function to run the MCP server."""
     import threading
@@ -97,6 +149,10 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
     if read_only:
         set_read_only_mode(True)
         print("Read-only mode enabled", file=sys.stderr)
+
+    log_path = _setup_file_logging()
+    if log_path is not None:
+        print(f"Logging to {log_path}", file=sys.stderr)
 
     manager = IndexManager.get_instance()
 

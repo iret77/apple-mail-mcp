@@ -1649,3 +1649,87 @@ class TestGetAttachmentLinksMode:
             assert result["links"][0]["url"] == "https://example.com"
             assert result["links"][0]["text"] == "Example"
             assert "file_path" not in result
+
+
+class TestServerLogFile:
+    """The server's own log file.
+
+    Under a desktop client stderr reaches nobody: the user sees "it
+    doesn't work" and there is no record of why. A file we control is
+    the only channel left.
+    """
+
+    def test_log_path_is_configurable_and_disableable(self, monkeypatch):
+        from apple_mail_mcp.config import get_log_path
+
+        monkeypatch.delenv("APPLE_MAIL_LOG_PATH", raising=False)
+        assert get_log_path().name == "server.log"
+
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", "/tmp/custom.log")
+        assert str(get_log_path()) == "/tmp/custom.log"
+
+        # Disabled must be an explicit None: Path("") normalizes to
+        # ".", which is truthy, so a plain falsy guard never fires and
+        # the handler tries to open the current directory as a file.
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", "")
+        assert get_log_path() is None
+
+    def test_file_log_is_written_and_owner_only(self, tmp_path, monkeypatch):
+        import logging
+
+        from apple_mail_mcp.cli import _setup_file_logging
+
+        target = tmp_path / "sub" / "server.log"
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", str(target))
+        path = _setup_file_logging()
+        try:
+            logging.getLogger("apple_mail_mcp.test").info("hello from test")
+            for h in logging.getLogger("apple_mail_mcp").handlers:
+                h.flush()
+
+            assert path == target
+            assert target.exists()
+            assert "hello from test" in target.read_text()
+            assert oct(target.stat().st_mode)[-3:] == "600"
+        finally:
+            root = logging.getLogger("apple_mail_mcp")
+            for h in list(root.handlers):
+                h.close()
+                root.removeHandler(h)
+
+    def test_disabled_logging_installs_no_handler(self, monkeypatch):
+        import logging
+
+        from apple_mail_mcp.cli import _setup_file_logging
+
+        before = len(logging.getLogger("apple_mail_mcp").handlers)
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", "")
+        assert _setup_file_logging() is None
+        assert len(logging.getLogger("apple_mail_mcp").handlers) == before
+
+    def test_rotated_log_stays_owner_only(self, tmp_path, monkeypatch):
+        """chmod once is not enough: on rollover the handler reopens the
+        path with plain open(), i.e. 0644 under the usual umask."""
+        import logging
+
+        from apple_mail_mcp.cli import _setup_file_logging
+
+        target = tmp_path / "server.log"
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", str(target))
+        _setup_file_logging()
+        root = logging.getLogger("apple_mail_mcp")
+        try:
+            handler = root.handlers[-1]
+            handler.maxBytes = 200  # force a rollover
+            log = logging.getLogger("apple_mail_mcp.rotate_test")
+            for i in range(50):
+                log.info("padding line %d %s", i, "x" * 40)
+            handler.flush()
+
+            assert (tmp_path / "server.log.1").exists(), "no rollover"
+            for f in (target, tmp_path / "server.log.1"):
+                assert oct(f.stat().st_mode)[-3:] == "600", f
+        finally:
+            for h in list(root.handlers):
+                h.close()
+                root.removeHandler(h)

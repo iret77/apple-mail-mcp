@@ -13,6 +13,7 @@ from pathlib import Path
 
 # Default index location
 DEFAULT_INDEX_PATH = Path.home() / ".apple-mail-mcp" / "index.db"
+DEFAULT_LOG_PATH = Path.home() / ".apple-mail-mcp" / "server.log"
 CONFIG_FILE_PATH = Path.home() / ".apple-mail-mcp" / "config.toml"
 
 CONFIG_SCHEMA_VERSION = 1
@@ -305,6 +306,23 @@ def get_index_staleness_hours() -> float:
 # ========== Server Mode ==========
 
 _read_only_mode: bool = False
+
+
+def get_log_path() -> Path | None:
+    """Where the server writes its own log.
+
+    The server's stderr is not reachable when it runs under a desktop
+    client, so without a file of our own a crash leaves no trace at all.
+    Set ``APPLE_MAIL_LOG_PATH`` to relocate it, or to an empty string to
+    disable file logging.
+    """
+    env = os.environ.get("APPLE_MAIL_LOG_PATH")
+    if env is not None:
+        # Explicit None for "disabled": Path("") normalizes to ".",
+        # which is a truthy directory — the guard never fired and the
+        # handler tried to open the current directory as a file.
+        return Path(env).expanduser() if env else None
+    return DEFAULT_LOG_PATH
 
 
 def get_read_only_mode() -> bool:
