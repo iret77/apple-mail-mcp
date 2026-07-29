@@ -207,6 +207,38 @@ class EmailFull(TypedDict, total=False):
 # ========== Helper Functions ==========
 
 
+async def _overlay_live_flags(result: dict, message_id: int) -> None:
+    """Replace disk-derived read/flagged with Mail's live values.
+
+    The `.emlx` plist footer is written when Mail stores the file and is
+    not reliably rewritten when the user toggles a flag or read state in
+    the UI. Reporting those stale bits makes the assistant contradict
+    what the user sees — and skip a write it should have made ("it's
+    already flagged"). Apple's Envelope Index has the current values, so
+    overlay them in place. Best-effort: on any failure the parsed values
+    stand, exactly as before.
+    """
+    try:
+        from .index.disk import find_mail_directory
+        from .index.envelope_direct import (
+            envelope_index_path,
+            fetch_message_flags,
+        )
+
+        env_path = envelope_index_path(find_mail_directory())
+        if not env_path.exists():
+            return
+        live = await asyncio.to_thread(
+            fetch_message_flags, env_path, message_id
+        )
+        if live is not None:
+            result["read"], result["flagged"] = live
+    except Exception as exc:
+        logger.debug(
+            "Live flag overlay unavailable for %s: %s", message_id, exc
+        )
+
+
 def _get_index_manager():
     """Get the IndexManager singleton, lazily imported."""
     from .index import IndexManager
@@ -730,6 +762,7 @@ async def get_email(
                                 for a in (parsed.attachments or [])
                             ],
                         }
+                        await _overlay_live_flags(result, message_id)
                         return _enrich_attachments(result)
                 else:
                     stale_index_entry = (idx_acct, mailbox)

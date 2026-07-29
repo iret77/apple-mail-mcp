@@ -1649,3 +1649,91 @@ class TestGetAttachmentLinksMode:
             assert result["links"][0]["url"] == "https://example.com"
             assert result["links"][0]["text"] == "Example"
             assert "file_path" not in result
+
+
+class TestLiveFlagOverlay:
+    """get_email must not report stale flag state from the .emlx footer."""
+
+    @pytest.mark.asyncio
+    async def test_overlay_replaces_stale_disk_values(self, tmp_path):
+        from apple_mail_mcp.server import _overlay_live_flags
+
+        env = tmp_path / "Envelope Index"
+        env.write_bytes(b"")
+        result = {"read": True, "flagged": True}  # stale footer values
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=env,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_message_flags",
+                return_value=(False, False),  # user cleared them in Mail
+            ),
+        ):
+            await _overlay_live_flags(result, 42)
+
+        assert result["flagged"] is False
+        assert result["read"] is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_message_leaves_values_untouched(self, tmp_path):
+        from apple_mail_mcp.server import _overlay_live_flags
+
+        env = tmp_path / "Envelope Index"
+        env.write_bytes(b"")
+        result = {"read": True, "flagged": True}
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=env,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_message_flags",
+                return_value=None,
+            ),
+        ):
+            await _overlay_live_flags(result, 42)
+
+        assert result["flagged"] is True
+
+    @pytest.mark.asyncio
+    async def test_failure_is_non_fatal(self):
+        """No Mail access (or any error) must not break get_email."""
+        from apple_mail_mcp.server import _overlay_live_flags
+
+        result = {"read": False, "flagged": True}
+        with patch(
+            "apple_mail_mcp.index.disk.find_mail_directory",
+            side_effect=PermissionError("no FDA"),
+        ):
+            await _overlay_live_flags(result, 42)
+
+        assert result == {"read": False, "flagged": True}
+
+    def test_fetch_message_flags_reads_live_columns(self, tmp_path):
+        """Against a real SQLite file shaped like Apple's index."""
+        import sqlite3
+
+        from apple_mail_mcp.index.envelope_direct import fetch_message_flags
+
+        env = tmp_path / "Envelope Index"
+        conn = sqlite3.connect(env)
+        conn.execute("CREATE TABLE messages (read INTEGER, flagged INTEGER)")
+        conn.execute("INSERT INTO messages (read, flagged) VALUES (1, 0)")
+        conn.commit()
+        rowid = conn.execute("SELECT ROWID FROM messages").fetchone()[0]
+        conn.close()
+
+        assert fetch_message_flags(env, rowid) == (True, False)
+        assert fetch_message_flags(env, 9999) is None
