@@ -12,6 +12,7 @@ Tests the central orchestration class for the FTS5 search index:
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -917,8 +918,6 @@ class TestPerThreadConnections:
     """A long write must not block reads — the cause of a hung server."""
 
     def test_each_thread_gets_its_own_connection(self, temp_db_path):
-        import threading
-
         manager = IndexManager(db_path=temp_db_path)
         main_conn = manager._get_conn()
         other: list = []
@@ -940,7 +939,6 @@ class TestPerThreadConnections:
     def test_read_is_not_blocked_by_an_open_write(self, temp_db_path):
         """The regression: a reader must answer while a writer holds a
         transaction open, instead of waiting for it to finish."""
-        import threading
 
         manager = IndexManager(db_path=temp_db_path)
         manager._get_conn()  # create schema first
@@ -1380,3 +1378,308 @@ class TestFailedSyncDoesNotPoisonTheConnection:
         )
         conn.commit()
         assert m.indexed_email_count() == 1
+
+
+class TestUsableIndexAndErrorTracking:
+    """has_usable_index() and last_error on the real IndexManager."""
+
+    def test_empty_db_is_not_usable(self, temp_db_path):
+        from apple_mail_mcp.index import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        m.indexed_email_count()  # creates the DB file
+        assert m.has_index() is True
+        assert m.has_usable_index() is False  # file exists, but no rows
+
+    def test_sync_failure_sets_last_error_and_returns_zero(self, temp_db_path):
+        from apple_mail_mcp.index import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        with patch(
+            "apple_mail_mcp.index.disk.find_mail_directory",
+            side_effect=PermissionError("Cannot access"),
+        ):
+            assert m.sync_updates() == 0  # contract preserved
+        assert "PermissionError" in (m.last_error or "")
+
+
+class TestBuildProgressVisibility:
+    """During a build the user needs a percentage, not silence."""
+
+    @pytest.mark.asyncio
+    async def test_progress_reported_from_cached_disk_count(self, tmp_path):
+        mgr = MagicMock()
+        mgr.is_building.return_value = True
+        mgr.write_lock_held.return_value = False
+        mgr.has_index.return_value = True
+        mgr.indexed_email_count.return_value = 17_500
+        mgr.cached_disk_count.return_value = 70_000
+        mgr.build_progress.return_value = {
+            "phase": "indexing",
+            "emails_done": 17_500,
+            "files_seen": 17500,
+            "seconds_since_progress": 2.0,
+            "appears_stalled": False,
+        }
+        mgr.last_error = None
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["state"] == "building"
+        assert r["disk_emails"] == 70_000
+        assert r["progress_percent"] == 25.0
+        # The expensive fresh walk must not run during a build.
+        mgr.get_stats.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_cached_total_still_reports_count(self, tmp_path):
+        mgr = MagicMock()
+        mgr.is_building.return_value = True
+        mgr.write_lock_held.return_value = False
+        mgr.has_index.return_value = True
+        mgr.indexed_email_count.return_value = 42
+        mgr.cached_disk_count.return_value = None  # never walked yet
+        mgr.build_progress.return_value = {
+            "phase": "indexing",
+            "emails_done": 42,
+            "files_seen": 42,
+            "seconds_since_progress": 1.0,
+            "appears_stalled": False,
+        }
+        mgr.last_error = None
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["indexed_emails"] == 42
+        assert "progress_percent" not in r  # honest: no denominator
+
+
+class TestStallDetection:
+    """ "Working" and "wedged" must be distinguishable."""
+
+    def _building_mgr(self, seconds_ago, phase="indexing"):
+        m = MagicMock()
+        m.is_building.return_value = True
+        m.write_lock_held.return_value = False
+        m.has_index.return_value = True
+        m.indexed_email_count.return_value = 0
+        m.cached_disk_count.return_value = 70_000
+        m.build_progress.return_value = {
+            "phase": phase,
+            "emails_done": 500,
+            "files_seen": 500,
+            "seconds_since_progress": seconds_ago,
+            "appears_stalled": seconds_ago > 120,
+        }
+        m.last_error = None
+        return m
+
+    async def _status(self, mgr, tmp_path):
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            return await get_index_status()
+
+    @pytest.mark.asyncio
+    async def test_recent_progress_is_not_a_problem(self, tmp_path):
+        r = await self._status(self._building_mgr(3.0), tmp_path)
+        assert r["build_appears_stalled"] is False
+        assert r["seconds_since_progress"] == 3.0
+        assert "problem" not in r
+
+    @pytest.mark.asyncio
+    async def test_long_silence_is_reported_as_stalled(self, tmp_path):
+        r = await self._status(self._building_mgr(600.0), tmp_path)
+        assert r["build_appears_stalled"] is True
+        assert "stuck" in r["problem"].lower()
+        assert any("Cmd-Q" in s for s in r["next_steps"])
+
+    @pytest.mark.asyncio
+    async def test_reports_rows_written_even_when_count_reads_zero(
+        self, tmp_path
+    ):
+        """The committed-batch counter proves work happened, even if the
+        table count is still catching up."""
+        r = await self._status(self._building_mgr(5.0), tmp_path)
+        assert r["build_emails_done"] == 500
+
+
+class TestWarmUpPhaseIsNotMistakenForAStall:
+    """Zero indexed during metadata reading is expected, not a fault."""
+
+    def _mgr(self, phase, idle):
+        m = MagicMock()
+        m.is_building.return_value = True
+        m.write_lock_held.return_value = False
+        m.has_index.return_value = True
+        m.indexed_email_count.return_value = 0
+        m.cached_disk_count.return_value = 63_953
+        m.build_progress.return_value = {
+            "phase": phase,
+            "emails_done": 0,
+            "files_seen": 0,
+            "seconds_since_progress": idle,
+            "appears_stalled": False,
+        }
+        m.last_error = None
+        return m
+
+    async def _status(self, mgr, tmp_path):
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            return await get_index_status()
+
+    @pytest.mark.asyncio
+    async def test_metadata_phase_explains_the_zero(self, tmp_path):
+        r = await self._status(self._mgr("reading_metadata", 150.0), tmp_path)
+
+        assert r["build_phase"] == "reading_metadata"
+        assert "problem" not in r  # 150s of no writes is normal here
+        assert "warm-up" in r["user_message"]
+        assert any("zero" in s.lower() for s in r["next_steps"])
+
+    @pytest.mark.asyncio
+    async def test_indexing_phase_with_zero_reads_differently(self, tmp_path):
+        r = await self._status(self._mgr("indexing", 5.0), tmp_path)
+
+        assert r["build_phase"] == "indexing"
+        assert "warm-up" not in r["user_message"]
+
+    def test_metadata_phase_gets_a_longer_grace_period(self, temp_db_path):
+        """Reading metadata legitimately takes minutes; indexing must not."""
+        from apple_mail_mcp.index import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        assert (
+            m._STALL_SECONDS["reading_metadata"] > m._STALL_SECONDS["indexing"]
+        )
+
+    def test_heartbeat_reports_phase_and_liveness(self, temp_db_path):
+        from apple_mail_mcp.index import IndexManager
+
+        m = IndexManager(db_path=temp_db_path)
+        assert m.build_progress() is None  # nothing running
+
+        m._mark_progress("reading_metadata")
+        p = m.build_progress()
+        assert p["phase"] == "reading_metadata"
+        assert p["emails_done"] == 0
+        assert p["appears_stalled"] is False
+
+        m._mark_progress("indexing", done=500, seen=512)
+        p = m.build_progress()
+        assert p["phase"] == "indexing"
+        assert p["emails_done"] == 500
+        assert p["files_seen"] == 512
+
+
+class TestRunningSyncIsVisible:
+    """A sync holds the write lock but sets no build phase, so it was
+    invisible: counts frozen, last_sync stale, state 'ready'."""
+
+    @pytest.mark.asyncio
+    async def test_status_reports_a_running_sync(self, tmp_path):
+        mgr = MagicMock()
+        mgr.is_building.return_value = False
+        mgr.write_lock_held.return_value = True
+        mgr.has_index.return_value = True
+        mgr.indexed_email_count.return_value = 63_875
+        mgr.cached_disk_count.return_value = 63_977
+        mgr.build_progress.return_value = None
+        mgr.last_error = None
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["sync_running"] is True
+        assert "update is running" in r["user_message"]
+        # Not a fault — no fresh disk walk, no "problem".
+        assert "problem" not in r
+        mgr.get_stats.assert_not_called()
+
+
+class TestLockErrorIsExplainedCorrectly:
+    """Twice in a live session the assistant blamed Apple Mail for
+    "database is locked" and told the user to quit Mail. Mail.app never
+    touches this database."""
+
+    @pytest.mark.asyncio
+    async def test_guidance_names_the_real_cause(self, tmp_path):
+        mgr = MagicMock()
+        mgr.is_building.return_value = False
+        mgr.write_lock_held.return_value = False
+        mgr.has_index.return_value = True
+        mgr.indexed_email_count.return_value = 63_875
+        mgr.count_skipped_too_large.return_value = 0
+        mgr.count_without_stable_id.return_value = 0
+        mgr.build_progress.return_value = None
+        mgr.recent_events.return_value = []
+        mgr.last_error = "OperationalError: database is locked"
+        stats = MagicMock()
+        stats.disk_email_count = 63_900
+        stats.mailbox_count = 24
+        stats.attachment_count = 0
+        stats.db_size_mb = 485.0
+        stats.failed_jobs_count = 0
+        stats.excluded_accounts = []
+        stats.last_sync = None
+        stats.staleness_hours = None
+        mgr.get_stats.return_value = stats
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        steps = " ".join(r["next_steps"]).lower()
+        assert "not apple mail's" in steps
+        assert "quitting mail does not help" in steps
+        assert "two copies" in steps
+        assert (
+            "apple mail has nothing to do with it" in r["user_message"].lower()
+        )
