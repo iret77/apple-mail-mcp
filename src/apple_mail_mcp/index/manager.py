@@ -354,6 +354,7 @@ class IndexManager:
                         email_data.get("content", ""),
                         email_data.get("date_received", ""),
                         email_data.get("emlx_path", ""),
+                        email_data.get("message_id_header") or None,
                         len(attachments),
                     )
                 )
