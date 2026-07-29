@@ -36,16 +36,6 @@ const MailCore = {
      * @param {string} name - Mailbox name (e.g., "INBOX", "Sent")
      * @returns {Mailbox} Mailbox object
      */
-    /**
-     * Role → the names Mail is known to use for it.
-     *
-     * A name is the WEAKEST way to find a well-known mailbox: it changes
-     * with the system language, with the macOS version, and with the
-     * provider. This table is therefore the last resort, not the first
-     * — see getMailbox below. Every entry is taken from Apple's own
-     * localized Mail user guide or is a documented provider/legacy
-     * name; nothing here is a translation someone made up.
-     */
     /** Message-ID without its angle brackets — see normHeader in the
      *  write builder. Both sides must agree or nothing ever matches. */
     normHeaderValue(v) {
@@ -72,6 +62,16 @@ const MailCore = {
         return this.FLAG_COLORS[i] || null;
     },
 
+    /**
+     * Role → the names Mail is known to use for it.
+     *
+     * A name is the WEAKEST way to find a well-known mailbox: it changes
+     * with the system language, with the macOS version, and with the
+     * provider. This table is therefore the last resort, not the first
+     * — see getMailbox below. Every entry is taken from Apple's own
+     * localized Mail user guide or is a documented provider/legacy
+     * name; nothing here is a translation someone made up.
+     */
     MAILBOX_ROLES: {
         inbox: [
             "INBOX", "Inbox", "In",
