@@ -18,10 +18,11 @@ import logging
 import sqlite3
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from ..config import (
     get_index_max_emails,
@@ -43,6 +44,9 @@ if TYPE_CHECKING:
     from .watcher import IndexWatcher
 
 logger = logging.getLogger(__name__)
+
+# How many lifecycle events to keep in memory for a status reader.
+MAX_EVENTS = 50
 
 
 @dataclass
@@ -111,6 +115,135 @@ class IndexManager:
         # (build/sync/watcher). Lets JXA-free paths like the disk
         # email count honor exclusions without their own JXA call.
         self._exclude_account_uuids: set[str] = set()
+        # Observability. A build runs in a daemon thread, so "is it
+        # working or wedged?" is otherwise invisible to any caller.
+        # Both are process-local by design — they describe *this*
+        # server's activity.
+        self._building = False
+        self._last_error: str | None = None
+        # Build heartbeat: the phase, how much has been read and
+        # written, and when that last changed. The phase is what makes
+        # the number interpretable — a build spends its first minutes
+        # reading Apple's metadata before a single row is written, and
+        # without naming that phase "warming up" and "wedged" look
+        # identical, both showing zero indexed messages.
+        self._build_progress: dict | None = None
+        # Ring of recent lifecycle events. An MCP server's stderr is
+        # not reachable under a desktop client, so this is the only
+        # channel through which "what just happened?" can be answered.
+        self._events: deque[dict] = deque(maxlen=MAX_EVENTS)
+        self._events_lock = threading.Lock()
+
+    def record_event(self, level: str, message: str, **fields) -> None:
+        """Record a lifecycle event and mirror it to the logger.
+
+        Two audiences: the log for a post-mortem after a restart, and
+        this ring for "what is happening right now". Never raises —
+        diagnostics must not be able to break the operation they
+        describe.
+        """
+        try:
+            event = {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "level": level,
+                "message": message,
+                # Coerce: these may go straight into an MCP response,
+                # where one non-serializable value would break the
+                # whole reply rather than this one event.
+                **{k: str(v) for k, v in fields.items()},
+            }
+            with self._events_lock:
+                self._events.append(event)
+            logger.log(
+                logging.ERROR if level == "error" else logging.INFO,
+                "%s%s",
+                message,
+                f" {fields}" if fields else "",
+            )
+        except Exception:  # pragma: no cover - diagnostics only
+            pass
+
+    def recent_events(self, limit: int = 20) -> list[dict]:
+        """Most recent lifecycle events, newest first."""
+        with self._events_lock:
+            events = list(self._events)
+        return list(reversed(events[-limit:]))
+
+    def is_building(self) -> bool:
+        """True while a full index build is running in this process."""
+        return self._building
+
+    # Reading Apple's metadata for a large mailbox legitimately takes
+    # minutes with nothing to show, so it gets a longer grace period
+    # than the indexing loop, which should tick every few seconds.
+    _STALL_SECONDS: ClassVar[dict[str, float]] = {
+        "clearing": 120.0,
+        "reading_metadata": 600.0,
+        "indexing": 120.0,
+    }
+
+    def build_progress(self) -> dict | None:
+        """Heartbeat of the running build, or None if none is running.
+
+        Returns ``phase``, ``emails_done``, ``files_seen``,
+        ``seconds_since_progress`` and ``appears_stalled``. The phase is
+        what makes zero progress interpretable: during metadata
+        reading, zero is expected.
+        """
+        progress = self._build_progress
+        if progress is None:
+            return None
+        phase = progress["phase"]
+        idle = max(0.0, time.monotonic() - progress["ts"])
+        return {
+            "phase": phase,
+            "emails_done": progress["done"],
+            "files_seen": progress["seen"],
+            "seconds_since_progress": round(idle, 1),
+            "appears_stalled": idle > self._STALL_SECONDS.get(phase, 120.0),
+        }
+
+    def _mark_progress(
+        self, phase: str, *, done: int = 0, seen: int = 0
+    ) -> None:
+        """Stamp the build heartbeat."""
+        self._build_progress = {
+            "phase": phase,
+            "done": done,
+            "seen": seen,
+            "ts": time.monotonic(),
+        }
+
+    @property
+    def last_error(self) -> str | None:
+        """Most recent build/sync failure message, or None.
+
+        Cleared by the next successful build or sync, so a transient
+        failure — Full Disk Access granted mid-session, say — does not
+        stick around misreporting a healthy index.
+        """
+        return self._last_error
+
+    def indexed_email_count(self) -> int:
+        """Cheap COUNT(*) over the emails table (no disk walk).
+
+        Distinguishes "DB file exists" from "DB has content": an
+        interrupted or permission-denied first build leaves an empty
+        database behind, which must not be mistaken for a usable index.
+        """
+        try:
+            row = (
+                self._get_conn()
+                .execute("SELECT COUNT(*) AS n FROM emails")
+                .fetchone()
+            )
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def has_usable_index(self) -> bool:
+        """True when an index exists *and* holds at least one email."""
+        return self.has_index() and self.indexed_email_count() > 0
 
     def _resolve_exclusions(self) -> set[str]:
         """Resolve configured account exclusions to UUIDs and remember
@@ -311,41 +444,71 @@ class IndexManager:
         """
         from .disk import find_mail_directory, scan_all_emails
 
-        # Verify we can access the mail directory
-        mail_dir = find_mail_directory()
-
-        # Resolve excluded account names -> UUIDs (one JXA call, only
-        # when exclusions are configured) so the JXA-free disk walk can
-        # skip whole accounts. Excluded accounts never enter the index.
-        exclude_account_uuids = self._resolve_exclusions()
-
-        conn = self._get_conn()
-        max_per_mailbox = get_index_max_emails()
+        # Mark the build running before the first thing that can fail,
+        # so a reader can tell "never started" from "running" and from
+        # "failed with this error". Everything below is inside
+        # try/finally: a failure here used to leave `_building` stuck
+        # True and the server reported "building" for the rest of its
+        # life.
+        self._building = True
+        # Phases are reported so a slow preparation step is never
+        # mistaken for a hang.
+        self._mark_progress("clearing")
+        self.record_event("info", "Index build started")
 
         # Track counts per mailbox to enforce limits
         mailbox_counts: dict[tuple[str, str], int] = {}
         capped_mailboxes: set[tuple[str, str]] = set()
         total_indexed = 0
 
-        # Clear existing data for rebuild
-        conn.execute("DELETE FROM attachments")
-        conn.execute("DELETE FROM emails")
-        conn.execute("DELETE FROM sync_state")
-
-        # Disable triggers during bulk insert for performance
-        conn.execute("DROP TRIGGER IF EXISTS emails_ai")
-        conn.execute("DROP TRIGGER IF EXISTS emails_ad")
-        conn.execute("DROP TRIGGER IF EXISTS emails_au")
-
         batch: list[tuple] = []
         # Deferred attachment rows: (email_tuple_index, attachments)
         batch_attachments: list[tuple[int, list]] = []
         batch_size = 500
+        # None until the mail directory has been found. The cleanup
+        # below now has to cope with never having opened anything —
+        # which is precisely the failure this build reports.
+        conn: sqlite3.Connection | None = None
 
         try:
+            # Verify we can access the mail directory
+            mail_dir = find_mail_directory()
+
+            # Resolve excluded account names -> UUIDs (one JXA call,
+            # only when exclusions are configured) so the JXA-free disk
+            # walk can skip whole accounts. Excluded accounts never
+            # enter the index.
+            exclude_account_uuids = self._resolve_exclusions()
+
+            conn = self._get_conn()
+            max_per_mailbox = get_index_max_emails()
+
+            # Clear existing data for rebuild
+            conn.execute("DELETE FROM attachments")
+            conn.execute("DELETE FROM emails")
+            conn.execute("DELETE FROM sync_state")
+
+            # Disable triggers during bulk insert for performance
+            conn.execute("DROP TRIGGER IF EXISTS emails_ai")
+            conn.execute("DROP TRIGGER IF EXISTS emails_ad")
+            conn.execute("DROP TRIGGER IF EXISTS emails_au")
+
+            files_seen = 0
+            # Reading Apple's metadata comes first and writes nothing.
+            # Naming that phase is the whole point: otherwise "warming
+            # up" and "wedged" are the same observation — zero emails
+            # indexed.
+            self._mark_progress("reading_metadata")
             for email_data in scan_all_emails(
                 mail_dir, exclude_account_uuids=exclude_account_uuids
             ):
+                files_seen += 1
+                # Tick well before the first batch commits, so a build
+                # that is parsing steadily never looks frozen.
+                if files_seen % 100 == 0:
+                    self._mark_progress(
+                        "indexing", done=total_indexed, seen=files_seen
+                    )
                 key = (email_data["account"], email_data["mailbox"])
                 count = mailbox_counts.get(key, 0)
 
@@ -374,6 +537,11 @@ class IndexManager:
 
                 if len(batch) >= batch_size:
                     self._flush_batch(conn, batch, batch_attachments)
+                    self._mark_progress(
+                        "indexing",
+                        done=total_indexed + len(batch),
+                        seen=files_seen,
+                    )
                     total_indexed += len(batch)
 
                     if progress_callback:
@@ -383,35 +551,55 @@ class IndexManager:
                     batch = []
                     batch_attachments = []
 
+        except BaseException as exc:
+            # Record EVERY failure. With only the mail-directory case
+            # reported, any other exception left a reader cheerfully
+            # seeing "no errors" while the build was dead.
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self.record_event(
+                "error", "Index build failed", error=self._last_error
+            )
+            raise
         finally:
-            # Flush any remaining partial batch (crash-safe)
-            if batch:
-                self._flush_batch(conn, batch, batch_attachments)
-                total_indexed += len(batch)
+            # The build is no longer running, however it ended. Set
+            # before the flush below so a failure in cleanup cannot
+            # leave a phantom in-progress build on display.
+            self._building = False
+            self._build_progress = None
 
-            # Update sync state for whatever we managed to index
-            if mailbox_counts:
-                now = datetime.now().isoformat()
-                for (account, mailbox), count in mailbox_counts.items():
-                    conn.execute(
-                        """INSERT OR REPLACE INTO sync_state
-                           (account, mailbox, last_sync, message_count)
-                           VALUES (?, ?, ?, ?)""",
-                        (account, mailbox, now, count),
-                    )
-                conn.commit()
+            # Nothing was opened (Mail unreadable, say): no schema
+            # state to restore. A conditional rather than an early
+            # return — returning from `finally` would swallow the
+            # exception that brought us here.
+            if conn is not None:
+                # Flush any remaining partial batch (crash-safe)
+                if batch:
+                    self._flush_batch(conn, batch, batch_attachments)
+                    total_indexed += len(batch)
 
-            # Re-enable triggers BEFORE rebuilding FTS to close the
-            # watcher race condition: if the file watcher (or any other
-            # writer) inserts a row after the bulk loop ends but before
-            # the FTS rebuild — or between rebuild and trigger
-            # recreation in the original ordering — that row would land
-            # in `emails` but never enter `emails_fts`. By recreating
-            # triggers first, any concurrent INSERT after this point
-            # fires the trigger normally; the subsequent FTS rebuild
-            # then re-syncs everything in `emails`, double-covering rows
-            # added during the rebuild call itself.
-            conn.executescript("""
+                # Update sync state for whatever we managed to index
+                if mailbox_counts:
+                    now = datetime.now().isoformat()
+                    for (account, mailbox), count in mailbox_counts.items():
+                        conn.execute(
+                            """INSERT OR REPLACE INTO sync_state
+                               (account, mailbox, last_sync, message_count)
+                               VALUES (?, ?, ?, ?)""",
+                            (account, mailbox, now, count),
+                        )
+                    conn.commit()
+
+                # Re-enable triggers BEFORE rebuilding FTS to close the
+                # watcher race condition: if the file watcher (or any other
+                # writer) inserts a row after the bulk loop ends but before
+                # the FTS rebuild — or between rebuild and trigger
+                # recreation in the original ordering — that row would land
+                # in `emails` but never enter `emails_fts`. By recreating
+                # triggers first, any concurrent INSERT after this point
+                # fires the trigger normally; the subsequent FTS rebuild
+                # then re-syncs everything in `emails`, double-covering rows
+                # added during the rebuild call itself.
+                conn.executescript("""
                 CREATE TRIGGER IF NOT EXISTS emails_ai
                 AFTER INSERT ON emails BEGIN
                     INSERT INTO emails_fts(rowid, subject, sender, content)
@@ -441,35 +629,37 @@ class IndexManager:
                 END;
             """)
 
-            # Rebuild FTS index (must run even if scan crashed
-            # mid-iteration, otherwise emails table has rows
-            # but FTS5 is empty)
-            if total_indexed > 0:
-                if progress_callback:
-                    msg = "Building search index..."
-                    progress_callback(total_indexed, total_indexed, msg)
+                # Rebuild FTS index (must run even if scan crashed
+                # mid-iteration, otherwise emails table has rows
+                # but FTS5 is empty)
+                if total_indexed > 0:
+                    if progress_callback:
+                        msg = "Building search index..."
+                        progress_callback(total_indexed, total_indexed, msg)
 
-                rebuild_fts_index(conn)
-                optimize_fts_index(conn)
+                    rebuild_fts_index(conn)
+                    optimize_fts_index(conn)
 
-            # Log cap warnings (aggregate summary)
-            if capped_mailboxes:
-                logger.warning(
-                    "%d mailbox(es) hit the per-mailbox cap (%d). "
-                    "Increase APPLE_MAIL_INDEX_MAX_EMAILS to index more.",
-                    len(capped_mailboxes),
-                    max_per_mailbox,
-                )
-                if progress_callback:
-                    msg = (
-                        f"Warning: {len(capped_mailboxes)} mailbox(es) "
-                        f"hit cap ({max_per_mailbox})"
+                # Log cap warnings (aggregate summary)
+                if capped_mailboxes:
+                    logger.warning(
+                        "%d mailbox(es) hit the per-mailbox cap (%d). "
+                        "Increase APPLE_MAIL_INDEX_MAX_EMAILS to index more.",
+                        len(capped_mailboxes),
+                        max_per_mailbox,
                     )
-                    progress_callback(total_indexed, total_indexed, msg)
+                    if progress_callback:
+                        msg = (
+                            f"Warning: {len(capped_mailboxes)} mailbox(es) "
+                            f"hit cap ({max_per_mailbox})"
+                        )
+                        progress_callback(total_indexed, total_indexed, msg)
 
         # Disk inventory just changed — drop the cache so the next
         # status call reflects truth.
         self.invalidate_disk_count_cache()
+        self._last_error = None  # a clean build clears prior failures
+        self.record_event("info", "Index build finished", emails=total_indexed)
         return total_indexed
 
     @staticmethod
@@ -524,9 +714,18 @@ class IndexManager:
         from .disk import find_mail_directory
         from .sync import sync_from_disk
 
+        self.record_event("info", "Sync started")
+        self._last_error = None  # this run's verdict, not a previous one
+
         try:
             mail_dir = find_mail_directory()
         except (FileNotFoundError, PermissionError) as e:
+            # Returning 0 here reads exactly like "no changes", so the
+            # reason has to be recorded somewhere the caller can see.
+            self._last_error = f"{type(e).__name__}: {e}"
+            self.record_event(
+                "error", "Sync did not run", error=self._last_error
+            )
             logger.warning("Cannot access mail directory for sync: %s", e)
             return 0
 
@@ -540,7 +739,7 @@ class IndexManager:
                 progress_callback,
                 exclude_account_uuids=exclude_account_uuids,
             )
-        except Exception:
+        except Exception as exc:
             # A sync that raises mid-run leaves its write transaction
             # open, and every later write then fails with "database is
             # locked" until the process restarts. The index looks dead
@@ -549,11 +748,14 @@ class IndexManager:
                 conn.rollback()
             except Exception:
                 logger.debug("Rollback after failed sync failed too")
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self.record_event("error", "Sync failed", error=self._last_error)
             logger.exception("Sync failed")
             raise
         # Disk inventory just changed (or was just verified) — drop
         # the get_stats cache so the next status call reflects truth.
         self.invalidate_disk_count_cache()
+        self.record_event("info", "Sync finished", changes=result.total_changes)
         return result.total_changes
 
     def search(

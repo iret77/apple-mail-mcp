@@ -1017,3 +1017,174 @@ class TestConnectionsArePerThread:
         assert len(mgr._open_conns) == 2
         mgr.close()
         assert mgr._open_conns == []
+
+
+class TestUsableIndexAndErrorTracking:
+    """`has_usable_index()` and `last_error`.
+
+    An index *file* can exist while holding nothing: an interrupted or
+    permission-denied first build leaves an empty database behind, and
+    syncing that forever never populates it.
+    """
+
+    def test_empty_db_is_not_usable(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        m.indexed_email_count()  # creates the DB file
+        assert m.has_index() is True
+        assert m.has_usable_index() is False  # file exists, but no rows
+
+    def test_sync_failure_sets_last_error_and_returns_zero(self, temp_db_path):
+        """`sync_updates()` returns 0 for "no changes" AND for "could not
+        read Mail". The caller cannot tell those apart from the number,
+        so the reason has to be recorded."""
+        m = IndexManager(db_path=temp_db_path)
+        with patch(
+            "apple_mail_mcp.index.disk.find_mail_directory",
+            side_effect=PermissionError("Cannot access"),
+        ):
+            assert m.sync_updates() == 0  # contract preserved
+        assert "PermissionError" in (m.last_error or "")
+
+    def test_a_later_success_clears_the_error(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        m._last_error = "PermissionError: stale"
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp"),
+            ),
+            patch(
+                "apple_mail_mcp.index.manager.IndexManager._resolve_exclusions",
+                return_value=set(),
+            ),
+            patch("apple_mail_mcp.index.sync.sync_from_disk") as sync,
+        ):
+            sync.return_value = MagicMock(total_changes=0)
+            m.sync_updates()
+
+        assert m.last_error is None
+
+
+class TestBuildProgressHeartbeat:
+    """A build runs on a daemon thread. Without a heartbeat, "working"
+    and "wedged" are the same observation from outside: zero indexed."""
+
+    def test_nothing_running_has_no_progress(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        assert m.build_progress() is None
+        assert m.is_building() is False
+
+    def test_heartbeat_reports_phase_and_liveness(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+
+        m._mark_progress("reading_metadata")
+        p = m.build_progress()
+        assert p["phase"] == "reading_metadata"
+        assert p["emails_done"] == 0
+        assert p["appears_stalled"] is False
+
+        m._mark_progress("indexing", done=500, seen=512)
+        p = m.build_progress()
+        assert p["phase"] == "indexing"
+        assert p["emails_done"] == 500
+        assert p["files_seen"] == 512
+
+    def test_metadata_phase_gets_a_longer_grace_period(self, temp_db_path):
+        """Reading Apple's metadata for a large mailbox legitimately
+        takes minutes with nothing written; the indexing loop must tick
+        every few seconds."""
+        m = IndexManager(db_path=temp_db_path)
+        assert (
+            m._STALL_SECONDS["reading_metadata"] > m._STALL_SECONDS["indexing"]
+        )
+
+    def test_silence_beyond_the_phase_budget_reads_as_stalled(
+        self, temp_db_path
+    ):
+        m = IndexManager(db_path=temp_db_path)
+        m._mark_progress("indexing", done=500, seen=500)
+        # Backdate the stamp instead of sleeping.
+        m._build_progress["ts"] -= m._STALL_SECONDS["indexing"] + 1
+        assert m.build_progress()["appears_stalled"] is True
+
+
+class TestBuildStateSurvivesFailure:
+    """A build that dies must not leave a phantom build on display."""
+
+    def test_failed_build_clears_the_flag_and_records_the_error(
+        self, temp_db_path
+    ):
+        m = IndexManager(db_path=temp_db_path)
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=PermissionError("no Full Disk Access"),
+            ),
+            pytest.raises(PermissionError),
+        ):
+            m.build_from_disk()
+
+        assert m.is_building() is False
+        assert m.build_progress() is None
+        assert "PermissionError" in (m.last_error or "")
+        assert any(
+            e["message"] == "Index build failed" for e in m.recent_events()
+        )
+
+    def test_failure_before_the_db_opens_does_not_mask_itself(
+        self, temp_db_path
+    ):
+        """The cleanup path writes through `conn`, which does not exist
+        when the mail directory could not even be found. Raising
+        UnboundLocalError from `finally` would hide the real cause."""
+        m = IndexManager(db_path=temp_db_path)
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=FileNotFoundError("no ~/Library/Mail"),
+            ),
+            pytest.raises(FileNotFoundError),
+        ):
+            m.build_from_disk()
+
+
+class TestEventRing:
+    """An MCP server's stderr reaches nobody under a desktop client, so
+    this ring is the only answer to "what just happened?"."""
+
+    def test_events_are_newest_first(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        m.record_event("info", "first")
+        m.record_event("info", "second")
+        assert [e["message"] for e in m.recent_events()][:2] == [
+            "second",
+            "first",
+        ]
+
+    def test_ring_is_bounded(self, temp_db_path):
+        from apple_mail_mcp.index.manager import MAX_EVENTS
+
+        m = IndexManager(db_path=temp_db_path)
+        for i in range(MAX_EVENTS + 25):
+            m.record_event("info", f"event {i}")
+        assert len(m.recent_events(limit=1000)) == MAX_EVENTS
+
+    def test_fields_are_stringified_not_dropped(self, temp_db_path):
+        """These go into an MCP response: one non-serializable value
+        would break the whole reply rather than this one event."""
+        m = IndexManager(db_path=temp_db_path)
+        m.record_event("info", "with fields", path=Path("/tmp/x"), count=3)
+        e = m.recent_events()[0]
+        assert e["path"] == "/tmp/x"
+        assert e["count"] == "3"
+
+    def test_recording_never_raises(self, temp_db_path):
+        """Diagnostics must not be able to break what they describe."""
+
+        class Hostile:
+            def __str__(self):
+                raise RuntimeError("nope")
+
+        m = IndexManager(db_path=temp_db_path)
+        m.record_event("info", "hostile", bad=Hostile())  # must not raise
