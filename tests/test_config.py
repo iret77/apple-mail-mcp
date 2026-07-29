@@ -503,3 +503,46 @@ account = "NowSet"
         assert get_default_account() is None
         _invalidate_config_cache()
         assert get_default_account() == "NowSet"
+
+
+class TestAutoBuildConfig:
+    """`[index] auto_build` — off unless someone asks for it."""
+
+    def test_default_is_off(self, config_file):
+        """The server must not walk ~/Library/Mail unasked: on a large
+        mailbox that is minutes of disk work nobody requested."""
+        from apple_mail_mcp.config import get_index_auto_build
+
+        assert get_index_auto_build() is False
+
+    def test_file_enables_it(self, config_file):
+        from apple_mail_mcp.config import get_index_auto_build
+
+        _write(
+            config_file,
+            """
+            config_version = 1
+            [index]
+            auto_build = true
+            """,
+        )
+        _invalidate_config_cache()
+        assert get_index_auto_build() is True
+
+    def test_env_overrides_file(self, monkeypatch, config_file):
+        from apple_mail_mcp.config import get_index_auto_build
+
+        _write(
+            config_file,
+            """
+            config_version = 1
+            [index]
+            auto_build = true
+            """,
+        )
+        _invalidate_config_cache()
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", "false")
+        assert get_index_auto_build() is False
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", "1")
+        assert get_index_auto_build() is True

@@ -98,3 +98,46 @@ class TestNonBlockingStartup:
         import apple_mail_mcp.server as srv
 
         assert not hasattr(srv, "_sync_lock")
+
+
+class TestAutoBuildOnFirstRun:
+    """What `serve` does when there is no index yet."""
+
+    def _serve(self, monkeypatch, auto_build: str, capsys):
+        mock_manager = MagicMock()
+        mock_manager.has_index.return_value = False
+        mock_manager.build_from_disk.return_value = 3
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", auto_build)
+
+        with (
+            patch(
+                "apple_mail_mcp.index.IndexManager.get_instance",
+                return_value=mock_manager,
+            ),
+            patch("apple_mail_mcp.server.mcp", MagicMock()),
+            patch("apple_mail_mcp.server._cleanup_old_attachments"),
+        ):
+            from apple_mail_mcp.cli import _run_serve
+
+            _run_serve(watch=False)
+        # The build runs on a daemon thread; give it a moment.
+        for _ in range(50):
+            if mock_manager.build_from_disk.called:
+                break
+            time.sleep(0.01)
+        return mock_manager, capsys.readouterr().err
+
+    def test_disabled_builds_nothing_but_says_so(self, monkeypatch, capsys):
+        """Silence here becomes an empty body search later, with nothing
+        to explain it."""
+        manager, err = self._serve(monkeypatch, "false", capsys)
+
+        manager.build_from_disk.assert_not_called()
+        assert "No search index" in err
+        assert "apple-mail-mcp index" in err
+
+    def test_enabled_builds_in_the_background(self, monkeypatch, capsys):
+        manager, err = self._serve(monkeypatch, "true", capsys)
+
+        manager.build_from_disk.assert_called_once()
+        assert "building in the background" in err
