@@ -87,6 +87,11 @@ const MailCore = {
             "Входящие",                            // ru
             "受信", "受信トレイ",                    // ja
             "收件箱",                              // zh-Hans
+            "收件匣",                              // zh-Hant
+            "받은 편지함",                          // ko
+            "Saapuneet",                           // fi
+            "Innboks",                             // no
+            "Gelen Kutusu",                        // tr
         ],
         sent: [
             "Sent", "Sent Messages", "Sent Items", "Sent Mail", "Out",
@@ -99,19 +104,23 @@ const MailCore = {
             "Wysłane",
             "Отправленные",
             "送信済み",
-            "已发出邮件", "发件箱",
+            "已发出邮件", "发件箱", "已傳送",
+            "보낸 편지함", "보낸",
+            "Lähetetyt", "Sendt", "Gönderilen",
         ],
         drafts: [
             "Drafts", "Draft",
             "Entwürfe", "Brouillons", "Borradores", "Bozze",
             "Rascunhos", "Concepten", "Utkast", "Udkast", "Robocze",
             "Черновики", "下書き", "草稿",
+            "임시 저장", "Luonnokset", "Taslaklar",
         ],
         trash: [
             "Trash", "Deleted Items", "Deleted Messages", "Bin",
             "Papierkorb", "Corbeille", "Papelera", "Cestino", "Lixo",
             "Prullenmand", "Papperskorg", "Papirkurv", "Kosz",
-            "Корзина", "ゴミ箱", "废纸篓",
+            "Корзина", "ゴミ箱", "废纸篓", "垃圾桶",
+            "휴지통", "Roskakori", "Papirkurv", "Çöp Sepeti",
         ],
         junk: [
             "Junk", "Junk E-mail", "Junk Email", "Spam", "Bulk Mail",
@@ -120,12 +129,15 @@ const MailCore = {
             "Indesiderata", "Indesejadas",
             "Skräp", "Reklamepost", "Niechciane",
             "Спам", "迷惑", "迷惑メール", "垃圾", "垃圾邮件",
+            "垃圾郵件", "정크", "Roskapostit", "Uønsket",
+            "İstenmeyen",
         ],
         archive: [
             "Archive", "All Mail", "Archived",
             "Archiv", "Archives", "Archivo", "Archivio", "Arquivadas",
             "Archief", "Arkiv", "Archiwum",
-            "Архив", "アーカイブ", "归档",
+            "Архив", "アーカイブ", "归档", "封存",
+            "아카이브", "Arkisto", "Arkiv", "Arşiv",
         ],
     },
 

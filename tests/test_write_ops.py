@@ -3417,6 +3417,11 @@ const account = {{ mailboxes }};
             ("fr", ["Boîte de réception", "Corbeille"], "Trash", "Corbeille"),
             ("ja", ["受信", "ゴミ箱", "迷惑メール"], "Junk", "迷惑メール"),
             ("pl", ["Przychodzące", "Kosz"], "INBOX", "Przychodzące"),
+            ("ko", ["받은 편지함", "휴지통", "정크"], "Junk", "정크"),
+            ("fi", ["Saapuneet", "Roskakori"], "INBOX", "Saapuneet"),
+            ("no", ["Innboks", "Papirkurv"], "Trash", "Papirkurv"),
+            ("tr", ["Gelen Kutusu", "Çöp Sepeti"], "INBOX", "Gelen Kutusu"),
+            ("zh-Hant", ["收件匣", "垃圾桶"], "Trash", "垃圾桶"),
             ("ru", ["Входящие", "Корзина"], "Trash", "Корзина"),
             # Provider: hierarchy and vocabulary, not language.
             (
