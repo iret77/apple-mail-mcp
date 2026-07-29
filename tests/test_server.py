@@ -1649,3 +1649,93 @@ class TestGetAttachmentLinksMode:
             assert result["links"][0]["url"] == "https://example.com"
             assert result["links"][0]["text"] == "Example"
             assert "file_path" not in result
+
+
+class TestBatchReads:
+    """One round-trip for a page of messages instead of one per message.
+
+    The cost of reading mail here is the round-trip, not the read: a
+    single message comes off disk in 1-5 ms. Surveying 57 messages took
+    57 calls to move a few hundred kilobytes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_list_returns_one_entry_per_id(self):
+        async def by_id(mid, account=None, mailbox=None):
+            return {"id": mid, "subject": f"re {mid}"}
+
+        with patch("apple_mail_mcp.server._get_email_by_id", side_effect=by_id):
+            from apple_mail_mcp.server import get_email
+
+            out = await get_email([11, 22])
+
+        assert [e["ref"] for e in out] == [11, 22]
+        assert out[0]["email"]["subject"] == "re 11"
+
+    @pytest.mark.asyncio
+    async def test_one_bad_id_does_not_sink_the_batch(self):
+        async def flaky(mid, account=None, mailbox=None):
+            if mid == 99:
+                raise ValueError("not found")
+            return {"id": mid}
+
+        with patch("apple_mail_mcp.server._get_email_by_id", side_effect=flaky):
+            from apple_mail_mcp.server import get_email
+
+            out = await get_email([11, 99, 22])
+
+        assert "email" in out[0]
+        assert out[1]["error"] == "not found"
+        assert "email" in out[2]
+
+    @pytest.mark.asyncio
+    async def test_a_single_id_keeps_the_old_shape(self):
+        """Existing callers and their parsers must not have to change."""
+
+        async def by_id(mid, account=None, mailbox=None):
+            return {"id": mid, "subject": "single"}
+
+        with patch("apple_mail_mcp.server._get_email_by_id", side_effect=by_id):
+            from apple_mail_mcp.server import get_email
+
+            out = await get_email(42)
+
+        assert out["subject"] == "single"  # not a list
+
+    @pytest.mark.asyncio
+    async def test_duplicates_are_read_once(self):
+        seen = []
+
+        async def by_id(mid, account=None, mailbox=None):
+            seen.append(mid)
+            return {"id": mid}
+
+        with patch("apple_mail_mcp.server._get_email_by_id", side_effect=by_id):
+            from apple_mail_mcp.server import get_email
+
+            out = await get_email([7, 7, 8])
+
+        assert seen == [7, 8]
+        assert [e["ref"] for e in out] == [7, 8]
+
+    @pytest.mark.asyncio
+    async def test_oversized_batch_is_refused_with_the_reason(self):
+        """The cap is about context, not speed — say so, or the caller
+        cannot tell whether retrying differently would help."""
+        from apple_mail_mcp.server import MAX_READ_BATCH, get_email
+
+        with pytest.raises(ValueError, match="context"):
+            await get_email(list(range(MAX_READ_BATCH + 1)))
+
+    @pytest.mark.asyncio
+    async def test_a_non_numeric_id_is_named(self):
+        from apple_mail_mcp.server import get_email
+
+        with pytest.raises(ValueError, match="not-a-number"):
+            await get_email([1, "not-a-number"])
+
+    @pytest.mark.asyncio
+    async def test_an_empty_list_is_an_empty_answer(self):
+        from apple_mail_mcp.server import get_email
+
+        assert await get_email([]) == []

@@ -610,21 +610,30 @@ JSON.stringify({{
 """
 
 
+MAX_READ_BATCH = 50
+
+
 @mcp.tool
 async def get_email(
-    message_id: int,
+    message_id: int | list[int],
     account: str | None = None,
     mailbox: str | None = None,
-) -> EmailFull:
+) -> EmailFull | list[dict]:
     """
-    Get a single email with full content.
+    Get one email with full content, or a batch of them in one call.
 
     Looks up the email across all accounts using a cascade strategy.
     Just pass the message_id — account/mailbox are optional hints
     that speed up lookup but are not required.
 
     Args:
-        message_id: The email's unique ID (from search results)
+        message_id: One id, or a LIST of ids (max 50). A batch costs one
+            round-trip instead of one per message, and each read is a
+            few milliseconds from disk — so fetching the page you just
+            listed is nearly free. A list returns a list of
+            {"ref": id, "email": {...}} or {"ref": id, "error": "..."}
+            entries, in the order given: one unreadable message never
+            takes the batch down.
         account: Optional hint (speeds up lookup, not required)
         mailbox: Optional hint (speeds up lookup, not required)
 
@@ -635,6 +644,9 @@ async def get_email(
         - read, flagged status
         - reply_to, message_id (email Message-ID header)
         - attachments: List of {filename, mime_type, size}
+
+        For a list of ids, a list of {"ref", "email"} / {"ref", "error"}
+        entries in the order given.
 
     Note:
         The attachments list comes from JXA's mailAttachments(),
@@ -647,6 +659,59 @@ async def get_email(
         >>> get_email(12345)
         {"id": 12345, "subject": "Meeting notes",
          "content": "Hi team,\\n\\nHere are the notes...", ...}
+        >>> get_email([12345, 12346])
+        [{"ref": 12345, "email": {...}}, {"ref": 12346, "email": {...}}]
+    """
+    if not isinstance(message_id, (list, tuple)):
+        # A single id keeps the single-object shape it always had —
+        # callers and their parsers depend on it.
+        return await _get_email_by_id(message_id, account, mailbox)
+
+    refs: list[int] = []
+    for raw in message_id:
+        try:
+            ref = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Invalid message id {raw!r}: expected an integer."
+            ) from None
+        if ref not in refs:
+            refs.append(ref)
+
+    if not refs:
+        return []
+    if len(refs) > MAX_READ_BATCH:
+        raise ValueError(
+            f"Too many ids ({len(refs)}); max {MAX_READ_BATCH} per call. "
+            f"Each one is a disk read of a few milliseconds, so the limit "
+            f"is about how much text fits in your context, not speed — "
+            f"split the list."
+        )
+
+    async def fetch(ref: int) -> dict:
+        try:
+            return {
+                "ref": ref,
+                "email": await _get_email_by_id(ref, account, mailbox),
+            }
+        except Exception as exc:
+            # One unreadable message must not take the batch down with
+            # it: the caller asked about 50 messages, and 49 answers are
+            # worth more than a single exception.
+            return {"ref": ref, "error": str(exc)}
+
+    return list(await asyncio.gather(*(fetch(r) for r in refs)))
+
+
+async def _get_email_by_id(
+    message_id: int,
+    account: str | None = None,
+    mailbox: str | None = None,
+) -> EmailFull:
+    """Fetch one email by its Mail.app id (the strategy cascade).
+
+    Split out of `get_email` so a batch can drive it once per id and
+    keep the per-id failure to itself.
     """
     if _hidden_account(account):
         # Hidden account: surface as a plain "not found" so a hidden
