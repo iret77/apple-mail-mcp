@@ -15,6 +15,7 @@ Thread Safety:
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -64,6 +65,90 @@ class IndexStats:
 # SearchResult is imported from .search to avoid duplication
 
 
+class IndexBusyError(RuntimeError):
+    """A build or sync is already running.
+
+    Distinct from a failure: nothing is wrong, the caller simply must
+    not present the skipped work as completed.
+    """
+
+
+class WriteLock:
+    """Serializes index writes across threads AND processes.
+
+    A ``threading.Lock`` is not enough: Claude Desktop starts a second
+    instance of every MCP server (upstream #106), so two processes hold
+    connections to the same SQLite file. SQLite allows one writer, and a
+    rebuild holds its transaction for minutes — the other process then
+    dies on "database is locked" after busy_timeout, which is exactly
+    how a rebuild failed in practice.
+
+    The file lock (``flock``) is advisory but process-wide, and the OS
+    releases it if a process dies, so a crash cannot wedge the index
+    permanently. The thread lock still guards threads inside one
+    process, where flock would not: the same file description is shared.
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._thread_lock = threading.Lock()
+        self._fd: int | None = None
+
+    def acquire(self, blocking: bool = False, timeout: float = 0.0) -> bool:
+        """Take both locks, or neither. Returns False if unavailable."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        thread_timeout = timeout if (blocking or timeout) else -1
+        if not self._thread_lock.acquire(
+            blocking=blocking or bool(timeout), timeout=thread_timeout
+        ):
+            return False
+        try:
+            while True:
+                if self._acquire_file_lock():
+                    return True
+                if time.monotonic() >= deadline:
+                    self._thread_lock.release()
+                    return False
+                time.sleep(0.2)
+        except BaseException:
+            self._thread_lock.release()
+            raise
+
+    def _acquire_file_lock(self) -> bool:
+        import fcntl
+
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            # Cannot create a lock file (read-only home?). Degrade to
+            # thread-only rather than blocking all writes forever.
+            logger.debug("Lock file unavailable at %s", self._path)
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._fd = fd
+        return True
+
+    def release(self) -> None:
+        import fcntl
+
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        self._thread_lock.release()
+
+    def locked(self) -> bool:
+        """True when this process holds it."""
+        return self._thread_lock.locked()
+
+
 class IndexManager:
     """
     Manages the FTS5 search index for email body search.
@@ -103,6 +188,9 @@ class IndexManager:
         self._local = threading.local()
         self._open_conns: list[sqlite3.Connection] = []
         self._conn_lock = threading.Lock()
+        # Claude Desktop starts this server twice, so a
+        # thread-only lock cannot serialize index writes.
+        self._write_lock = WriteLock(self._db_path)
         self._watcher: IndexWatcher | None = None
         self._watcher_callback: Callable[[int, int], None] | None = None
         # (count, expiry_monotonic) — None until first successful read.
@@ -290,6 +378,23 @@ class IndexManager:
         return stats.staleness_hours > get_index_staleness_hours()
 
     def build_from_disk(
+        self,
+        progress_callback: Callable[[int, int | None, str], None] | None = None,
+    ) -> int:
+        """Build the index, serialized against every other writer.
+
+        The lock is held for the whole build and released last: the
+        heaviest writes happen at the end, and letting go earlier would
+        leave them unguarded against the second server process.
+        """
+        if not self._write_lock.acquire(blocking=False):
+            raise IndexBusyError("An index build or sync is already running.")
+        try:
+            return self._build_from_disk_locked(progress_callback)
+        finally:
+            self._write_lock.release()
+
+    def _build_from_disk_locked(
         self,
         progress_callback: Callable[[int, int | None, str], None] | None = None,
     ) -> int:
@@ -524,10 +629,16 @@ class IndexManager:
         from .disk import find_mail_directory
         from .sync import sync_from_disk
 
+        if not self._write_lock.acquire(blocking=False):
+            # Distinguishable from "0 changes": a sync that never ran
+            # must not be reported as a successful no-op.
+            raise IndexBusyError("An index build or sync is already running.")
+
         try:
             mail_dir = find_mail_directory()
         except (FileNotFoundError, PermissionError) as e:
             logger.warning("Cannot access mail directory for sync: %s", e)
+            self._write_lock.release()
             return 0
 
         exclude_account_uuids = self._resolve_exclusions()
@@ -551,6 +662,8 @@ class IndexManager:
                 logger.debug("Rollback after failed sync failed too")
             logger.exception("Sync failed")
             raise
+        finally:
+            self._write_lock.release()
         # Disk inventory just changed (or was just verified) — drop
         # the get_stats cache so the next status call reflects truth.
         self.invalidate_disk_count_cache()

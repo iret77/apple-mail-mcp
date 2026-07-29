@@ -1017,3 +1017,64 @@ class TestConnectionsArePerThread:
         assert len(mgr._open_conns) == 2
         mgr.close()
         assert mgr._open_conns == []
+
+
+class TestIndexWritesAreSerializedAcrossProcesses:
+    """A thread lock is not enough here.
+
+    Claude Desktop starts this server twice, so two processes contend
+    for the same index file. Locking correctly inside each process
+    still produced "database is locked" — the lock has to live in the
+    filesystem.
+    """
+
+    def test_a_second_holder_is_refused(self, temp_db_path):
+        from apple_mail_mcp.index.manager import WriteLock
+
+        a = WriteLock(temp_db_path)
+        b = WriteLock(temp_db_path)
+        assert a.acquire(blocking=False)
+        try:
+            assert not b.acquire(blocking=False)
+        finally:
+            a.release()
+        assert b.acquire(blocking=False)
+        b.release()
+
+    def test_release_lets_the_next_one_in(self, temp_db_path):
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock = WriteLock(temp_db_path)
+        assert lock.acquire(blocking=False)
+        lock.release()
+        assert lock.acquire(blocking=False)
+        lock.release()
+
+    def test_a_busy_index_raises_rather_than_reporting_no_changes(
+        self, temp_db_path
+    ):
+        """0 changes and "never ran" must not look the same."""
+        from apple_mail_mcp.index.manager import IndexBusyError, IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        assert mgr._write_lock.acquire(blocking=False)
+        try:
+            with pytest.raises(IndexBusyError):
+                mgr.sync_updates()
+            with pytest.raises(IndexBusyError):
+                mgr.build_from_disk()
+        finally:
+            mgr._write_lock.release()
+
+    def test_an_unusable_lock_file_degrades_to_thread_locking(
+        self, temp_db_path
+    ):
+        """A read-only home must not make the index unusable."""
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        with patch("builtins.open", side_effect=OSError("read-only")):
+            lock = WriteLock(temp_db_path)
+            assert lock.acquire(blocking=False)
+            lock.release()
