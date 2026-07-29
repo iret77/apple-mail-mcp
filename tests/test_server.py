@@ -1935,7 +1935,7 @@ class TestAgentGuidance:
             self._mgr(indexed=5), accessible=True, tmp_path=tmp_path
         )
         for key in (
-            "install_mode",
+            "install_mode",  # fork-only
             "server_version",
             "index_mode",
             "write_tools_enabled",
@@ -1943,6 +1943,7 @@ class TestAgentGuidance:
         ):
             assert key in r, key
 
+    # fork-only:start — _install_mode only exists in this fork
     def test_index_command_matches_install_mode(self, monkeypatch):
         from apple_mail_mcp.server import _index_command, _install_mode
 
@@ -1958,6 +1959,8 @@ class TestAgentGuidance:
 
         monkeypatch.setenv("APPLE_MAIL_MCP_REF", "git+https://example/x@main")
         assert "git+https://example/x@main" in _index_command()
+
+    # fork-only:end
 
     def test_index_command_has_no_hardcoded_fork(self, monkeypatch):
         """Upstream-safety: no fork URL baked into the source."""
@@ -2487,9 +2490,9 @@ class TestDiagnosticsAreReachable:
             r = await get_index_status()
 
         assert r["recent_events"][0]["message"] == "Index build failed"
-        assert r["server_revision"]
+        assert r["server_revision"]  # fork-only
         assert "log_file" in r
-        assert "source_ref" in r
+        assert "source_ref" in r  # fork-only
 
     def test_log_path_is_configurable_and_disableable(self, monkeypatch):
         from apple_mail_mcp.config import get_log_path
