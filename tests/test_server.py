@@ -48,6 +48,16 @@ def _isolate_server_singletons(monkeypatch):
     AccountMap.get_instance().reset()
 
 
+def _mock_acct_map(uuid_to_name="Work", excluded_uuids=None):
+    """An AccountMap double: name<->uuid, and the exclusion set."""
+    m = MagicMock()
+    m.ensure_loaded = AsyncMock()
+    m.names_to_uuids.return_value = set(excluded_uuids or [])
+    m.name_to_uuid.return_value = None
+    m.uuid_to_name.return_value = uuid_to_name
+    return m
+
+
 class TestListAccounts:
     """Tests for list_accounts() tool."""
 
@@ -1649,3 +1659,101 @@ class TestGetAttachmentLinksMode:
             assert result["links"][0]["url"] == "https://example.com"
             assert result["links"][0]["text"] == "Example"
             assert "file_path" not in result
+
+
+class TestTimestampsAreLocal:
+    """Mail.app showed 14:54 while the tool said 12:54 — stored UTC was
+    handed to the reader unconverted."""
+
+    def test_utc_is_converted_to_the_running_system_zone(self, monkeypatch):
+        import time as _time
+
+        from apple_mail_mcp.server import to_local_iso
+
+        # Two different zones: the conversion must follow the system,
+        # never a value baked into the code.
+        for tz, expected_hour in (("Europe/Berlin", 14), ("UTC", 12)):
+            monkeypatch.setenv("TZ", tz)
+            _time.tzset()
+            out = to_local_iso("2026-07-27T12:54:00+00:00")
+            assert out is not None
+            assert int(out[11:13]) == expected_hour, (tz, out)
+
+    def test_naive_values_are_read_as_utc(self, monkeypatch):
+        import time as _time
+
+        from apple_mail_mcp.server import to_local_iso
+
+        monkeypatch.setenv("TZ", "Europe/Berlin")
+        _time.tzset()
+        # Everything this server writes is UTC, so a naive string must
+        # not be mistaken for local time.
+        assert to_local_iso("2026-07-27T12:54:00")[11:13] == "14"
+
+    def test_unparseable_and_empty_values_survive_untouched(self):
+        from apple_mail_mcp.server import to_local_iso
+
+        for value in ("Mon, 1 Jan 2026 10:00:00 +0100", "", None, "garbage"):
+            assert to_local_iso(value) == value
+
+    def test_dst_is_honoured(self, monkeypatch):
+        """A fixed offset would be wrong for half the year."""
+        import time as _time
+
+        from apple_mail_mcp.server import to_local_iso
+
+        monkeypatch.setenv("TZ", "Europe/Berlin")
+        _time.tzset()
+        summer = to_local_iso("2026-07-27T12:00:00+00:00")
+        winter = to_local_iso("2026-01-27T12:00:00+00:00")
+        assert summer.endswith("+02:00")  # CEST
+        assert winter.endswith("+01:00")  # CET
+
+    @pytest.mark.asyncio
+    async def test_get_email_reports_local_time(self):
+        parsed = MagicMock()
+        parsed.id = 42
+        parsed.subject = "s"
+        parsed.sender = "a@b"
+        parsed.content = "c"
+        parsed.date_received = "2026-07-27T12:54:00+00:00"
+        parsed.date_sent = "2026-07-27T12:50:00+00:00"
+        parsed.read = True
+        parsed.flagged = False
+        parsed.reply_to = ""
+        parsed.message_id_header = "<x@y>"
+        parsed.attachments = []
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.find_email_path.return_value = MagicMock(exists=lambda: True)
+        mgr.get_email_attachments.return_value = None
+        amap = _mock_acct_map()
+
+        import time as _time
+
+        os.environ["TZ"] = "Europe/Berlin"
+        _time.tzset()
+        try:
+            with (
+                patch(
+                    "apple_mail_mcp.server._get_index_manager",
+                    return_value=mgr,
+                ),
+                patch(
+                    "apple_mail_mcp.server._get_account_map",
+                    return_value=amap,
+                ),
+                patch(
+                    "apple_mail_mcp.index.disk.parse_emlx", return_value=parsed
+                ),
+            ):
+                from apple_mail_mcp.server import get_email
+
+                r = await get_email(42)
+        finally:
+            os.environ.pop("TZ", None)
+            _time.tzset()
+
+        assert r["date_received"].startswith("2026-07-27T14:54")
+        assert r["date_sent"].startswith("2026-07-27T14:50")
