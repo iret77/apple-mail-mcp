@@ -188,6 +188,10 @@ class SearchResult:
     content_snippet: str
     date_received: str
     score: float
+    # RFC822 Message-ID header. Stable across folder moves, unlike
+    # `id` (a per-mailbox ROWID). Callers that hold on to a message
+    # between calls must use this one.
+    rfc822_message_id: str | None = None
 
 
 def sanitize_fts_query(query: str) -> str:
@@ -303,6 +307,7 @@ def search_fts(
             e.sender,
             e.content,
             e.date_received,
+            e.rfc822_message_id,
             -bm25(emails_fts, 1.0, 0.5, 2.0) as score
         FROM emails_fts
         JOIN emails e ON emails_fts.rowid = e.rowid
@@ -341,6 +346,7 @@ def search_fts(
                     content_snippet=_extract_snippet(row["content"]),
                     date_received=row["date_received"] or "",
                     score=round(row["score"], 3),
+                    rfc822_message_id=row["rfc822_message_id"],
                 )
             )
 
@@ -425,6 +431,7 @@ def search_fts_highlight(
             snippet(emails_fts, 2, '**', '**', '...', 32)
                 as content_snippet,
             e.date_received,
+            e.rfc822_message_id,
             -bm25(emails_fts, 1.0, 0.5, 2.0) as score
         FROM emails_fts
         JOIN emails e ON emails_fts.rowid = e.rowid
@@ -463,6 +470,7 @@ def search_fts_highlight(
                     content_snippet=row["content_snippet"] or "",
                     date_received=row["date_received"] or "",
                     score=round(row["score"], 3),
+                    rfc822_message_id=row["rfc822_message_id"],
                 )
             )
 
@@ -580,6 +588,7 @@ def search_attachments(
     sql = """
         SELECT e.message_id, e.account, e.mailbox,
                e.subject, e.sender, e.date_received,
+               e.rfc822_message_id,
                a.filename
         FROM attachments a
         JOIN emails e ON a.email_rowid = e.rowid

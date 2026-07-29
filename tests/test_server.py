@@ -1020,6 +1020,7 @@ class TestSearchAttachments:
                 "subject": "Invoice attached",
                 "sender": "billing@co.com",
                 "date_received": "2024-01-15",
+                "rfc822_message_id": "<inv-1@co.com>",
                 "filename": "invoice.pdf",
             }
         ]
@@ -1649,3 +1650,198 @@ class TestGetAttachmentLinksMode:
             assert result["links"][0]["url"] == "https://example.com"
             assert result["links"][0]["text"] == "Example"
             assert "file_path" not in result
+
+
+class TestReadsHandOutTheStableId:
+    """Every read path carries the RFC822 header alongside the ROWID.
+
+    A caller that holds on to a message between calls has only `id`,
+    which is a per-mailbox ROWID: it dies the moment any device files
+    the message elsewhere — routine when a phone and a tablet share the
+    account.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fts_search_carries_the_header(self):
+        from apple_mail_mcp.index.search import SearchResult as Row
+
+        row = Row(
+            id=1,
+            account="UUID-1",
+            mailbox="INBOX",
+            subject="s",
+            sender="a@x",
+            content_snippet="...",
+            date_received="2026-07-28",
+            score=1.0,
+            rfc822_message_id="<abc@x.example>",
+        )
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.search.return_value = [row]
+        amap = MagicMock()
+        amap.ensure_loaded = AsyncMock()
+        amap.uuid_to_name.return_value = "Work"
+        amap.name_to_uuid.return_value = None
+        amap.names_to_uuids.return_value = set()
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import search
+
+            out = await search("anything")
+
+        assert out[0]["message_id"] == "<abc@x.example>"
+
+    @pytest.mark.asyncio
+    async def test_attachment_search_carries_the_header(self):
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.search_attachments.return_value = [
+            {
+                "message_id": 1,
+                "account": "UUID-1",
+                "mailbox": "INBOX",
+                "subject": "Invoice",
+                "sender": "b@x",
+                "date_received": "2026-07-28",
+                "rfc822_message_id": "<inv@x.example>",
+                "filename": "invoice.pdf",
+            }
+        ]
+        amap = MagicMock()
+        amap.ensure_loaded = AsyncMock()
+        amap.uuid_to_name.return_value = "Work"
+        amap.name_to_uuid.return_value = None
+        amap.names_to_uuids.return_value = set()
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+        ):
+            from apple_mail_mcp.server import search
+
+            out = await search("invoice", scope="attachments")
+
+        assert out[0]["message_id"] == "<inv@x.example>"
+
+    @pytest.mark.asyncio
+    async def test_the_envelope_fast_path_takes_one_batched_lookup(self):
+        """A per-row query would undo the reason that path exists."""
+        from types import SimpleNamespace
+
+        rows = [
+            SimpleNamespace(
+                message_id=i,
+                subject=f"s{i}",
+                sender="a@x",
+                date_received="2026-07-28T10:00:00",
+                read=False,
+                flagged=False,
+                account_uuid="uuid-1",
+                mailbox_name="INBOX",
+            )
+            for i in (1, 2, 3)
+        ]
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.get_rfc822_ids.return_value = {
+            ("uuid-1", "INBOX", 1): "<one@x>",
+            ("uuid-1", "INBOX", 3): "<three@x>",
+        }
+        amap = MagicMock()
+        amap.ensure_loaded = AsyncMock()
+        amap.names_to_uuids.return_value = set()
+        amap.name_to_uuid.return_value = "uuid-1"
+        amap.uuid_to_name.return_value = "Work"
+        amap.get_cached_accounts.return_value = [
+            {"name": "Work", "id": "uuid-1"}
+        ]
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                return_value=rows,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            out = await get_emails(account="Work")
+
+        assert mgr.get_rfc822_ids.call_count == 1
+        assert [e.get("message_id") for e in out] == [
+            "<one@x>",
+            None,  # not indexed: absent, never a wrong header
+            "<three@x>",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_degrades_the_listing_not_kills_it(self):
+        from types import SimpleNamespace
+
+        rows = [
+            SimpleNamespace(
+                message_id=1,
+                subject="s",
+                sender="a@x",
+                date_received="2026-07-28T10:00:00",
+                read=False,
+                flagged=False,
+                account_uuid="uuid-1",
+                mailbox_name="INBOX",
+            )
+        ]
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.get_rfc822_ids.side_effect = RuntimeError("db went away")
+        amap = MagicMock()
+        amap.ensure_loaded = AsyncMock()
+        amap.names_to_uuids.return_value = set()
+        amap.name_to_uuid.return_value = "uuid-1"
+        amap.uuid_to_name.return_value = "Work"
+        amap.get_cached_accounts.return_value = [
+            {"name": "Work", "id": "uuid-1"}
+        ]
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                return_value=rows,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            out = await get_emails(account="Work")
+
+        assert out[0]["subject"] == "s"
+        assert out[0].get("message_id") is None
+
+    def test_the_standard_property_set_fetches_the_header(self):
+        """The JXA paths get it from the bulk fetch — one more IPC call
+        for the whole listing, not one per message."""
+        from apple_mail_mcp.builders import PROPERTY_SETS
+
+        assert "message_id" in PROPERTY_SETS["standard"]

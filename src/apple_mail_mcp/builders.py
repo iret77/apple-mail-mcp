@@ -34,6 +34,11 @@ PROPERTY_SETS = {
         "date_received",
         "read",
         "flagged",
+        # The stable handle. batchFetch costs one IPC call per property,
+        # so carrying it everywhere is cheap — and without it every
+        # JXA-served listing hands out ids that stop resolving the
+        # moment another device files the message elsewhere.
+        "message_id",
     ],
     "full": [
         "id",

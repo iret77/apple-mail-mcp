@@ -155,10 +155,13 @@ class Mailbox(TypedDict):
     unreadCount: int
 
 
-class EmailSummary(TypedDict):
+class EmailSummary(TypedDict, total=False):
     """Summary of an email (used in list/search results)."""
 
     id: int
+    # RFC822 Message-ID header — see SearchResult.message_id. Use this,
+    # not `id`, for anything that outlives the call.
+    message_id: str | None
     subject: str
     sender: str
     date_received: str
@@ -170,6 +173,11 @@ class SearchResult(TypedDict, total=False):
     """Result from search operations."""
 
     id: int
+    # RFC822 Message-ID header — the stable handle on this message.
+    # Prefer it over `id` for anything that outlives the call: `id` is a
+    # per-mailbox ROWID that dies the moment any device files the
+    # message elsewhere.
+    message_id: str | None
     subject: str
     sender: str
     date_received: str
@@ -212,6 +220,26 @@ def _get_index_manager():
     from .index import IndexManager
 
     return IndexManager.get_instance()
+
+
+def _rfc822_ids_for_rows(rows) -> dict[tuple[str, str, int], str]:
+    """Stable headers for a page of Envelope Index rows, in one query.
+
+    The Envelope Index has no RFC822 header column, so the header can
+    only come from our own index. A missing row simply yields no
+    entry — never a wrong header — and a lookup failure degrades the
+    listing rather than failing it.
+    """
+    manager = _get_index_manager()
+    if not rows or not manager.has_index():
+        return {}
+    try:
+        return manager.get_rfc822_ids(
+            [(r.account_uuid, r.mailbox_name, r.message_id) for r in rows]
+        )
+    except Exception as exc:
+        logger.debug("stable-id lookup failed: %s", exc)
+        return {}
 
 
 def _get_account_map():
@@ -414,7 +442,11 @@ async def get_emails(
         limit: Maximum number of emails to return (default: 50)
 
     Returns:
-        List of email dictionaries sorted by date (newest first).
+        List of email dictionaries sorted by date (newest first). Each
+        carries `message_id`, the RFC822 Message-ID header — prefer that
+        over `id` for anything that outlives the call, because `id` is a
+        per-mailbox ROWID that stops resolving as soon as any device
+        files the message elsewhere.
 
     Examples:
         >>> get_emails()  # All emails from default mailbox
@@ -490,9 +522,17 @@ async def get_emails(
                     filter_kind=filter,
                     limit=limit,
                 )
+                # Stable headers for the whole page in one query. The
+                # Envelope Index has no RFC822 header column, so this is
+                # the only place it can come from — and a per-row lookup
+                # would undo the reason this path exists.
+                headers = await asyncio.to_thread(_rfc822_ids_for_rows, rows)
                 return [
                     EmailSummary(
                         id=r.message_id,
+                        message_id=headers.get(
+                            (r.account_uuid, r.mailbox_name, r.message_id)
+                        ),
                         subject=r.subject,
                         sender=r.sender,
                         date_received=r.date_received,
@@ -630,7 +670,12 @@ async def get_email(
 
     Returns:
         Email dictionary with full content including:
-        - id, subject, sender, date_received, date_sent
+        - id: the numeric id — a per-mailbox ROWID, valid only while
+          the message stays where it is
+        - message_id: the RFC822 Message-ID header. Hold on to THIS
+          between calls; it keeps naming the same message after it is
+          filed elsewhere from another device.
+        - subject, sender, date_received, date_sent
         - content: Full plain text body
         - read, flagged status
         - reply_to, message_id (email Message-ID header)
@@ -1102,9 +1147,14 @@ async def search(
             and content_snippet (default: False).
 
     Returns:
-        List of matching emails with id, subject, sender,
+        List of matching emails with id, message_id, subject, sender,
         date_received, score, matched_in, content_snippet,
         account, and mailbox fields.
+
+        `message_id` is the RFC822 Message-ID header: the handle to keep
+        if the result is used later. `id` is a per-mailbox ROWID and
+        stops resolving as soon as any device files the message
+        elsewhere.
 
         When nothing matches, returns a dict instead:
         {"result": [], "hint": "..."} — the hint suggests how to
@@ -1166,6 +1216,7 @@ async def search(
             [
                 {
                     "id": row["message_id"],
+                    "message_id": row["rfc822_message_id"],
                     "subject": row["subject"],
                     "sender": row["sender"],
                     "date_received": row["date_received"],
@@ -1235,6 +1286,7 @@ async def search(
                 [
                     {
                         "id": r.id,
+                        "message_id": r.rfc822_message_id,
                         "subject": r.subject,
                         "sender": r.sender,
                         "date_received": r.date_received,
@@ -1302,6 +1354,7 @@ async def search(
         [
             {
                 "id": e["id"],
+                "message_id": e.get("message_id"),
                 "subject": e["subject"],
                 "sender": e["sender"],
                 "date_received": e["date_received"],

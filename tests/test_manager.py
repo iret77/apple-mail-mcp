@@ -906,3 +906,68 @@ class TestWatcher:
         assert manager.watcher_running is False
         manager.stop_watcher()  # Should not raise
         assert manager.watcher_running is False
+
+
+class TestBatchedStableIdLookup:
+    """`get_rfc822_ids()` — one query for a whole page of results."""
+
+    def _insert(self, m, mid, account, mailbox, header):
+        from apple_mail_mcp.index.schema import (
+            INSERT_EMAIL_SQL,
+            email_to_row,
+        )
+
+        conn = m._get_conn()
+        conn.execute(
+            INSERT_EMAIL_SQL,
+            email_to_row(
+                {"id": mid, "subject": "s", "message_id_header": header},
+                account,
+                mailbox,
+                f"/tmp/{mid}.emlx",
+            ),
+        )
+        conn.commit()
+
+    def test_returns_the_header_for_known_rows(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "<one@x>")
+        self._insert(m, 2, "acct", "INBOX", "<two@x>")
+
+        out = m.get_rfc822_ids([("acct", "INBOX", 1), ("acct", "INBOX", 2)])
+        assert out == {
+            ("acct", "INBOX", 1): "<one@x>",
+            ("acct", "INBOX", 2): "<two@x>",
+        }
+
+    def test_the_lookup_is_scoped_to_the_mailbox(self, temp_db_path):
+        """A Mail.app id is unique only within its mailbox: the same
+        number in another mailbox is a different message."""
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "<inbox@x>")
+        self._insert(m, 1, "acct", "Sent", "<sent@x>")
+
+        assert m.get_rfc822_ids([("acct", "Sent", 1)]) == {
+            ("acct", "Sent", 1): "<sent@x>"
+        }
+
+    def test_rows_without_a_header_are_absent(self, temp_db_path):
+        """Rows indexed before v6 have NULL. Absent means "unknown" —
+        never an empty string that could match something."""
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "")
+
+        assert m.get_rfc822_ids([("acct", "INBOX", 1)]) == {}
+
+    def test_empty_input_asks_nothing(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        assert m.get_rfc822_ids([]) == {}
+
+    def test_a_large_page_stays_under_the_variable_limit(self, temp_db_path):
+        """Three variables per key; SQLite's default cap is 999."""
+        m = IndexManager(db_path=temp_db_path)
+        for i in range(400):
+            self._insert(m, i, "acct", "INBOX", f"<m{i}@x>")
+
+        out = m.get_rfc822_ids([("acct", "INBOX", i) for i in range(400)])
+        assert len(out) == 400

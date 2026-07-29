@@ -652,6 +652,47 @@ class IndexManager:
     # Public Query Methods (used by server.py instead of raw SQL)
     # ─────────────────────────────────────────────────────────────────
 
+    def get_rfc822_ids(
+        self, keys: list[tuple[str, str, int]]
+    ) -> dict[tuple[str, str, int], str]:
+        """Stable headers for a page of listing results, in one query.
+
+        Takes ``(account, mailbox, message_id)`` triples — fully scoped,
+        because a Mail.app id is only unique within its mailbox — and
+        returns the header for the ones the index knows. One statement
+        for the whole page instead of a query per row; the listing paths
+        call this for every result they return.
+
+        Rows indexed before schema v6 have no header and are simply
+        absent from the result.
+        """
+        if not keys:
+            return {}
+        out: dict[tuple[str, str, int], str] = {}
+        conn = self._get_conn()
+        # Chunked to stay well under SQLite's variable limit (999).
+        chunk = 300
+        for start in range(0, len(keys), chunk):
+            batch = keys[start : start + chunk]
+            clause = " OR ".join(
+                ["(account = ? AND mailbox = ? AND message_id = ?)"]
+                * len(batch)
+            )
+            params: list = []
+            for acct, mbox, mid in batch:
+                params += [acct, mbox, mid]
+            rows = conn.execute(
+                "SELECT account, mailbox, message_id, rfc822_message_id "
+                f"FROM emails WHERE ({clause}) "
+                "AND rfc822_message_id IS NOT NULL",
+                params,
+            ).fetchall()
+            for r in rows:
+                out[(r["account"], r["mailbox"], r["message_id"])] = r[
+                    "rfc822_message_id"
+                ]
+        return out
+
     def find_email_location(
         self,
         message_id: int,
