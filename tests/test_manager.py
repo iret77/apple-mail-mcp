@@ -1017,3 +1017,64 @@ class TestConnectionsArePerThread:
         assert len(mgr._open_conns) == 2
         mgr.close()
         assert mgr._open_conns == []
+
+
+class TestRebuildDoesNotFireOneDeletePerRow:
+    """Clearing with the FTS triggers still in place is quadratic work.
+
+    emails_ad fires once per deleted row against the external content
+    index — minutes on a 64k-message mailbox, for a table that is about
+    to be empty. Dropping the triggers first and emptying FTS with a
+    single statement removes all of it.
+    """
+
+    def test_triggers_are_dropped_before_the_delete(self):
+        import inspect
+
+        from apple_mail_mcp.index import manager as m
+
+        src = inspect.getsource(m.IndexManager.build_from_disk)
+        drop = src.index("DROP TRIGGER IF EXISTS emails_ad")
+        delete = src.index('conn.execute("DELETE FROM emails")')
+        assert drop < delete, "the DELETE would fire the trigger per row"
+
+    def test_fts_is_emptied_in_one_statement(self):
+        import inspect
+
+        from apple_mail_mcp.index import manager as m
+
+        src = inspect.getsource(m.IndexManager.build_from_disk)
+        assert "VALUES('delete-all')" in src
+
+    def test_triggers_are_restored_even_when_the_build_fails(
+        self, temp_db_path
+    ):
+        """DDL commits implicitly, so a rollback does not bring them
+        back: without the restore the index silently stops tracking
+        its FTS table from then on."""
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        conn = mgr._get_conn()
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                side_effect=RuntimeError("disk went away"),
+            ),
+        ):
+            with pytest.raises(RuntimeError):
+                mgr.build_from_disk()
+
+        names = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+        assert {"emails_ai", "emails_ad", "emails_au"} <= names

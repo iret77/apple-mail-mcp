@@ -327,15 +327,21 @@ class IndexManager:
         capped_mailboxes: set[tuple[str, str]] = set()
         total_indexed = 0
 
+        # Drop the triggers BEFORE clearing, not after: with them in
+        # place the DELETE fires emails_ad once per row, which on a
+        # 64k-message index is minutes of pure trigger work for a table
+        # that is about to be empty anyway.
+        conn.execute("DROP TRIGGER IF EXISTS emails_ai")
+        conn.execute("DROP TRIGGER IF EXISTS emails_ad")
+        conn.execute("DROP TRIGGER IF EXISTS emails_au")
+
         # Clear existing data for rebuild
         conn.execute("DELETE FROM attachments")
         conn.execute("DELETE FROM emails")
         conn.execute("DELETE FROM sync_state")
-
-        # Disable triggers during bulk insert for performance
-        conn.execute("DROP TRIGGER IF EXISTS emails_ai")
-        conn.execute("DROP TRIGGER IF EXISTS emails_ad")
-        conn.execute("DROP TRIGGER IF EXISTS emails_au")
+        # With no triggers running, the FTS table has to be emptied
+        # explicitly — one statement instead of one delete per row.
+        conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('delete-all')")
 
         batch: list[tuple] = []
         # Deferred attachment rows: (email_tuple_index, attachments)
