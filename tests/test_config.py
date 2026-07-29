@@ -503,3 +503,30 @@ account = "NowSet"
         assert get_default_account() is None
         _invalidate_config_cache()
         assert get_default_account() == "NowSet"
+
+
+class TestAutoBuildConfig:
+    def test_default_true(self, monkeypatch):
+        import apple_mail_mcp.config as cfg
+
+        monkeypatch.delenv("APPLE_MAIL_INDEX_AUTO_BUILD", raising=False)
+        monkeypatch.setattr(
+            cfg, "CONFIG_FILE_PATH", cfg.Path("/nonexistent/config.toml")
+        )
+        cfg._invalidate_config_cache()
+        try:
+            assert cfg.get_index_auto_build() is True
+        finally:
+            cfg._invalidate_config_cache()
+
+    def test_env_false(self, monkeypatch):
+        import apple_mail_mcp.config as cfg
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", "false")
+        assert cfg.get_index_auto_build() is False
+
+    def test_env_true(self, monkeypatch):
+        import apple_mail_mcp.config as cfg
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", "1")
+        assert cfg.get_index_auto_build() is True

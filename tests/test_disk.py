@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import email
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from apple_mail_mcp.index.disk import (
     MAX_EMLX_SIZE,
@@ -1180,34 +1183,34 @@ class TestNestedExternalAttachments:
                 application/pdf (part 2.2 - the invoice)
         """
         return (
-            'Content-Type: multipart/mixed; boundary="outer"\r\n'
-            "\r\n"
-            "--outer\r\n"
-            'Content-Type: multipart/alternative; boundary="alt"\r\n'
-            "\r\n"
-            "--alt\r\n"
-            "Content-Type: text/plain\r\n"
-            "\r\n"
-            "Body text\r\n"
-            "--alt\r\n"
-            "Content-Type: text/html\r\n"
-            "\r\n"
-            "<p>Body</p>\r\n"
-            "--alt--\r\n"
-            "--outer\r\n"
-            'Content-Type: multipart/mixed; boundary="fwd"\r\n'
-            "\r\n"
-            "--fwd\r\n"
-            "Content-Type: text/html\r\n"
-            "\r\n"
-            "<p>Forwarded body</p>\r\n"
-            "--fwd\r\n"
-            "Content-Type: application/pdf\r\n"
-            'Content-Disposition: attachment; filename="invoice.pdf"\r\n'
-            "\r\n"
-            "--fwd--\r\n"
-            "--outer--\r\n"
-        ).encode()
+            b'Content-Type: multipart/mixed; boundary="outer"\r\n'
+            b"\r\n"
+            b"--outer\r\n"
+            b'Content-Type: multipart/alternative; boundary="alt"\r\n'
+            b"\r\n"
+            b"--alt\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"Body text\r\n"
+            b"--alt\r\n"
+            b"Content-Type: text/html\r\n"
+            b"\r\n"
+            b"<p>Body</p>\r\n"
+            b"--alt--\r\n"
+            b"--outer\r\n"
+            b'Content-Type: multipart/mixed; boundary="fwd"\r\n'
+            b"\r\n"
+            b"--fwd\r\n"
+            b"Content-Type: text/html\r\n"
+            b"\r\n"
+            b"<p>Forwarded body</p>\r\n"
+            b"--fwd\r\n"
+            b"Content-Type: application/pdf\r\n"
+            b'Content-Disposition: attachment; filename="invoice.pdf"\r\n'
+            b"\r\n"
+            b"--fwd--\r\n"
+            b"--outer--\r\n"
+        )
 
     def test_get_attachment_content_nested(self, tmp_path: Path):
         """get_attachment_content finds file in dotted subdir."""
@@ -1259,26 +1262,26 @@ class TestNestedExternalAttachments:
     def test_deeply_nested(self, tmp_path: Path):
         """Three levels deep: subdir 1.2.1 works."""
         mime_raw = (
-            'Content-Type: multipart/mixed; boundary="L1"\r\n'
-            "\r\n"
-            "--L1\r\n"
-            'Content-Type: multipart/mixed; boundary="L2"\r\n'
-            "\r\n"
-            "--L2\r\n"
-            "Content-Type: text/plain\r\n"
-            "\r\n"
-            "Body\r\n"
-            "--L2\r\n"
-            'Content-Type: multipart/mixed; boundary="L3"\r\n'
-            "\r\n"
-            "--L3\r\n"
-            "Content-Type: application/pdf\r\n"
-            'Content-Disposition: attachment; filename="deep.pdf"\r\n'
-            "\r\n"
-            "--L3--\r\n"
-            "--L2--\r\n"
-            "--L1--\r\n"
-        ).encode()
+            b'Content-Type: multipart/mixed; boundary="L1"\r\n'
+            b"\r\n"
+            b"--L1\r\n"
+            b'Content-Type: multipart/mixed; boundary="L2"\r\n'
+            b"\r\n"
+            b"--L2\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"Body\r\n"
+            b"--L2\r\n"
+            b'Content-Type: multipart/mixed; boundary="L3"\r\n'
+            b"\r\n"
+            b"--L3\r\n"
+            b"Content-Type: application/pdf\r\n"
+            b'Content-Disposition: attachment; filename="deep.pdf"\r\n'
+            b"\r\n"
+            b"--L3--\r\n"
+            b"--L2--\r\n"
+            b"--L1--\r\n"
+        )
 
         pdf_bytes = b"%PDF deeply nested"
         emlx = _build_partial_tree(
@@ -1683,3 +1686,147 @@ class TestGetEmailLinks:
             _synthetic_inline_name("logo.png", "image/jpeg")
             == "inline_logo.png.jpg"
         )
+
+
+class TestOversizedEmailsAreVisible:
+    """A skipped message must never be silently missing from search."""
+
+    def test_limit_is_configurable(self, monkeypatch):
+        from apple_mail_mcp.index.disk import max_emlx_size
+
+        monkeypatch.delenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", raising=False)
+        assert max_emlx_size() == 25 * 1024 * 1024
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "100")
+        assert max_emlx_size() == 100 * 1024 * 1024
+
+    def test_too_large_detection(self, tmp_path, monkeypatch):
+        from apple_mail_mcp.index.disk import emlx_too_large
+
+        f = tmp_path / "big.emlx"
+        f.write_bytes(b"x" * 2048)
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "1")
+        assert emlx_too_large(f) is False  # 2 KB under a 1 MB cap
+
+        # 1 KB cap expressed in MB
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", str(1 / 1024))
+        assert emlx_too_large(f) is True
+
+    def test_scan_reports_the_skip_instead_of_swallowing_it(
+        self, tmp_path, monkeypatch
+    ):
+        from apple_mail_mcp.index import disk
+
+        mail_dir = tmp_path
+        big = tmp_path / "big.emlx"
+        big.write_bytes(b"x" * 4096)
+
+        monkeypatch.setattr(
+            disk, "scan_emlx_files", lambda *a, **k: iter([big])
+        )
+        monkeypatch.setattr(disk, "read_envelope_index", lambda d: {})
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", str(1 / 1024))
+
+        skips: list = []
+        results = list(
+            disk.scan_all_emails(
+                mail_dir, on_skip=lambda p, r: skips.append((p, r))
+            )
+        )
+
+        assert results == []
+        assert skips == [(big, "too_large")]
+
+    @pytest.mark.asyncio
+    async def test_status_explains_the_gap(self, tmp_path):
+        mgr = MagicMock()
+        mgr.is_building.return_value = False
+        mgr.write_lock_held.return_value = False
+        mgr.has_index.return_value = True
+        mgr.indexed_email_count.return_value = 63_875
+        mgr.count_skipped_too_large.return_value = 4
+        mgr.count_without_stable_id.return_value = 0
+        mgr.last_error = None
+        stats = MagicMock()
+        stats.disk_email_count = 63_879
+        stats.mailbox_count = 24
+        stats.attachment_count = 0
+        stats.db_size_mb = 1.0
+        stats.failed_jobs_count = 4
+        stats.excluded_accounts = []
+        stats.last_sync = None
+        stats.staleness_hours = None
+        mgr.get_stats.return_value = stats
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["skipped_too_large"] == 4
+        # The count difference is explained, not left to guesswork.
+        assert "size limit" in r["skipped_note"]
+        assert "APPLE_MAIL_INDEX_MAX_EMAIL_MB" in r["skipped_note"]
+
+
+class TestContentIdHeaderCrash:
+    """The one file the log showed still failing after the first header
+    fix: an inline image with a non-ASCII Content-ID."""
+
+    def _emlx(self, tmp_path, mime: bytes):
+        p = tmp_path / "1.emlx"
+        p.write_bytes(
+            f"{len(mime)}\n".encode()
+            + mime
+            + b"<?xml version='1.0'?><plist><dict></dict></plist>"
+        )
+        return p
+
+    def test_non_ascii_content_id_parses(self, tmp_path):
+        from apple_mail_mcp.index.disk import parse_emlx
+
+        mime = (
+            b"From: a@b.com\r\nSubject: t\r\n"
+            b"Date: Mon, 1 Jan 2026 10:00:00 +0100\r\n"
+            b'Content-Type: multipart/mixed; boundary="B"\r\n\r\n--B\r\n'
+            b"Content-Type: text/plain\r\n\r\nbody\r\n--B\r\n"
+            b"Content-Type: image/png\r\nContent-ID: <H\xe4ndler>\r\n\r\n"
+            b"XX\r\n--B--\r\n"
+        )
+        parsed = parse_emlx(self._emlx(tmp_path, mime))
+        assert parsed is not None
+        assert len(parsed.attachments or []) == 1
+
+    def test_non_ascii_attachment_filename_parses(self, tmp_path):
+        from apple_mail_mcp.index.disk import parse_emlx
+
+        mime = (
+            b"From: a@b.com\r\nSubject: t\r\n"
+            b"Date: Mon, 1 Jan 2026 10:00:00 +0100\r\n"
+            b'Content-Type: multipart/mixed; boundary="B"\r\n\r\n--B\r\n'
+            b"Content-Type: text/plain\r\n\r\nbody\r\n--B\r\n"
+            b"Content-Type: application/pdf\r\n"
+            b"Content-Disposition: attachment; "
+            b'filename="H\xe4ndler.pdf"\r\n\r\n'
+            b"XX\r\n--B--\r\n"
+        )
+        parsed = parse_emlx(self._emlx(tmp_path, mime))
+        assert parsed is not None
+        assert len(parsed.attachments or []) == 1
+
+    def test_no_raw_header_access_remains_in_the_parser(self):
+        """Every header must go through header_text/_filename_text —
+        two rounds of this bug came from a missed raw access."""
+        from pathlib import Path as _P
+
+        src = _P("src/apple_mail_mcp/index/disk.py").read_text()
+        body = src[src.index("def parse_emlx") :]
+        for pattern in ('msg["', 'part.get("Content-ID")', "get_filename()"):
+            assert pattern not in body, pattern

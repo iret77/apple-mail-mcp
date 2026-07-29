@@ -206,7 +206,9 @@ therefore failed outright on a German install.
    provider hierarchy (`[Gmail]/…`, a leading `INBOX.`), then compares
    the last path segment. This is what makes `INBOX.Sent` answer a
    request for `Sent`.
-4. **The role table** (`MAILBOX_ROLES`) — localized and legacy names.
+4. **The role table** (`MAILBOX_ROLES`) — localized and legacy names,
+   covering de, fr, es, it, pt-BR, nl, sv, da, fi, no, pl, ru, tr, ja,
+   ko, zh-Hans and zh-Hant.
    **Every entry is sourced from Apple's localized Mail user guide or is
    a documented provider/legacy name.** Do not add a translation you
    have not verified: a wrong name here is worse than a missing one,
