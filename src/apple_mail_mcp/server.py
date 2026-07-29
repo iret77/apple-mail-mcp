@@ -429,10 +429,12 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # ========== Diagnostics Helpers ==========
 
 
-# Bumped on every shipped change. The package version alone cannot
-# answer "which build is answering me" when a bundle tracks a moving
-# branch — and that question had to be guessed twice.
+# fork-only:start — the .mcpb bundle tracks a git ref, so the package
+# version alone cannot answer "which build is answering me". Upstream
+# ships through PyPI, where the package version does answer it.
+# Bumped on every shipped change.
 SERVER_REVISION = "2026-07-28.19"
+# fork-only:end
 
 
 def to_local_iso(value: str | None) -> str | None:
@@ -491,6 +493,7 @@ def _log_file_path() -> str:
         return "(unknown)"
 
 
+# fork-only:start — recognises OUR launcher; upstream has no bundle.
 def _install_mode() -> str:
     """How this server was launched: 'bundle' (.mcpb) or 'cli'.
 
@@ -502,19 +505,24 @@ def _install_mode() -> str:
     return "bundle" if os.environ.get("APPLE_MAIL_MCP_LAUNCHER") else "cli"
 
 
-def _index_command() -> str:
-    """A copy-pasteable command that builds the index for this install.
+# fork-only:end
 
-    Bundle installs have no ``apple-mail-mcp`` on the user's PATH, so
-    the plain command would be a dead end; run the same distribution
-    through ``uvx`` instead. The launcher passes its own source in
-    ``APPLE_MAIL_MCP_REF`` (a git ref for a development build); without
-    it, the published package name is correct.
-    """
+
+def _index_command() -> str:
+    """A copy-pasteable command that builds the index for this install."""
+    # fork-only:start — bundle installs have no `apple-mail-mcp` on the
+    # user's PATH, so the plain command would be a dead end; run the
+    # same distribution through `uvx` instead. The launcher passes its
+    # own source in APPLE_MAIL_MCP_REF (a git ref for a development
+    # build); without it, the published package name is correct.
+    # fork-only:end
+    # fork-only:start — the bundle route; upstream users have the
+    # command on their PATH.
     if _install_mode() == "bundle":
         ref = os.environ.get("APPLE_MAIL_MCP_REF", "").strip()
         source = ref or "apple-mail-mcp"
         return f"uvx --from {source} apple-mail-mcp index --verbose"
+    # fork-only:end
     return "apple-mail-mcp index --verbose"
 
 
@@ -538,7 +546,7 @@ def _index_guidance(
     steps. The terminal command appears only where it is unavoidable.
     """
     cmd = _index_command()
-    app = "Claude" if _install_mode() == "bundle" else "the app running this"
+    app = "the app running this"  # fork-only-replace: was a bundle check
 
     if error and "database is locked" in error.lower():
         return (
@@ -3435,10 +3443,12 @@ async def get_index_status() -> dict:
         "mail_directory": mail_dir,
         "index_mode": "automatic" if auto_build else "manual",
         "sync_running": syncing,
+        # fork-only:start — build identity of the bundle distribution
         "install_mode": _install_mode(),
-        "server_version": _server_version(),
         "server_revision": SERVER_REVISION,
         "source_ref": os.environ.get("APPLE_MAIL_MCP_REF") or "(default)",
+        # fork-only:end
+        "server_version": _server_version(),
         "log_file": str(_log_file_path()),
         "read_only": get_read_only_mode(),
         "write_tools_enabled": not get_read_only_mode(),

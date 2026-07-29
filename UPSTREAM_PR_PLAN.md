@@ -28,11 +28,24 @@ without dragging the others down. Where a dependency is unavoidable it is named
 
 ## What must not travel upstream
 
+These are **marked in the source**, not listed by line number — a list
+goes stale on the next edit:
+
+```
+# fork-only:start … # fork-only:end     a block
+something()                # fork-only  a single line
+x = "plain"  # fork-only-replace: …     what the fork version did
+```
+
+`scripts/fork-only.py list` shows every marked region, `check` verifies the
+markers are balanced, and `strip <dir>` writes a copy with them removed — so an
+upstream branch is cut mechanically rather than from memory.
+
 | Item | Where | Why |
 |---|---|---|
-| `mcpb/`, `scripts/build-mcpb.sh`, `dist/`, this file | fork branches | fork distribution |
+| `mcpb/`, `scripts/build-mcpb.sh`, `dist/`, this file | fork branches | fork distribution; `strip` drops them |
 | `install_mode`, `source_ref`, `APPLE_MAIL_MCP_LAUNCHER`, `APPLE_MAIL_MCP_REF` | server.py | describes our bundle launcher |
-| `SERVER_REVISION` | server.py | our build stamp |
+| `SERVER_REVISION` | server.py | our build stamp; upstream ships via PyPI, where the package version answers it |
 | The `.mcpb` paragraph in the README | README.md | fork-specific |
 
 ---

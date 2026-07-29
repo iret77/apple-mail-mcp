@@ -484,6 +484,24 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
 
+## Fork-only code is marked, not remembered
+
+A few pieces describe this fork's distribution and must not travel to
+upstream: the `.mcpb` launcher detection (`_install_mode`, `source_ref`,
+`APPLE_MAIL_MCP_*`) and `SERVER_REVISION`, the build stamp that answers
+"which build is answering me" while a bundle tracks a moving git ref.
+
+They carry markers rather than living in a list that goes stale:
+
+```
+# fork-only:start … # fork-only:end     a block
+something()                # fork-only  a single line
+x = "plain"  # fork-only-replace: …     what the fork version did
+```
+
+`scripts/fork-only.py list | check | strip <dir>`. When adding anything
+that only makes sense with the bundle, mark it — including its tests.
+
 ## Coding Standards
 
 - **Python 3.11+**, type hints required
