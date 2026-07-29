@@ -90,7 +90,7 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
     """Internal function to run the MCP server."""
     import threading
 
-    from .config import set_read_only_mode
+    from .config import get_index_auto_build, set_read_only_mode
     from .index import IndexManager
     from .server import mcp
 
@@ -107,6 +107,32 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
         _cleanup_old_attachments()
     except Exception:
         pass
+
+    def _start_watcher() -> None:
+        """Start the real-time watcher (only with --watch).
+
+        Lifted out of the sync branch: a first build has to be able to
+        hand over to the watcher too, otherwise --watch silently does
+        nothing on a fresh install.
+        """
+        if not watch:
+            return
+        try:
+
+            def on_update(added: int, removed: int) -> None:
+                if added or removed:
+                    print(
+                        f"Index updated: +{added} -{removed}",
+                        file=sys.stderr,
+                    )
+
+            if manager.start_watcher(on_update=on_update):
+                print("File watcher started", file=sys.stderr)
+        except Exception as e:
+            print(
+                f"Warning: File watcher failed: {e}",
+                file=sys.stderr,
+            )
 
     if manager.has_index():
 
@@ -132,29 +158,60 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
                     file=sys.stderr,
                 )
 
-            # Start watcher only after sync completes
-            if watch:
-                try:
-
-                    def on_update(added: int, removed: int) -> None:
-                        if added or removed:
-                            print(
-                                f"Index updated: +{added} -{removed}",
-                                file=sys.stderr,
-                            )
-
-                    if manager.start_watcher(on_update=on_update):
-                        print("File watcher started", file=sys.stderr)
-                except Exception as e:
-                    print(
-                        f"Warning: File watcher failed: {e}",
-                        file=sys.stderr,
-                    )
+            _start_watcher()  # only after sync completes
 
         sync_thread = threading.Thread(target=_background_sync, daemon=True)
         sync_thread.start()
         print(
             "Syncing index in background...",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    elif get_index_auto_build():
+        # No index yet, and the operator asked us to build one. Detached
+        # and daemonic so the MCP server answers immediately; needs Full
+        # Disk Access, and a failure is reported rather than fatal.
+        def _background_build() -> None:
+            try:
+                start = time.time()
+                count = manager.build_from_disk()
+                elapsed = time.time() - start
+                print(
+                    f"Index built: {count} emails ({_format_time(elapsed)})",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                print(
+                    f"Warning: automatic index build failed: {e}. "
+                    f"Grant Full Disk Access, or run 'apple-mail-mcp "
+                    f"index'. Set APPLE_MAIL_INDEX_AUTO_BUILD=false to "
+                    f"stop trying.",
+                    file=sys.stderr,
+                )
+                return
+            _start_watcher()
+
+        build_thread = threading.Thread(target=_background_build, daemon=True)
+        build_thread.start()
+        print(
+            "No index yet — building in the background (first run; "
+            "requires Full Disk Access)...",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    else:
+        # No index and no permission to build one. Say so: silence here
+        # turns into an empty body search later, with nothing to
+        # explain it.
+        print(
+            "No search index, and automatic building is disabled. "
+            "Run 'apple-mail-mcp index --verbose' in a terminal with "
+            "Full Disk Access to build it, or set "
+            "APPLE_MAIL_INDEX_AUTO_BUILD=true. Body search stays "
+            "unavailable until then; the live JXA tools work "
+            "regardless.",
             file=sys.stderr,
             flush=True,
         )
