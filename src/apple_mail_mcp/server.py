@@ -44,7 +44,12 @@ else:
 
 from fastmcp import FastMCP
 
-from .builders import AccountsQueryBuilder, QueryBuilder
+from .builders import (
+    FLAG_COLOR_INDEX,
+    AccountsQueryBuilder,
+    QueryBuilder,
+    WriteBuilder,
+)
 from .config import (
     get_default_account,
     get_default_mailbox,
@@ -210,6 +215,347 @@ class EmailFull(TypedDict, total=False):
     reply_to: str
     message_id: str
     attachments: list[AttachmentSummary]
+
+
+# ========== Write-Tool Helpers ==========
+
+# Ceiling on one write batch. A batch is one osascript call per
+# (account, mailbox) group, so the cost is in the ids, not the call;
+# the cap exists so a runaway list cannot hold Mail.app hostage.
+MAX_WRITE_BATCH = 500
+
+# Located writes address a known mailbox directly, so they are fast;
+# the all-mailbox scan reuses Strategy 3's budget.
+WRITE_TIMEOUT = _clamped_env_int("APPLE_MAIL_WRITE_TIMEOUT", 30, 1, 300)
+
+
+class WriteResult(TypedDict, total=False):
+    """Per-id outcome of a batch write.
+
+    Every id the caller passed appears in exactly one bucket, so a
+    partial success is reportable rather than an exception.
+    """
+
+    updated: list[int]
+    unchanged: list[int]
+    not_found: list[int]
+    skipped_hidden: list[int]
+    failed: list[int]
+    error: str
+    hint: str
+    diagnostics: dict
+
+
+def _normalize_message_ids(
+    message_ids: int | list[int],
+) -> list[int]:
+    """Coerce a single id or a list into a validated, unique list.
+
+    Order is preserved so the answer reads in the order asked. A
+    non-integer id is refused by name rather than silently dropped: a
+    caller that mistyped one reference must not read the result as "that
+    message does not exist".
+    """
+    raw = (
+        list(message_ids)
+        if isinstance(message_ids, (list, tuple))
+        else [message_ids]
+    )
+    if not raw:
+        raise ValueError("No message ids given.")
+    if len(raw) > MAX_WRITE_BATCH:
+        raise ValueError(
+            f"Too many ids ({len(raw)}); max {MAX_WRITE_BATCH} per call."
+        )
+    out: list[int] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, int):
+            try:
+                item = int(item)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Invalid message id {item!r}: expected an integer."
+                ) from None
+        if item not in out:
+            out.append(item)
+    return out
+
+
+async def _resolve_write_targets(
+    ids: list[int],
+    account: str | None,
+    mailbox: str | None,
+) -> tuple[list[dict], list[int], list[int]]:
+    """Resolve message ids to JXA write groups, honoring the account gate.
+
+    A Mail.app id is a per-mailbox ROWID, not a globally addressable
+    handle: `Mail.messages.byId()` needs to know which mailbox to look
+    in. So each id is placed first via the index's location resolver
+    (the same machinery `get_email` Strategy 2 leans on), then via an
+    explicit `account` + `mailbox` hint (which JXA verifies), and
+    failing both via a bounded all-mailbox **scan** of a visible account
+    — mirroring `get_email` Strategy 3, so writes work with no index at
+    all.
+
+    An id that resolves into an excluded account (#90) goes to
+    `skipped_hidden` and is never dispatched to JXA. Only ids with no
+    visible account to scan land in `not_found`.
+
+    Returns ``(groups, not_found, skipped_hidden)``. Located groups are
+    ``{"account", "mailbox", "ids"}``; the optional scan group is
+    ``{"account", "ids", "scan": True}``.
+    """
+    # Explicit hidden account: refuse the whole batch up front, exactly
+    # as the read tools do at their entry gate.
+    if _hidden_account(account):
+        return [], [], list(ids)
+
+    manager = _get_index_manager()
+    has_index = manager.has_index()
+
+    acct_map = _get_account_map()
+    excluded_names = _excluded_account_names()
+    excluded_uuids: set[str] = set()
+    idx_acct_uuid: str | None = None
+
+    if has_index or excluded_names or account:
+        await acct_map.ensure_loaded()
+        excluded_uuids = acct_map.names_to_uuids(excluded_names)
+        if account:
+            idx_acct_uuid = acct_map.name_to_uuid(account)
+
+    # Fallback target for ids the index cannot place: usable only when
+    # the caller pinned BOTH account and mailbox (the account is known
+    # non-hidden here — the explicit-hidden case returned above).
+    hint_location: tuple[str, str] | None = (
+        (account, mailbox) if account and mailbox else None
+    )
+
+    grouped: dict[tuple[str, str], list[int]] = {}
+    scan_ids: list[int] = []
+    not_found: list[int] = []
+    skipped_hidden: list[int] = []
+
+    for mid in ids:
+        located: tuple[str, str] | None = None
+        if has_index:
+            loc = manager.find_email_location(
+                mid, account=idx_acct_uuid, mailbox=mailbox
+            )
+            if loc:
+                acct_uuid, mb_name = loc
+                if acct_uuid in excluded_uuids:
+                    skipped_hidden.append(mid)
+                    continue
+                located = (acct_map.uuid_to_name(acct_uuid), mb_name)
+        if located is None and hint_location is not None:
+            located = hint_location
+        if located is None:
+            # No index hit, no hint: defer to the bounded JXA scan.
+            scan_ids.append(mid)
+            continue
+        grouped.setdefault(located, []).append(mid)
+
+    groups: list[dict] = [
+        {"account": acct, "mailbox": mb, "ids": mids}
+        for (acct, mb), mids in grouped.items()
+    ]
+
+    if scan_ids:
+        scan_account = await _resolve_visible_account(account)
+        # A None account is legitimate: MailCore.getAccount(null) picks
+        # the first account, which is the documented default. Only bail
+        # when exclusions are active and nothing visible remains.
+        if excluded_names and (
+            scan_account is None or scan_account in excluded_names
+        ):
+            not_found.extend(scan_ids)
+        else:
+            groups.append(
+                {"account": scan_account, "ids": scan_ids, "scan": True}
+            )
+
+    return groups, not_found, skipped_hidden
+
+
+def _absorb_failures(res: dict, failed: list, errors: list) -> None:
+    """Move JXA-reported failures out of the caller's success path.
+
+    The write script distinguishes "Mail was open and the message was
+    not there" (`not_found`) from "we never got that far" (`failures`,
+    each with its reason). Merging the two would make a broken account
+    or mailbox lookup look like a batch of deleted mail.
+    """
+    for item in res.get("failures", []) or []:
+        target = item.get("target")
+        if target is None:
+            continue
+        failed.append(int(target))
+        reason = str(item.get("reason", "")).strip()
+        if reason:
+            errors.append(reason)
+
+
+async def _apply_write(
+    message_ids: int | list[int],
+    account: str | None,
+    mailbox: str | None,
+    make_builder,
+) -> WriteResult:
+    """Shared orchestration for the batch write tools.
+
+    Normalizes ids, resolves targets (with the account gate), then runs
+    the located groups and any scan group in *separate* osascript calls
+    — so a slow or timed-out mailbox scan cannot discard the fast,
+    precise located writes — and merges every id's outcome.
+    `make_builder` maps ``groups -> WriteBuilder``: the only per-tool
+    difference.
+
+    Every id comes back in exactly one bucket.
+    """
+    ids = _normalize_message_ids(message_ids)
+    groups, not_found, skipped_hidden = await _resolve_write_targets(
+        ids, account, mailbox
+    )
+
+    located = [g for g in groups if not g.get("scan")]
+    scan = [g for g in groups if g.get("scan")]
+    updated: list[int] = []
+    unchanged: list[int] = []
+    # A write that never reached Apple Mail is NOT evidence that the
+    # message is gone. Reporting it as not_found would send the caller
+    # hunting for a message that was there all along.
+    failed: list[int] = []
+    errors: list[str] = []
+    # Mailboxes the scan never reached: a miss that follows one of these
+    # is not evidence that the message is gone.
+    unsearched = 0
+
+    def _merge(res: dict) -> None:
+        nonlocal unsearched
+        updated.extend(int(x) for x in res.get("updated", []))
+        unchanged.extend(int(x) for x in res.get("unchanged", []))
+        not_found.extend(int(x) for x in res.get("not_found", []))
+        _absorb_failures(res, failed, errors)
+        unsearched += int(res.get("scan_capped") or 0) + int(
+            res.get("scan_unreadable") or 0
+        )
+
+    if located:
+        try:
+            _merge(
+                await execute_with_core_async(
+                    make_builder(located).build(), timeout=WRITE_TIMEOUT
+                )
+            )
+        except Exception as exc:
+            # The contract is that every id lands in exactly one bucket.
+            # Letting this raise would leave the caller with no idea
+            # which writes did or did not happen.
+            logger.warning("located write failed: %s", exc, exc_info=True)
+            failed += [i for g in located for i in g["ids"]]
+            errors.append(str(exc))
+
+    if scan:
+        builder = make_builder(scan)
+        builder.max_scan_mailboxes = STRATEGY3_MAX_MAILBOXES
+        try:
+            _merge(
+                await execute_with_core_async(
+                    builder.build(), timeout=STRATEGY3_TIMEOUT
+                )
+            )
+        except Exception as exc:
+            logger.warning("write scan failed: %s", exc, exc_info=True)
+            failed += [i for g in scan for i in g["ids"]]
+            errors.append(str(exc))
+
+    result: WriteResult = {
+        "updated": updated,
+        "unchanged": unchanged,
+        "not_found": not_found,
+        "skipped_hidden": skipped_hidden,
+    }
+    if not_found or failed:
+        # Say what was actually attempted. A bare not_found cannot be
+        # checked by the caller: it looks the same whether the index
+        # placed the message or the search never reached it.
+        result["diagnostics"] = {
+            "located_by_index": [
+                f"{g['account']}/{g['mailbox']}" for g in located
+            ],
+            "accounts_scanned": [g.get("account") for g in scan],
+            "mailboxes_not_searched": unsearched,
+        }
+    if failed:
+        # Say plainly that Apple Mail never carried the write out, and
+        # what it said — the caller must not read this as "deleted".
+        result["failed"] = failed
+        result["error"] = "; ".join(dict.fromkeys(errors))[:500]
+        blob = result["error"].lower()
+        if "no such account" in blob:
+            cause = (
+                "The account name taken from the index does not match any "
+                "account in Mail. Re-index and retry; passing `account` "
+                "with the name Mail shows also works."
+            )
+        elif "cannot open mailbox" in blob or "cannot list mailboxes" in blob:
+            cause = (
+                "The mailbox could not be opened under that name — the "
+                "index may name it differently than Mail does. Pass "
+                "`account` and `mailbox` as Mail shows them."
+            )
+        elif "-1743" in blob or "not authorized" in blob:
+            cause = (
+                "This process has no Automation permission for Mail "
+                "(System Settings > Privacy & Security > Automation). A "
+                "background or scheduled run cannot show that consent "
+                "dialog — it has to be granted once interactively."
+            )
+        else:
+            cause = (
+                "Check that Mail.app is running and that this process may "
+                "control it (System Settings > Privacy & Security > "
+                "Automation)."
+            )
+        result["hint"] = (
+            f"{len(failed)} write(s) never reached the message — this is "
+            f"NOT a statement about the mail, which is most likely fine. "
+            f"Reported: {result['error']} — {cause} Reads keep working "
+            f"meanwhile because they come from the index and the .emlx "
+            f"files, not from Apple Events."
+        )
+        return result
+    if not_found and unsearched:
+        result["hint"] = (
+            f"{len(not_found)} id(s) were not found, but {unsearched} "
+            f"mailbox(es) were never searched (scan limit, or a mailbox "
+            f"Mail refused to read). This is NOT evidence that the "
+            f"messages are gone — pass `account` and `mailbox` to aim the "
+            f"write."
+        )
+    elif not_found and not _get_index_manager().has_index():
+        result["hint"] = (
+            "Some ids were not found by scanning the default account. "
+            "Pass both `account` and `mailbox` for reliable resolution, "
+            "or build the index (`apple-mail-mcp index`) so id lookup is "
+            "exact."
+        )
+    elif not_found:
+        # No claim of deletion. A Mail.app id is a per-mailbox ROWID, so
+        # it cannot be searched for across accounts at all: the same
+        # number is a different message elsewhere, and widening the
+        # search would risk writing to a stranger's mail. The honest
+        # answer is to state the limit.
+        result["hint"] = (
+            f"{len(not_found)} id(s) were not found where the index "
+            f"expected them. A Mail.app id is only unique within its "
+            f"mailbox, so it cannot be searched for in other accounts. "
+            f"The message may have been filed elsewhere (from another "
+            f"device), in which case its id has changed: re-index and "
+            f"look it up again."
+        )
+    return result
 
 
 # ========== Helper Functions ==========
@@ -1364,6 +1710,101 @@ async def search(
             for e in emails
         ]
     )
+
+
+@mcp.tool
+async def set_flag(
+    message_ids: int | list[int],
+    color: Literal[
+        "default",
+        "none",
+        "red",
+        "orange",
+        "yellow",
+        "green",
+        "blue",
+        "purple",
+        "gray",
+    ] = "default",
+    account: str | None = None,
+    mailbox: str | None = None,
+) -> WriteResult:
+    """
+    Flag or unflag one or many messages, optionally in a given color.
+
+    Args:
+        message_ids: One id, or a list of them (max 500). A batch is one
+            osascript call per (account, mailbox) group rather than one
+            per message.
+        color: "default" flags without forcing a color, "none" unflags,
+            and the seven names set that flag color. The server attaches
+            NO meaning to any color — what a color stands for is the
+            user's own convention, so ask rather than assume.
+        account: Optional hint. Speeds up resolution and is required
+            (together with `mailbox`) for ids the index cannot place.
+        mailbox: Optional hint, as above.
+
+    Returns:
+        Per-id buckets: `updated`, `unchanged` (already in that state),
+        `not_found`, `skipped_hidden` (ids in an excluded account), and
+        on trouble `failed` + `error` + `hint`. A batch never fails as a
+        whole — every id you passed appears in exactly one bucket.
+
+        `unchanged` is not a failure: the state was already what you
+        asked for, and a no-op write is a server round-trip on
+        IMAP/Exchange accounts, so it is deliberately skipped.
+
+    Example:
+        >>> set_flag(12345, color="red")
+        {"updated": [12345], "unchanged": [], "not_found": [], ...}
+        >>> set_flag([1, 2, 3], color="none")  # unflag a batch
+    """
+    _ensure_writable()
+
+    if color == "none":
+        flagged, flag_index = False, None
+    elif color == "default":
+        flagged, flag_index = True, None
+    else:
+        flagged, flag_index = True, FLAG_COLOR_INDEX[color]
+
+    def make_builder(groups: list[dict]) -> WriteBuilder:
+        return WriteBuilder.set_flag(groups, flagged, flag_index)
+
+    return await _apply_write(message_ids, account, mailbox, make_builder)
+
+
+@mcp.tool
+async def set_read_status(
+    message_ids: int | list[int],
+    read: bool = True,
+    account: str | None = None,
+    mailbox: str | None = None,
+) -> WriteResult:
+    """
+    Mark one or many messages as read (seen) or unread (unseen).
+
+    Args:
+        message_ids: One id, or a list of them (max 500).
+        read: True marks as read (default), False as unread.
+        account: Optional hint. Speeds up resolution and is required
+            (together with `mailbox`) for ids the index cannot place.
+        mailbox: Optional hint, as above.
+
+    Returns:
+        Per-id buckets, exactly as `set_flag` — see there. A batch never
+        fails as a whole.
+
+    Example:
+        >>> set_read_status([1, 2, 3])  # mark read
+        >>> set_read_status(12345, read=False)  # back to unread
+    """
+    _ensure_writable()
+
+    def make_builder(groups: list[dict]) -> WriteBuilder:
+        return WriteBuilder.set_read(groups, read)
+
+    return await _apply_write(message_ids, account, mailbox, make_builder)
 
 
 # ========== MCP Resources ==========
