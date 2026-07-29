@@ -362,8 +362,9 @@ async def list_mailboxes(account: str | None = None) -> list[Mailbox]:
     List all mailboxes for an email account.
 
     Args:
-        account: Account name. Uses APPLE_MAIL_DEFAULT_ACCOUNT env var or
-                 first account if not specified.
+        account: Account name, or "all" to list across EVERY visible
+                 account in one call. Uses APPLE_MAIL_DEFAULT_ACCOUNT
+                 env var or the first account if not specified.
 
     Returns:
         List of mailbox dictionaries with 'name' and 'unreadCount' fields.
@@ -420,20 +421,45 @@ async def get_emails(
         >>> get_emails()  # All emails from default mailbox
         >>> get_emails(filter="unread", limit=10)  # Unread emails
         >>> get_emails("Work", "INBOX", filter="today")  # Today's work emails
+        >>> get_emails(account="all", filter="unread")  # Every account
     """
     limit, _ = _validate_pagination(limit)
-    if _hidden_account(account):
+    all_accounts = isinstance(account, str) and account.strip().lower() in (
+        "all",
+        "*",
+    )
+    if all_accounts:
+        # The Envelope Index query already means "every account" when
+        # given no UUID; only this tool's defaulting stood in the way.
+        # Excluded accounts stay excluded — that filter runs on UUIDs
+        # further down, not on this name.
+        account = None
+    if not all_accounts and _hidden_account(account):
         # Hidden account explicitly requested: return nothing and do
         # NOT fall through to JXA (which would surface its mail).
         return []
     # Resolve None/excluded-default to a visible account so neither the
     # fast path nor the JXA fallback implicitly targets a hidden one.
-    target_account = await _resolve_visible_account(account)
-    if target_account is None and _excluded_account_names():
+    target_account = (
+        None if all_accounts else (await _resolve_visible_account(account))
+    )
+    if (
+        not all_accounts
+        and target_account is None
+        and _excluded_account_names()
+    ):
         # No visible account at all (every account is hidden): the JXA
         # fallback would target Mail.accounts()[0] — a hidden one.
         return []
-    target_mailbox = _resolve_mailbox(mailbox)
+    # With "all" and no explicit mailbox, do not apply the INBOX
+    # default: it would narrow every account to whichever of them
+    # happens to have a mailbox by that name — and on a localized Mail
+    # none of them does.
+    target_mailbox = (
+        None
+        if (all_accounts and mailbox is None)
+        else _resolve_mailbox(mailbox)
+    )
 
     # Strategy 0: direct read against Apple's Envelope Index SQLite.
     # 100-1000x faster than JXA at scale because we skip the
@@ -462,6 +488,10 @@ async def get_emails(
             account_uuid: str | None = None
             if target_account:
                 account_uuid = _get_account_map().name_to_uuid(target_account)
+            elif all_accounts:
+                # Explicitly every account: leave the scope open. Hidden
+                # accounts are still dropped below, by UUID.
+                account_uuid = None
             else:
                 # No account requested: scope to the first account,
                 # matching the documented behavior and the JXA path
@@ -512,6 +542,17 @@ async def get_emails(
         logger.debug(
             "Envelope Index fast path unavailable (%s); falling back to JXA",
             exc,
+        )
+
+    if all_accounts:
+        # Only the Envelope Index can answer across accounts. JXA walks
+        # one account at a time, so falling through would quietly answer
+        # a different question than the one that was asked.
+        raise ValueError(
+            "Listing across all accounts needs Apple's Envelope Index, "
+            "which is not readable right now (Full Disk Access, or an "
+            "unsupported Mail.app layout). Pass a single `account` "
+            "instead."
         )
 
     # Strategy 1: JXA batchFetch fallback. Preserves correctness

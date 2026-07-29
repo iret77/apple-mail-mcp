@@ -1649,3 +1649,177 @@ class TestGetAttachmentLinksMode:
             assert result["links"][0]["url"] == "https://example.com"
             assert result["links"][0]["text"] == "Example"
             assert "file_path" not in result
+
+
+def _acct_map(uuid_to_name="Work", excluded_uuids=None):
+    """An AccountMap double for the Envelope-Index fast path."""
+    m = MagicMock()
+    m.ensure_loaded = AsyncMock()
+    m.names_to_uuids.return_value = set(excluded_uuids or [])
+    m.name_to_uuid.return_value = None
+    m.uuid_to_name.return_value = uuid_to_name
+    return m
+
+
+class TestCrossAccountListing:
+    """`get_emails(account="all")` — one call for every account.
+
+    The Envelope Index query already means "every account" when given no
+    UUID; only this tool's defaulting stood in the way. Without it, an
+    inbox review costs one call per account and the caller has to know
+    the account names first.
+    """
+
+    def _env_patches(self, amap, fetch):
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+        return (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                **fetch,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_drops_both_defaults(self):
+        """ "all" must not be narrowed by the INBOX default either: it
+        would keep whichever accounts happen to have a mailbox by that
+        name — on a localized Mail, none of them."""
+        captured = {}
+
+        def fetch(env_path, *, account_uuid, mailbox_name, **kw):
+            captured["account_uuid"] = account_uuid
+            captured["mailbox_name"] = mailbox_name
+            return []
+
+        amap = _acct_map()
+        amap.get_cached_accounts.return_value = [
+            {"name": "Work", "id": "uuid-work"}
+        ]
+        with (
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                side_effect=fetch,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            await get_emails(account="all")
+
+        assert captured["account_uuid"] is None  # every account
+        assert captured["mailbox_name"] is None  # every mailbox
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_mailbox_still_applies_under_all(self):
+        captured = {}
+
+        def fetch(env_path, *, account_uuid, mailbox_name, **kw):
+            captured["mailbox_name"] = mailbox_name
+            return []
+
+        amap = _acct_map()
+        amap.get_cached_accounts.return_value = []
+        with (
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                side_effect=fetch,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            await get_emails(account="all", mailbox="Sent")
+
+        assert captured["mailbox_name"] == "Sent"
+
+    @pytest.mark.asyncio
+    async def test_excluded_accounts_survive_the_shortcut(self):
+        """ "all" must not become a hole in the exclusion boundary."""
+        from types import SimpleNamespace
+
+        def row(mid, subject, uuid):
+            return SimpleNamespace(
+                message_id=mid,
+                subject=subject,
+                sender="a@x",
+                date_received="2026-07-28T10:00:00",
+                read=False,
+                flagged=False,
+                account_uuid=uuid,
+                mailbox_name="INBOX",
+            )
+
+        amap = _acct_map(excluded_uuids={"uuid-secret"})
+        amap.get_cached_accounts.return_value = [
+            {"name": "Work", "id": "uuid-visible"},
+            {"name": "Secret", "id": "uuid-secret"},
+        ]
+        with (
+            patch(
+                "apple_mail_mcp.server._excluded_account_names",
+                return_value={"Secret"},
+            ),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                return_value=[
+                    row(1, "visible", "uuid-visible"),
+                    row(2, "secret", "uuid-secret"),
+                ],
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            out = await get_emails(account="all")
+
+        assert [e["subject"] for e in out] == ["visible"]
+
+    @pytest.mark.asyncio
+    async def test_jxa_fallback_refuses_rather_than_answering_narrowly(self):
+        """JXA walks one account at a time. Falling through would answer
+        a different question than the one that was asked."""
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=FileNotFoundError("no ~/Library/Mail"),
+            ),
+            pytest.raises(ValueError, match="all accounts"),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            await get_emails(account="all")
