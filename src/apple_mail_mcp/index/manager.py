@@ -647,39 +647,48 @@ class IndexManager:
             # must not be reported as a successful no-op.
             raise IndexBusyError("An index build or sync is already running.")
 
+        # Everything from here is inside try/finally. The lock was
+        # acquired above, and ANY escape between there and the release —
+        # an unreadable mail directory, a JXA failure while resolving
+        # exclusions, a database that will not open — used to leave both
+        # the flock and the thread lock held for the rest of the
+        # process's life, so every later build and sync was refused with
+        # "already running" while nothing was running.
         try:
-            mail_dir = find_mail_directory()
-        except (FileNotFoundError, PermissionError) as e:
-            logger.warning("Cannot access mail directory for sync: %s", e)
-            self._write_lock.release()
-            return 0
-
-        exclude_account_uuids = self._resolve_exclusions()
-
-        conn = self._get_conn()
-        try:
-            result = sync_from_disk(
-                conn,
-                mail_dir,
-                progress_callback,
-                exclude_account_uuids=exclude_account_uuids,
-            )
-        except BaseException:
-            # BaseException, not Exception: a Ctrl-C (KeyboardInterrupt)
-            # or a SystemExit lands mid-sync just as easily as a bug,
-            # and leaves exactly the same open transaction behind.
-            # A sync that raises mid-run leaves its write transaction
-            # open, and every later write then fails with "database is
-            # locked" until the process restarts. The index looks dead
-            # while nothing is actually wrong with it.
             try:
-                conn.rollback()
-            except Exception:
-                logger.debug("Rollback after failed sync failed too")
-            logger.exception("Sync failed")
-            raise
+                mail_dir = find_mail_directory()
+            except (FileNotFoundError, PermissionError) as e:
+                logger.warning("Cannot access mail directory for sync: %s", e)
+                return 0
+
+            exclude_account_uuids = self._resolve_exclusions()
+
+            conn = self._get_conn()
+            try:
+                result = sync_from_disk(
+                    conn,
+                    mail_dir,
+                    progress_callback,
+                    exclude_account_uuids=exclude_account_uuids,
+                )
+            except BaseException:
+                # BaseException, not Exception: a Ctrl-C
+                # (KeyboardInterrupt) or a SystemExit lands mid-sync
+                # just as easily as a bug, and leaves exactly the same
+                # open transaction behind. A sync that raises mid-run
+                # leaves its write transaction open, and every later
+                # write then fails with "database is locked" until the
+                # process restarts. The index looks dead while nothing
+                # is actually wrong with it.
+                try:
+                    conn.rollback()
+                except Exception:
+                    logger.debug("Rollback after failed sync failed too")
+                logger.exception("Sync failed")
+                raise
         finally:
             self._write_lock.release()
+
         # Disk inventory just changed (or was just verified) — drop
         # the get_stats cache so the next status call reflects truth.
         self.invalidate_disk_count_cache()

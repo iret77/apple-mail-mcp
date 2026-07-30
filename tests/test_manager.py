@@ -1156,3 +1156,52 @@ class TestAnInterruptRollsBackToo:
             mgr.sync_updates()
 
         conn.rollback.assert_called_once()
+
+
+class TestTheLockIsNeverLeaked:
+    """The lock is taken before the first thing that can fail.
+
+    Any escape between the acquire and the release — an unreadable mail
+    directory, a JXA failure while resolving exclusions, a database that
+    will not open — left both the flock and the thread lock held for the
+    rest of the process's life. Every later build and sync was then
+    refused with "already running" while nothing was running.
+    """
+
+    def test_an_unreadable_mail_directory_releases_it(self, temp_db_path):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        with patch(
+            "apple_mail_mcp.index.disk.find_mail_directory",
+            side_effect=PermissionError("no Full Disk Access"),
+        ):
+            assert mgr.sync_updates() == 0
+
+        assert not mgr._write_lock.locked()
+
+    def test_a_failure_resolving_exclusions_releases_it(self, temp_db_path):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch.object(
+                mgr,
+                "_resolve_exclusions",
+                side_effect=RuntimeError("JXA refused"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            mgr.sync_updates()
+
+        assert not mgr._write_lock.locked(), (
+            "the lock stayed held, so every later sync is refused"
+        )
