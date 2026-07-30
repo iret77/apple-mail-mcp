@@ -416,6 +416,7 @@ async def get_emails(
     ] = "all",
     limit: int = 50,
     before: str | None = None,
+    before_id: int | None = None,
     after: str | None = None,
     offset: int = 0,
 ) -> list[EmailSummary]:
@@ -443,6 +444,12 @@ async def get_emails(
             walking a mailbox backwards: pass the oldest
             `date_received` you have seen to get the next page. Stable
             while new mail arrives, which `offset` is not.
+        before_id: The `id` of that same oldest row. Pass it together
+            with `before` for an exact walk. Mail stores whole seconds,
+            so a timestamp alone is not a position — without this, every
+            message sharing the oldest second of a page is skipped, and
+            three messages in one second with limit=2 leave the third
+            unreachable forever.
         after: Only messages received AFTER this ISO date/datetime.
         offset: Rows to skip before returning `limit`. Fine within one
             snapshot; prefer `before` for a long walk.
@@ -527,6 +534,7 @@ async def get_emails(
                     filter_kind=filter,
                     limit=limit,
                     before=before_ts,
+                    before_id=before_id,
                     after=after_ts,
                     offset=offset,
                 )
@@ -554,7 +562,12 @@ async def get_emails(
             exc,
         )
 
-    if before_ts is not None or after_ts is not None or offset:
+    if (
+        before_ts is not None
+        or after_ts is not None
+        or offset
+        or before_id is not None
+    ):
         # The JXA fallback has no date window and no offset. Silently
         # dropping them would answer a different question than the one
         # asked — the caller would page through the same newest N

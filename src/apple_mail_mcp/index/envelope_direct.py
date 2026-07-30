@@ -179,6 +179,7 @@ def fetch_recent_messages(
     filter_kind: str,
     limit: int,
     before: float | None = None,
+    before_id: int | None = None,
     after: float | None = None,
     offset: int = 0,
 ) -> list[EnvelopeMessageRow]:
@@ -205,9 +206,12 @@ def fetch_recent_messages(
         filter_kind: One of "all", "unread", "flagged", "today",
             "last_7_days", "this_week".
         limit: Maximum rows to return.
-        before: Only messages received strictly before this Unix
-            timestamp. The stable cursor for walking a mailbox
-            backwards.
+        before: Only messages received before this Unix timestamp.
+            Pair it with ``before_id`` for an exact walk — see below.
+        before_id: Message ROWID of the last row already seen. Mail
+            stores whole seconds, so a timestamp alone is not a
+            position: without this, every message sharing the oldest
+            second of a page is skipped permanently.
         after: Only messages received strictly after this Unix
             timestamp.
         offset: Rows to skip. Fine within one snapshot; `before` is
@@ -233,6 +237,7 @@ def fetch_recent_messages(
             filter_kind=filter_kind,
             limit=limit,
             before=before,
+            before_id=before_id,
             after=after,
             offset=offset,
         )
@@ -248,6 +253,7 @@ def _fetch_recent_messages(
     filter_kind: str,
     limit: int,
     before: float | None = None,
+    before_id: int | None = None,
     after: float | None = None,
     offset: int = 0,
 ) -> list[EnvelopeMessageRow]:
@@ -295,8 +301,21 @@ def _fetch_recent_messages(
     # it a caller only ever sees the newest N per mailbox and cannot
     # reach a backlog at all.
     if before is not None:
-        where_clauses.append("m.date_received < ?")
-        params.append(before)
+        if before_id is not None:
+            # Keyset cursor. A timestamp alone is not a position: Mail
+            # stores whole seconds, so several messages share one. With
+            # a strict `<` on the timestamp, every row sharing the
+            # oldest second of a page becomes permanently unreachable —
+            # three messages in one second and limit=2 leaves the third
+            # invisible forever. Ties are resolved by ROWID, which the
+            # caller already has: it is the `id` of the last row it saw.
+            where_clauses.append(
+                "(m.date_received < ? OR (m.date_received = ? AND m.ROWID < ?))"
+            )
+            params.extend([before, before, before_id])
+        else:
+            where_clauses.append("m.date_received < ?")
+            params.append(before)
     if after is not None:
         where_clauses.append("m.date_received > ?")
         params.append(after)
@@ -325,7 +344,7 @@ def _fetch_recent_messages(
         LEFT JOIN addresses a  ON m.sender  = a.ROWID
         LEFT JOIN mailboxes mb ON m.mailbox = mb.ROWID
         WHERE {where_sql}
-        ORDER BY m.date_received DESC
+        ORDER BY m.date_received DESC, m.ROWID DESC
         LIMIT ? OFFSET ?
     """
     params.append(int(limit))

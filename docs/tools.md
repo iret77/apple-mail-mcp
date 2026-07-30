@@ -8,7 +8,7 @@ Apple Mail MCP provides **8 MCP tools** — a consolidated API designed for AI a
 |------|---------|------------|
 | `list_accounts()` | List email accounts | — |
 | `list_mailboxes()` | List mailboxes | `account?` |
-| `get_emails()` | Get emails with filtering and paging | `account?`, `mailbox?`, `filter?`, `limit?`, `before?`, `after?`, `offset?` |
+| `get_emails()` | Get emails, filtered and paged | `account?`, `mailbox?`, `filter?`, `limit?`, `before?`, `before_id?`, `after?`, `offset?` |
 | `get_email()` | Get single email with content + attachments | `message_id`, `account?`, `mailbox?` |
 | `search()` | Search emails | `query`, `account?`, `mailbox?`, `scope?`, `limit?`, `exclude_mailboxes?`, `before?`, `after?`, `highlight?` |
 | `get_email_links()` | Extract links from an email | `message_id`, `account?`, `mailbox?` |
@@ -67,6 +67,7 @@ Get emails from a mailbox with optional filtering. This is the primary tool for 
 | `filter` | `string?` | `all` | Filter type (see below) |
 | `limit` | `int?` | `50` | Max emails to return |
 | `before` | `string?` | `None` | Only messages received BEFORE this ISO date/datetime (`2026-07-28` or `2026-07-28T09:30`) |
+| `before_id` | `int?` | `None` | The `id` of that same oldest row. Pass it with `before` for an exact walk |
 | `after` | `string?` | `None` | Only messages received AFTER this ISO date/datetime |
 | `offset` | `int?` | `0` | Rows to skip before returning `limit` |
 
@@ -103,6 +104,12 @@ get_emails(before="2026-01-01")
     `date_received` you have seen and the next page continues from there,
     unaffected by mail arriving mid-walk. `offset` shifts under new mail, so use
     it within one snapshot only. A naive date is read as local time.
+
+!!! warning
+    Pass `before_id` (the `id` of that same oldest row) together with `before`.
+    Mail stores whole seconds, so a timestamp alone is not a position: three
+    messages received in the same second with `limit=2` would leave the third
+    unreachable forever. Both values come from the last row you saw.
 
 !!! warning
     These three need Apple's Envelope Index (Full Disk Access). The JXA fallback

@@ -1770,12 +1770,12 @@ class TestEnvelopeWindowSql:
     def _fetch(self, path, **kw):
         from apple_mail_mcp.index.envelope_direct import fetch_recent_messages
 
+        kw.setdefault("limit", 10)
         return fetch_recent_messages(
             path,
             account_uuid=None,
             mailbox_name=None,
             filter_kind="all",
-            limit=10,
             **kw,
         )
 
@@ -1790,6 +1790,56 @@ class TestEnvelopeWindowSql:
     def test_offset_skips_from_the_newest(self, tmp_path):
         rows = self._fetch(self._db(tmp_path), offset=2)
         assert [r.subject for r in rows] == ["msg 2000", "msg 1000"]
+
+    def test_equal_timestamps_are_not_skipped_at_a_page_boundary(
+        self, tmp_path
+    ):
+        """Mail stores whole seconds. With a strict `<` on the timestamp
+        alone, every row sharing the oldest second of a page becomes
+        unreachable forever — the exact defect this unit exists to
+        remove, reintroduced at the boundary."""
+        import sqlite3
+
+        path = tmp_path / "Envelope Index"
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE messages (
+                ROWID INTEGER PRIMARY KEY, message_id INTEGER,
+                subject INTEGER, sender INTEGER, date_received INTEGER,
+                mailbox INTEGER, read INTEGER, flagged INTEGER,
+                deleted INTEGER DEFAULT 0
+            );
+            CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
+            CREATE TABLE addresses (
+                ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT
+            );
+            CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);
+            INSERT INTO mailboxes VALUES (1, 'imap://uuid/INBOX');
+            INSERT INTO addresses VALUES (1, 'a@x', '');
+        """)
+        # Three messages, one and the same second.
+        for i in (1, 2, 3):
+            conn.execute("INSERT INTO subjects VALUES (?, ?)", (i, f"m{i}"))
+            conn.execute(
+                "INSERT INTO messages (ROWID, message_id, subject, sender,"
+                " date_received, mailbox, read, flagged, deleted)"
+                " VALUES (?, ?, ?, 1, 1000, 1, 0, 0, 0)",
+                (i, i, i),
+            )
+        conn.commit()
+        conn.close()
+
+        page1 = self._fetch(path, limit=2)
+        assert len(page1) == 2
+
+        # The cursor the caller actually has: the oldest row it saw.
+        oldest = page1[-1]
+        page2 = self._fetch(
+            path, limit=2, before=1000, before_id=oldest.message_id
+        )
+        assert [r.subject for r in page2] == ["m1"], (
+            "the third message of that second must still be reachable"
+        )
 
     def test_a_window_and_offset_compose(self, tmp_path):
         rows = self._fetch(self._db(tmp_path), before=4000, offset=1)

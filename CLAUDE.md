@@ -33,7 +33,7 @@ src/apple_mail_mcp/
 |------|---------|----------------|
 | `list_accounts()` | List email accounts | - |
 | `list_mailboxes(account?)` | List mailboxes | account (optional) |
-| `get_emails(...)` | Unified listing, walkable backwards | filter, before, after, offset |
+| `get_emails(...)` | Unified listing, walkable backwards | filter, before(+id), after, offset |
 | `get_email(id)` | Full email content + attachments | message_id |
 | `search(query, ...)` | Unified search | scope, before, after, offset, highlight |
 | `get_email_links(id)` | Extract links from an email | message_id |
@@ -309,9 +309,16 @@ substitute: it needs keywords, and a gapless reverse scan has none.
 `before` / `after` / `offset` are two WHERE clauses and an OFFSET on the
 Envelope Index query. Two rules:
 
-- **`before` is the cursor to prefer.** Hand it the oldest `date_received` you
-  have seen and the walk continues from there, unaffected by mail arriving
-  mid-walk. `offset` shifts under new mail, so it is for one snapshot only.
+- **`before` + `before_id` is the cursor.** Hand them the oldest
+  `date_received` and `id` you have seen; the walk continues from there,
+  unaffected by mail arriving mid-walk. `offset` shifts under new mail, so it is
+  for one snapshot only.
+- **A timestamp alone is not a position.** Mail stores whole seconds, so a
+  strict `<` on the timestamp skips every row sharing the oldest second of a
+  page — three messages in one second with `limit=2` leave the third unreachable
+  forever, which is the very defect this unit exists to remove. The ROWID
+  tie-break closes it, and the ordering is `date_received DESC, ROWID DESC` so
+  the tie-break has a defined meaning.
 - **The JXA fallback refuses these three rather than dropping them.** A silently
   ignored window returns the same newest N on every page, so the caller pages
   forever and concludes the backlog is empty. An error is the only honest answer
