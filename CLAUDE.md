@@ -279,7 +279,37 @@ if manager.is_stale():
 manager.delete_email(message_id, account=None, mailbox=None)
 manager.record_parse_failure(emlx_path, account, mailbox, error)
 manager.clear_parse_failure(emlx_path)  # called on successful re-parse
+
+# Observability — a build runs on a daemon thread, so from outside
+# "working", "wedged" and "died minutes ago" all show zero indexed.
+manager.is_building()          # True while a full build runs in THIS process
+manager.build_progress()       # phase, emails_done, files_seen,
+                               # seconds_since_progress, appears_stalled
+manager.last_error             # most recent build/sync failure, or None
+manager.recent_events(limit=20)  # lifecycle ring, newest first
+manager.record_event("info", "message", **fields)  # never raises
+manager.has_usable_index()     # index exists AND holds at least one email
+manager.indexed_email_count()  # cheap COUNT(*), no disk walk
 ```
+
+**Build phases.** `build_progress()["phase"]` is what makes a count of zero
+interpretable: `clearing` → `reading_metadata` → `indexing`. A build spends its
+first minutes reading Apple's metadata before writing a single row, so
+`reading_metadata` gets a 600 s stall budget while `indexing` gets 120 s — the
+same silence means different things in the two phases.
+
+**`has_usable_index()` is not `has_index()`.** An index *file* can exist while
+holding nothing, because an interrupted or permission-denied first build leaves
+an empty database behind. Syncing that forever never populates it.
+
+**`last_error` is set on every failure, not just the interesting one.** With
+only the unreadable-mail-directory case recorded, any other exception left a
+reader seeing "no errors" while the build was dead. It is cleared by the next
+clean run, so a transient failure does not stick around.
+
+**`sync_updates()` records why it returned 0.** That number means both "no
+changes" and "could not read Mail", and the caller cannot tell them apart from
+the number alone.
 
 ### Disk Functions
 
