@@ -18,6 +18,7 @@ def _mock_index(location=None, has_index=True):
     mgr = MagicMock()
     mgr.has_index.return_value = has_index
     mgr.find_email_location.return_value = location
+    mgr.count_email_locations.return_value = 1 if location else 0
     return mgr
 
 
@@ -137,7 +138,7 @@ class TestTargetResolution:
                 return_value=_mock_acct_map(),
             ),
         ):
-            groups, not_found, hidden = await _resolve_write_targets(
+            groups, not_found, hidden, _amb = await _resolve_write_targets(
                 [7], None, None
             )
 
@@ -158,7 +159,7 @@ class TestTargetResolution:
                 return_value=_mock_acct_map(),
             ),
         ):
-            groups, _, _ = await _resolve_write_targets([7], "Work", "Sent")
+            groups, _, _, _amb = await _resolve_write_targets([7], "Work", "Sent")
 
         assert groups == [{"account": "Work", "mailbox": "Sent", "ids": [7]}]
 
@@ -182,7 +183,7 @@ class TestTargetResolution:
                 AsyncMock(return_value="Work"),
             ),
         ):
-            groups, not_found, _ = await _resolve_write_targets([7], None, None)
+            groups, not_found, _, _amb = await _resolve_write_targets([7], None, None)
 
         assert groups == [{"account": "Work", "ids": [7], "scan": True}]
         assert not not_found
@@ -194,6 +195,7 @@ class TestTargetResolution:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_email_location.side_effect = lambda mid, **kw: {
             1: ("uuid-work", "INBOX"),
             2: ("uuid-work", "INBOX"),
@@ -206,7 +208,7 @@ class TestTargetResolution:
                 return_value=_mock_acct_map(),
             ),
         ):
-            groups, _, _ = await _resolve_write_targets([1, 2, 3], None, None)
+            groups, _, _, _amb = await _resolve_write_targets([1, 2, 3], None, None)
 
         assert sorted(len(g["ids"]) for g in groups) == [1, 2]
 
@@ -230,7 +232,7 @@ class TestExcludedAccountBoundary:
                 return_value=_mock_acct_map(excluded_uuids={"uuid-secret"}),
             ),
         ):
-            groups, not_found, hidden = await _resolve_write_targets(
+            groups, not_found, hidden, _amb = await _resolve_write_targets(
                 [7], None, None
             )
 
@@ -245,7 +247,7 @@ class TestExcludedAccountBoundary:
             "apple_mail_mcp.server._excluded_account_names",
             return_value={"Secret"},
         ):
-            groups, not_found, hidden = await _resolve_write_targets(
+            groups, not_found, hidden, _amb = await _resolve_write_targets(
                 [1, 2], "Secret", None
             )
 
@@ -370,6 +372,7 @@ class TestBucketContract:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_email_location.side_effect = lambda mid, **kw: (
             ("uuid-work", "INBOX") if mid == 1 else None
         )
@@ -483,6 +486,7 @@ class TestHeaderIsAFirstClassReference:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_by_rfc822.return_value = [("uuid-work", "Archive", 42)]
         with (
             patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
@@ -495,7 +499,7 @@ class TestHeaderIsAFirstClassReference:
                 AsyncMock(return_value=["Work"]),
             ),
         ):
-            groups, not_found, hidden = await _resolve_write_targets(
+            groups, not_found, hidden, _amb = await _resolve_write_targets(
                 ["<a@x>"], None, None
             )
 
@@ -514,6 +518,7 @@ class TestHeaderIsAFirstClassReference:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_by_rfc822.return_value = [("uuid-work", "INBOX", 42)]
         with (
             patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
@@ -526,7 +531,7 @@ class TestHeaderIsAFirstClassReference:
                 AsyncMock(return_value=["Alpha", "Work", "Zeta"]),
             ),
         ):
-            groups, _, _ = await _resolve_write_targets(["<a@x>"], None, None)
+            groups, _, _, _amb = await _resolve_write_targets(["<a@x>"], None, None)
 
         # Insertion order, not alphabetical: sorting would throw the
         # index's priority away.
@@ -540,6 +545,7 @@ class TestHeaderIsAFirstClassReference:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_by_rfc822.return_value = []
         with (
             patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
@@ -552,7 +558,7 @@ class TestHeaderIsAFirstClassReference:
                 AsyncMock(return_value=["Work", "Private"]),
             ),
         ):
-            groups, not_found, _ = await _resolve_write_targets(
+            groups, not_found, _, _amb = await _resolve_write_targets(
                 ["<new@x>"], None, None
             )
 
@@ -565,6 +571,7 @@ class TestHeaderIsAFirstClassReference:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_by_rfc822.return_value = [("uuid-secret", "INBOX", 42)]
         with (
             patch(
@@ -577,7 +584,7 @@ class TestHeaderIsAFirstClassReference:
                 return_value=_mock_acct_map(excluded_uuids={"uuid-secret"}),
             ),
         ):
-            groups, _, hidden = await _resolve_write_targets(
+            groups, _, hidden, _amb = await _resolve_write_targets(
                 ["<a@x>"], None, None
             )
 
@@ -591,6 +598,7 @@ class TestHeaderIsAFirstClassReference:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_by_rfc822.return_value = []
         with (
             patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
@@ -624,6 +632,7 @@ class TestHeaderIsAFirstClassReference:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_by_rfc822.return_value = []
         with (
             patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
@@ -662,6 +671,7 @@ class TestHeaderIsAFirstClassReference:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_by_rfc822.return_value = []
         with (
             patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
@@ -764,6 +774,7 @@ class TestHeaderReads:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_by_rfc822.return_value = [
             ("uuid-work", "INBOX", 1),
             ("uuid-work", "Archive", 2),
@@ -797,6 +808,7 @@ class TestHeaderReads:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_by_rfc822.return_value = [("uuid-work", "INBOX", 1)]
 
         async def by_id(mid, acct=None, mbox=None):
@@ -821,6 +833,7 @@ class TestHeaderReads:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_by_rfc822.return_value = []
 
         async def by_id(mid, acct=None, mbox=None):
@@ -851,6 +864,7 @@ class TestHeaderReads:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_by_rfc822.return_value = []
 
         with (

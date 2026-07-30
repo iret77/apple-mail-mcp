@@ -574,9 +574,15 @@ for (const g of groups) {{
                         mailboxes[m].messages, idx, targetId);
                     if (r === "updated") updated.push(targetId);
                     else if (r === "unchanged") unchanged.push(targetId);
-                    else notFound.push(targetId);
+                    // The id was FOUND here; applyToMessage only says
+                    // "failed" when the message moved between snapshot
+                    // and write, or Mail refused the assignment. That is
+                    // a statement about the environment, not about the
+                    // message being absent.
+                    else fail([targetId], "the message changed position "
+                        + "or the write was refused while applying");
                 }} catch (e) {{
-                    notFound.push(targetId);
+                    fail([targetId], "write failed (" + e + ")");
                 }}
             }}
         }}
@@ -615,7 +621,8 @@ for (const g of groups) {{
             const r = applyToMessage(mailbox.messages, idx, targetId);
             if (r === "updated") updated.push(targetId);
             else if (r === "unchanged") unchanged.push(targetId);
-            else notFound.push(targetId);
+            else fail([targetId], "the message changed position or the "
+                + "write was refused while applying");
         }} catch (e) {{
             fail([targetId], "write failed (" + e + ")");
         }}

@@ -441,7 +441,7 @@ async def _resolve_write_targets(
     # Explicit hidden account: refuse the whole batch up front, exactly
     # as the read tools do at their entry gate.
     if _hidden_account(account):
-        return [], [], list(ids)
+        return [], [], list(ids), []
 
     manager = _get_index_manager()
     has_index = manager.has_index()
@@ -468,6 +468,8 @@ async def _resolve_write_targets(
     scan_ids: list[int] = []
     not_found: list[MessageRef] = []
     skipped_hidden: list[MessageRef] = []
+    # Ids the index cannot resolve to ONE message.
+    ambiguous: list[int] = []
     # account name -> {"headers": [...], "prefer": {mailbox, ...}}
     header_groups: dict[str | None, dict] = {}
 
@@ -545,6 +547,16 @@ async def _resolve_write_targets(
     for mid in int_ids:
         located: tuple[str, str] | None = None
         if has_index:
+            # A Mail.app id is a per-mailbox ROWID, so the index can
+            # legitimately hold several rows for the same number. Taking
+            # the first would write to a message the caller never named.
+            if (
+                mailbox is None
+                and manager.count_email_locations(mid, account=idx_acct_uuid)
+                > 1
+            ):
+                ambiguous.append(mid)
+                continue
             loc = manager.find_email_location(
                 mid, account=idx_acct_uuid, mailbox=mailbox
             )
@@ -593,7 +605,7 @@ async def _resolve_write_targets(
                 {"account": scan_account, "ids": scan_ids, "scan": True}
             )
 
-    return groups, not_found, skipped_hidden
+    return groups, not_found, skipped_hidden, ambiguous
 
 
 def _absorb_failures(
@@ -636,9 +648,12 @@ async def _apply_write(
     headers.
     """
     ids = _normalize_message_ids(message_ids)
-    groups, not_found, skipped_hidden = await _resolve_write_targets(
-        ids, account, mailbox
-    )
+    (
+        groups,
+        not_found,
+        skipped_hidden,
+        ambiguous,
+    ) = await _resolve_write_targets(ids, account, mailbox)
 
     located = [
         g for g in groups if not g.get("scan") and not g.get("by_header")
@@ -744,6 +759,23 @@ async def _apply_write(
             "references_as_received": [str(i) for i in ids],
             "mailboxes_not_searched": unsearched,
         }
+    if ambiguous:
+        # Never guessed at: the same number names a different message in
+        # another mailbox, and picking one would write to mail the
+        # caller did not ask about.
+        failed.extend(ambiguous)
+        errors.append(f"{len(ambiguous)} id(s) exist in more than one mailbox")
+        result["failed"] = failed
+        result["error"] = "; ".join(dict.fromkeys(errors))[:500]
+        result["hint"] = (
+            f"{len(ambiguous)} id(s) name a message in more than one "
+            f"mailbox — a Mail.app id is only unique within its mailbox, "
+            f"so the number alone does not say which message you mean. "
+            f"Pass `mailbox` (and `account`), or use the message_id "
+            f"header, which is unambiguous. Nothing was written for them."
+        )
+        return result
+
     if failed:
         # Say plainly that Apple Mail never carried the write out, and
         # what it said — the caller must not read this as "deleted".

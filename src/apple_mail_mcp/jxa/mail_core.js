@@ -201,21 +201,25 @@ const MailCore = {
             if (special) return special;
         }
 
-        // 3. Normalized match: ignores case and provider hierarchy, so
-        //    "[Gmail]/Sent Mail" answers a request for "Sent Mail".
-        const wanted = this.normalizeMailboxName(name);
-        for (const actual of names) {
-            if (this.normalizeMailboxName(actual) === wanted) {
-                return account.mailboxes.byName(actual);
-            }
-        }
-
-        // 4. Same role, different word — the localized/legacy table.
+        // 3. Same role, different word — the localized/legacy table.
+        //    BEFORE the generic match, and the order is load-bearing:
+        //    normalization drops provider hierarchy, so a user's own
+        //    "Projects/INBOX" normalizes to "inbox" and would answer a
+        //    request for the real inbox.
         if (role) {
             for (const actual of names) {
                 if (this.mailboxRole(actual) === role) {
                     return account.mailboxes.byName(actual);
                 }
+            }
+        }
+
+        // 4. Normalized match: ignores case and provider hierarchy, so
+        //    "[Gmail]/Sent Mail" answers a request for "Sent Mail".
+        const wanted = this.normalizeMailboxName(name);
+        for (const actual of names) {
+            if (this.normalizeMailboxName(actual) === wanted) {
+                return account.mailboxes.byName(actual);
             }
         }
 
