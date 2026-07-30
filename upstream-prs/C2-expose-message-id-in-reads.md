@@ -1,4 +1,4 @@
-**Title:** `feat: every read path hands out the RFC822 Message-ID`
+**Title:** `feat: search and listing results carry the RFC822 Message-ID`
 
 **Branch:** `iret77:feat/expose-message-id-in-reads` · **Depends on:** **C1**
 (contained in this PR)
@@ -13,7 +13,12 @@ or, worse, whatever message inherited that number.
 
 ### What changed
 
-`message_id` (the RFC822 header) travels with every result:
+`message_id` (the RFC822 header) travels with every result of the three tools
+that return message *rows* — `search()`, `get_emails()` and `get_email()`.
+(`get_email_links()` and `get_email_attachment()` return links and file content,
+not messages, so there is nothing to carry it on. And `get_email()` already
+returned the header before this change: what is new is that the two *listing*
+paths do, which is where a caller actually collects references.)
 
 - **FTS search** and **attachment search** read it from the `rfc822_message_id`
   column added in C1.
@@ -49,7 +54,7 @@ must never read as "0 messages".
 ```markdown
 ### Added
 
-- **Every read result carries `message_id`, the RFC822 header.** `id` is a
+- **Search and listing results carry `message_id`, the RFC822 header.** `id` is a
   per-mailbox ROWID and stops resolving as soon as any device files the message
   elsewhere, so a client holding a reference between calls had nothing durable to
   hold. `search()` (full-text and attachment scopes), `get_emails()` and
@@ -79,6 +84,6 @@ uv run pytest -q                # 514 passed
 ```bash
 gho iret77 pr create --repo imdinu/apple-mail-mcp --base main \
   --head iret77:feat/expose-message-id-in-reads \
-  --title "feat: every read path hands out the RFC822 Message-ID" \
+  --title "feat: search and listing results carry the RFC822 Message-ID" \
   --body-file upstream-prs/C2-expose-message-id-in-reads.md
 ```
