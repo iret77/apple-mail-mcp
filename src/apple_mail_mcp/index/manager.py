@@ -190,7 +190,11 @@ class IndexManager:
         self._conn_lock = threading.Lock()
         # Claude Desktop starts this server twice, so a
         # thread-only lock cannot serialize index writes.
-        self._write_lock = WriteLock(self._db_path)
+        # A lock file of its own, not the database. flock is advisory,
+        # so locking the DB file would work — but the documentation and
+        # the operator both expect `<index>.lock`, and a stray fd on the
+        # database is a needless surprise.
+        self._write_lock = WriteLock(self._db_path.with_suffix(".lock"))
         self._watcher: IndexWatcher | None = None
         self._watcher_callback: Callable[[int, int], None] | None = None
         # (count, expiry_monotonic) — None until first successful read.
@@ -226,9 +230,18 @@ class IndexManager:
         """Get or create the database connection (thread-safe)."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = init_database(self._db_path)
-            self._local.conn = conn
+            # init_database() creates the schema and runs migrations, so
+            # it must not run concurrently: with one connection per
+            # thread, several threads hitting a fresh database each try
+            # to create the same tables. Measured on 12 threads:
+            # "vtable constructor failed: emails_fts", "duplicate column
+            # name: emlx_path", and spurious migration notices. The lock
+            # is taken only on a thread's FIRST call — afterwards the
+            # thread-local short-circuits, so there is no ongoing
+            # contention, which is the whole point of this change.
             with self._conn_lock:
+                conn = init_database(self._db_path)
+                self._local.conn = conn
                 self._open_conns.append(conn)
         return conn
 
@@ -651,7 +664,10 @@ class IndexManager:
                 progress_callback,
                 exclude_account_uuids=exclude_account_uuids,
             )
-        except Exception:
+        except BaseException:
+            # BaseException, not Exception: a Ctrl-C (KeyboardInterrupt)
+            # or a SystemExit lands mid-sync just as easily as a bug,
+            # and leaves exactly the same open transaction behind.
             # A sync that raises mid-run leaves its write transaction
             # open, and every later write then fails with "database is
             # locked" until the process restarts. The index looks dead
@@ -737,20 +753,35 @@ class IndexManager:
         Returns:
             Number of emails re-indexed
         """
-        conn = self._get_conn()
-
-        # Delete existing entries for rebuild scope
-        if account and mailbox:
-            conn.execute(
-                "DELETE FROM emails WHERE account = ? AND mailbox = ?",
-                (account, mailbox),
+        # Take the lock BEFORE the first destructive statement. Deleting
+        # outside it meant a second rebuild could wipe rows while the
+        # first was mid-build, and it surfaced as "database is locked"
+        # from a raw DELETE rather than as the IndexBusyError this class
+        # exists to give.
+        if not self._write_lock.acquire(blocking=False):
+            raise IndexBusyError(
+                "An index build or sync is already running; "
+                "wait for it to finish."
             )
-        elif account:
-            conn.execute("DELETE FROM emails WHERE account = ?", (account,))
-        else:
-            conn.execute("DELETE FROM emails")
+        try:
+            conn = self._get_conn()
 
-        conn.commit()
+            # Delete existing entries for rebuild scope
+            if account and mailbox:
+                conn.execute(
+                    "DELETE FROM emails WHERE account = ? AND mailbox = ?",
+                    (account, mailbox),
+                )
+            elif account:
+                conn.execute("DELETE FROM emails WHERE account = ?", (account,))
+            else:
+                conn.execute("DELETE FROM emails")
+
+            conn.commit()
+        finally:
+            # build_from_disk() takes the lock itself, so it has to be
+            # free again before we call it.
+            self._write_lock.release()
 
         # Rebuild from disk
         return self.build_from_disk(progress_callback)

@@ -1069,12 +1069,60 @@ class TestIndexWritesAreSerializedAcrossProcesses:
     def test_an_unusable_lock_file_degrades_to_thread_locking(
         self, temp_db_path
     ):
-        """A read-only home must not make the index unusable."""
+        """A read-only home must not make the index unusable.
+
+        Patching `builtins.open` proved nothing: the lock uses `os.open`,
+        so the fallback was never exercised and the test passed either
+        way.
+        """
         from unittest.mock import patch
 
         from apple_mail_mcp.index.manager import WriteLock
 
-        with patch("builtins.open", side_effect=OSError("read-only")):
+        with patch(
+            "os.open", side_effect=OSError("read-only file system")
+        ) as opened:
             lock = WriteLock(temp_db_path)
             assert lock.acquire(blocking=False)
             lock.release()
+
+        assert opened.called, "the file-lock path was never reached"
+
+
+class TestTheLockFileIsItsOwnFile:
+    """Documentation and operator both expect `<index>.lock`."""
+
+    def test_the_database_itself_is_not_flocked(self, tmp_path):
+        from apple_mail_mcp.index import IndexManager
+
+        db = tmp_path / "index.db"
+        mgr = IndexManager(db_path=db)
+        assert mgr._write_lock._path != db
+        assert mgr._write_lock._path.suffix == ".lock"
+
+    def test_rebuild_takes_the_lock_before_deleting(self, tmp_path):
+        """The DELETE ran outside the lock, so a second rebuild could
+        wipe rows mid-build — and it surfaced as a raw 'database is
+        locked' instead of the IndexBusyError this class exists to
+        give."""
+        from apple_mail_mcp.index import IndexManager
+        from apple_mail_mcp.index.manager import IndexBusyError
+
+        mgr = IndexManager(db_path=tmp_path / "index.db")
+        conn = mgr._get_conn()
+        conn.execute(
+            "INSERT INTO emails (message_id, account, mailbox, subject) "
+            "VALUES (1, 'a', 'INBOX', 'keep me')"
+        )
+        conn.commit()
+
+        # Somebody else is already building.
+        assert mgr._write_lock.acquire(blocking=False)
+        try:
+            with pytest.raises(IndexBusyError):
+                mgr.rebuild()
+        finally:
+            mgr._write_lock.release()
+
+        rows = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
+        assert rows == 1, "the refused rebuild deleted rows anyway"
