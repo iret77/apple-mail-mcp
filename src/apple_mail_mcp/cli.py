@@ -116,6 +116,16 @@ def _setup_file_logging() -> Path | None:
                 _os.O_APPEND | _os.O_CREAT | _os.O_WRONLY,
                 0o600,
             )
+            # The mode argument of os.open applies only when the file is
+            # CREATED. An existing server.log — one written before this
+            # existed, or by a differently-umasked run — keeps whatever
+            # mode it had, so the very file this guard exists to protect
+            # stays world-readable. Enforce it on every open.
+            try:
+                if (_os.fstat(fd).st_mode & 0o777) != 0o600:
+                    _os.fchmod(fd, 0o600)
+            except OSError:
+                pass  # a log we cannot chmod is still better than none
             return _os.fdopen(fd, self.mode, encoding=self.encoding)
 
     path = get_log_path()
@@ -278,6 +288,9 @@ def index(
     IMPORTANT: Requires Full Disk Access permission for Terminal.
     Grant access in System Settings → Privacy & Security → Full Disk Access.
     """
+    # A failing build is exactly what the log file exists for, and this
+    # is the command that runs one.
+    _setup_file_logging()
     from .index import IndexManager
 
     print("Building search index from disk...")
@@ -458,6 +471,9 @@ def rebuild(
     Clears existing data and rebuilds from disk.
     Optionally scope to a specific account or mailbox.
     """
+    # A failing build is exactly what the log file exists for, and this
+    # is the command that runs one.
+    _setup_file_logging()
     if mailbox and not account:
         print("Error: --mailbox requires --account", file=sys.stderr)
         sys.exit(1)

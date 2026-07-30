@@ -1733,3 +1733,54 @@ class TestServerLogFile:
             for h in list(root.handlers):
                 h.close()
                 root.removeHandler(h)
+
+
+class TestTheLogFileModeIsEnforcedNotJustRequested:
+    """`os.open(..., 0o600)` applies the mode only when it CREATES the
+    file. An existing `server.log` — written before this feature, or by
+    a differently-umasked run — kept whatever mode it had, so the very
+    file the guard exists to protect stayed world-readable."""
+
+    def test_an_existing_world_readable_log_is_tightened(
+        self, tmp_path, monkeypatch
+    ):
+        import logging
+        import os
+
+        from apple_mail_mcp.cli import _setup_file_logging
+
+        target = tmp_path / "server.log"
+        target.write_text("from an earlier run\n")
+        os.chmod(target, 0o644)
+
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", str(target))
+        _setup_file_logging()
+        root = logging.getLogger("apple_mail_mcp")
+        try:
+            assert oct(target.stat().st_mode)[-3:] == "600"
+        finally:
+            for h in list(root.handlers):
+                h.close()
+                root.removeHandler(h)
+
+    def test_index_and_rebuild_set_up_logging(self):
+        """A failing build is what the log exists for, and those are the
+        commands that run one."""
+        import ast
+        import inspect
+
+        from apple_mail_mcp import cli
+
+        tree = ast.parse(inspect.getsource(cli))
+        for name in ("index", "rebuild", "_run_serve"):
+            fn = next(
+                n
+                for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == name
+            )
+            calls = {
+                c.func.id
+                for c in ast.walk(fn)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            }
+            assert "_setup_file_logging" in calls, name
