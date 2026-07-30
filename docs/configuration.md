@@ -36,6 +36,7 @@ config_version = 1
 # staleness_hours = 24.0        # Hours before re-sync
 # exclude_mailboxes = ["Drafts"]   # Mailboxes to skip during indexing
 # exclude_accounts = ["Work PHI"]  # Accounts to hide from the whole server
+# auto_build = true               # Build the index on first serve (default: off)
 
 [server]
 # read_only = false             # Disable write operations
@@ -78,6 +79,7 @@ in CI or in MCP client launch configs.
 | `APPLE_MAIL_INDEX_STALENESS_HOURS` | `24` | Hours before index is considered stale |
 | `APPLE_MAIL_INDEX_EXCLUDE_MAILBOXES` | `Drafts` | Comma-separated mailboxes to skip in search |
 | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` | _unset_ | Comma-separated account names (exact, case-sensitive) hidden from the entire server: never indexed, filtered from search, invisible to the list/get tools |
+| `APPLE_MAIL_INDEX_AUTO_BUILD` | `false` | When `true`, the first `serve` without an index builds one in the background (needs Full Disk Access). Off by default: it walks `~/Library/Mail` unasked, which takes minutes on a large mailbox |
 | `APPLE_MAIL_READ_ONLY` | `false` | When `true`, disables any write operations |
 
 ## Precedence

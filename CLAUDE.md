@@ -354,6 +354,24 @@ re-raising. The rollback itself is best-effort (it can fail too, on a connection
 that is already broken), but it must be attempted, and the original exception is
 the one that propagates.
 
+## Auto-build is opt-in, and the silent case has a voice
+
+`serve` syncs when an index exists and, without this setting, did nothing at all
+when one did not: the server started, said nothing, and body search came back
+empty with no hint that the index was never built. Startup now says so and names
+the command that fixes it — that part costs nothing and is unconditional.
+
+`APPLE_MAIL_INDEX_AUTO_BUILD` / `[index] auto_build` (**default `false`**) makes
+the first `serve` without an index kick off `build_from_disk()` on a daemon
+thread, so the server answers immediately and the build reports its own outcome.
+
+The default is off on purpose: with it on, the server walks `~/Library/Mail`
+unasked on first start — minutes on a large mailbox, and it needs Full Disk
+Access. That is a decision for whoever installs the server.
+
+`_start_watcher()` lives outside the sync branch so a first build can hand over
+to it too; otherwise `--watch` quietly does nothing on a fresh install.
+
 ## Coding Standards
 
 - **Python 3.11+**, type hints required
