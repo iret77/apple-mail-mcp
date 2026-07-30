@@ -965,3 +965,33 @@ class TestFailedSyncDoesNotWedgeTheIndex:
             pytest.raises(RuntimeError, match="the original failure"),
         ):
             mgr.sync_updates()
+
+        # Without this the test passes when the whole rollback handler
+        # is deleted: sync_from_disk still raises the asserted error.
+        conn.rollback.assert_called_once()
+
+    def test_an_interrupt_also_rolls_back(self, temp_db_path):
+        """Ctrl-C lands mid-sync as easily as a bug does, and leaves the
+        same open transaction. `except Exception` does not catch it."""
+        from unittest.mock import MagicMock, patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        conn = MagicMock()
+        with (
+            patch.object(mgr, "_get_conn", return_value=conn),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch(
+                "apple_mail_mcp.index.sync.sync_from_disk",
+                side_effect=KeyboardInterrupt(),
+            ),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            mgr.sync_updates()
+
+        conn.rollback.assert_called_once()

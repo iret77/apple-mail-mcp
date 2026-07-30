@@ -528,7 +528,10 @@ class IndexManager:
                 progress_callback,
                 exclude_account_uuids=exclude_account_uuids,
             )
-        except Exception:
+        except BaseException:
+            # BaseException, not Exception: a Ctrl-C (KeyboardInterrupt)
+            # or a SystemExit lands mid-sync just as easily as a bug,
+            # and leaves exactly the same open transaction behind.
             # A sync that raises mid-run leaves its write transaction
             # open, and every later write then fails with "database is
             # locked" until the process restarts. The index looks dead
