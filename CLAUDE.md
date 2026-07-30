@@ -299,6 +299,19 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
 
+## A failed write must not leave its transaction open
+
+Python's `sqlite3` holds an implicit transaction open until commit or rollback.
+So a sync that raised mid-run left one open on a connection the manager keeps —
+and **every later write failed with "database is locked" until the process was
+restarted.** From outside, the index looked dead while nothing was actually wrong
+with it.
+
+Any code path that writes to the index therefore rolls back on failure before
+re-raising. The rollback itself is best-effort (it can fail too, on a connection
+that is already broken), but it must be attempted, and the original exception is
+the one that propagates.
+
 ## Coding Standards
 
 - **Python 3.11+**, type hints required
