@@ -83,10 +83,11 @@ Get emails from a mailbox with optional filtering. This is the primary tool for 
 **Returns:** List of email summaries sorted by date (newest first), each with: `id`, `message_id`, `subject`, `sender`, `date_received`, `read`, `flagged`.
 
 !!! tip
-    `message_id` is the RFC822 Message-ID header — the handle to keep if the
-    result is used in a later call. `id` is a per-mailbox ROWID and stops
-    resolving as soon as any device files the message elsewhere. It is `null`
-    for messages the search index has not seen yet.
+    `message_id` is the RFC822 Message-ID header — the durable record of which
+    message a row was. `id` is a per-mailbox ROWID and stops identifying the
+    message as soon as any device files it elsewhere, so store the header
+    rather than the number. It is `null` for messages the search index has not
+    seen yet.
 
 ```python
 get_emails()
@@ -173,9 +174,11 @@ Search emails with automatic FTS5 optimization. Uses the FTS5 index for fast sea
 **Returns:** List of results sorted by relevance (FTS5) or date (JXA fallback), each with: `id`, `subject`, `sender`, `date_received`, `score`, `matched_in`, and optionally `content_snippet`, `account`, `mailbox`.
 
 !!! tip
-    Each result also carries `message_id`, the RFC822 header. Prefer it over
-    `id` for anything used in a later call — `id` is a per-mailbox ROWID and
-    stops resolving as soon as any device files the message elsewhere.
+    Each result also carries `message_id`, the RFC822 header. Store *that* if
+    you keep a reference to the message: `id` is a per-mailbox ROWID and stops
+    identifying the message as soon as any device files it elsewhere. (The
+    tools still take the numeric `id` as their parameter; the header is the
+    durable record of *which* message a result was.)
 
 ```python
 search("invoice")

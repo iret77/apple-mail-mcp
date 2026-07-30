@@ -551,3 +551,51 @@ class TestSearchFtsHighlight:
         # but search_fts handles via retry
         results = search_fts_highlight(fts_db, "budget")
         assert isinstance(results, list)
+
+
+class TestAttachmentSearchReturnsTheStableId:
+    """`search(scope="attachments")` reads `rfc822_message_id` from every
+    row `search_attachments()` returns.
+
+    Mocking the manager here proves nothing: the mock defines the very
+    dict whose shape is in question. This drives the real function
+    against a real database, which is what would have caught the
+    `KeyError` that shipped past a green mocked test.
+    """
+
+    def test_the_key_the_caller_reads_is_present(self, temp_db):
+        from apple_mail_mcp.index.schema import (
+            INSERT_ATTACHMENT_SQL,
+            INSERT_EMAIL_SQL,
+            email_to_row,
+        )
+        from apple_mail_mcp.index.search import search_attachments
+
+        cur = temp_db.execute(
+            INSERT_EMAIL_SQL,
+            email_to_row(
+                {
+                    "id": 1,
+                    "subject": "Invoice",
+                    "sender": "a@x",
+                    "content": "body",
+                    "date_received": "2026-07-28",
+                    "message_id_header": "<inv@x>",
+                },
+                "acct",
+                "INBOX",
+                "/tmp/1.emlx",
+                attachment_count=1,
+            ),
+        )
+        temp_db.execute(
+            INSERT_ATTACHMENT_SQL,
+            (cur.lastrowid, "invoice.pdf", "application/pdf", 10, None),
+        )
+        temp_db.commit()
+
+        rows = search_attachments(temp_db, "invoice")
+
+        assert rows, "fixture did not match"
+        # The exact key server.py indexes into.
+        assert rows[0]["rfc822_message_id"] == "<inv@x>"

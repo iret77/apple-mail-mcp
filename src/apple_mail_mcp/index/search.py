@@ -620,6 +620,11 @@ def search_attachments(
             "subject": row["subject"],
             "sender": row["sender"],
             "date_received": row["date_received"],
+            # Selected above and returned here: the caller reads this
+            # key. Selecting a column and then dropping it from the dict
+            # is the shape that made every attachment search raise
+            # KeyError while the mocked test stayed green.
+            "rfc822_message_id": row["rfc822_message_id"],
             "filename": row["filename"],
         }
         for row in cursor
