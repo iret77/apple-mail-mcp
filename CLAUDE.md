@@ -343,7 +343,11 @@ since most accounts are also open on a phone and a tablet. The RFC822
 - `get_email()` returns it as `message_id`.
 
 The docstrings say which one to keep, because a model handed two identifiers will
-otherwise use the shorter one.
+otherwise use the shorter one. **Handing the header out is not the same as
+accepting it back**: the tools still take the numeric id as their parameter.
+Making the header a usable *reference* is a separate change, and until it lands
+the header is a durable record of which message a result was, not something to
+pass to `get_email`.
 
 **`MailCore.batchFetch` degrades per property.** Carrying one more property means
 one more bulk call that Mail could refuse on some build, and a single refusal used
