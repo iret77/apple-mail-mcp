@@ -299,6 +299,39 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
 
+## An incomplete search is never a verdict
+
+The most expensive defect class in this codebase, because every instance of it
+produces the *identical* empty answer. The rule:
+
+> A tool may report that a message is absent ONLY when the search actually
+> covered every place the message could have been. Anything else — a mailbox
+> cap, a mailbox Mail refused to read, a timeout, a denied Apple Events
+> permission, an account that was never enumerated — leaves the question OPEN
+> and must be reported as such.
+
+Why it matters more than it sounds: a stale index row, a mistyped reference and
+a genuinely deleted message are indistinguishable from outside if all three
+answer "not found". Each one then costs a full debugging round.
+
+How it is enforced:
+
+- Every scan branch counts what it left out. `GetEmailBuilder` marks its error
+  `INCOMPLETE:` with the number of mailboxes not searched, and raises that
+  instead of a bare "not found" when the account could not be enumerated at all.
+- A missing `.emlx` file means the recorded PATH is stale, nothing more.
+  Strategy 0 cleans the row and **continues** into the live strategies; it must
+  not raise "deleted or moved" on the unverified assumption that they would fail
+  too.
+- A numeric id cannot be searched across accounts at all — it is a per-mailbox
+  ROWID, so the same number is a different message elsewhere, and widening the
+  search would risk returning a stranger's mail. The honest answer states the
+  limit rather than implying absence.
+
+When adding a code path that can end in "not found", the question is not "did I
+find it?" but **"did I look everywhere it could be, and if not, does the caller
+learn that?"**
+
 ## Coding Standards
 
 - **Python 3.11+**, type hints required
