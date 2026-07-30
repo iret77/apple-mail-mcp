@@ -1,6 +1,6 @@
 # Tools
 
-Apple Mail MCP provides **8 MCP tools** — a consolidated API designed for AI assistants.
+Apple Mail MCP provides **9 MCP tools** — a consolidated API designed for AI assistants.
 
 ## Overview
 
@@ -14,6 +14,7 @@ Apple Mail MCP provides **8 MCP tools** — a consolidated API designed for AI a
 | `get_email_links()` | Extract links from an email | `message_id`, `account?`, `mailbox?` |
 | `get_email_attachment()` | Extract attachment content | `message_id`, `filename`, `account?`, `mailbox?` |
 | `get_attachment()` | *Deprecated* — use `get_email_attachment()` | `message_id`, `filename`, `account?`, `mailbox?` |
+| `get_index_status()` | Index health and setup diagnostics | — |
 
 ---
 
@@ -273,3 +274,43 @@ Read-only JSON snapshot of FTS5 search-index health. Lets clients render an "ind
   "message": "No index found. Run 'apple-mail-mcp index' to build it."
 }
 ```
+
+---
+
+## `get_index_status()`
+
+Diagnose the search index: readiness, build progress, and setup problems — with
+step-by-step instructions for fixing them. Reads state only.
+
+**Parameters:** None
+
+**Returns:** A dict with, among others:
+
+| Field | Description |
+|-------|-------------|
+| `state` | `"building"`, `"ready"`, `"empty"` or `"absent"` |
+| `user_message` | One plain sentence to relay to the user |
+| `next_steps` | Ordered, non-technical instructions (may be empty) |
+| `problem` / `note` | What is wrong, or why the setup is fine anyway |
+| `indexed_emails` / `disk_emails` / `progress_percent` | Build progress |
+| `build_phase` / `build_appears_stalled` / `seconds_since_progress` | Whether a running build is working or wedged |
+| `mail_dir_accessible` | `false` means Full Disk Access is missing for the app running the server — the most common cause of an empty index |
+| `index_command` | The exact command that builds the index |
+| `recent_events` | What the server actually did, newest first |
+| `last_error`, `failed_parse_jobs`, `last_sync`, `staleness_hours`, `db_size_mb`, `excluded_accounts` | Health details |
+
+```python
+get_index_status()
+# → {"state": "ready", "indexed_emails": 63953, "disk_emails": 63953,
+#    "user_message": "The mail index is ready.", ...}
+```
+
+!!! tip
+    Call this whenever email tooling behaves unexpectedly, without waiting to be
+    asked — an empty search result and a missing index look identical from the
+    outside.
+
+!!! note
+    `state: "empty"` means the database file exists but holds no messages, which
+    is what an interrupted or permission-denied first build leaves behind.
+    Syncing it never fills it; it has to be built.

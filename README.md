@@ -68,6 +68,7 @@ for the full schema and precedence rules.
 | `get_email_links(message_id)` | Extract links from an email |
 | `get_email_attachment(message_id, filename)` | Extract attachment content |
 | `get_attachment(message_id, filename)` | *Deprecated* — use `get_email_attachment()` |
+| `get_index_status()` | Index health, build progress, and setup diagnostics |
 
 ## Performance
 

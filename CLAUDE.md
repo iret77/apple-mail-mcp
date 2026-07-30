@@ -27,7 +27,7 @@ src/apple_mail_mcp/
     └── mail_core.js    # Shared JXA utilities (MailCore object)
 ```
 
-## MCP Tools (8 total)
+## MCP Tools (9 total)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -39,6 +39,7 @@ src/apple_mail_mcp/
 | `get_email_links(id)` | Extract links from an email | message_id |
 | `get_email_attachment(id, filename)` | Extract attachment content | message_id, filename |
 | `get_attachment(id, filename)` | *Deprecated* — use `get_email_attachment()` | message_id, filename |
+| `get_index_status()` | Index health + setup diagnostics (state, progress, Full Disk Access) | - |
 
 ## MCP Resources (1 total)
 
@@ -371,6 +372,36 @@ Access. That is a decision for whoever installs the server.
 
 `_start_watcher()` lives outside the sync branch so a first build can hand over
 to it too; otherwise `--watch` quietly does nothing on a fresh install.
+
+## `get_index_status()` answers in two registers
+
+Every index failure produces the *same* user-visible symptom — search finds
+nothing — and the causes are indistinguishable from outside: no Full Disk
+Access, an index that was never built, a build still warming up, a build wedged,
+an index file with zero rows. Under a desktop client stderr goes nowhere, so the
+user reports "it doesn't work" and neither they nor the assistant can get
+further.
+
+So the tool returns both:
+
+- **Machine-readable state** — `state`, indexed/disk counts, `progress_percent`,
+  `build_phase`, `build_appears_stalled`, `seconds_since_progress`,
+  `mail_dir_accessible`, `last_error`, `recent_events`, plus the usual stats.
+- **Instructions a person can follow** — `problem` / `note`, `user_message`, and
+  an ordered `next_steps` written GUI-first, because most users have never opened
+  a terminal. macOS grants Full Disk Access to the *responsible app* — whichever
+  process launched the server — so the steps differ by setup, and
+  `_index_guidance()` picks the right ones.
+
+Two judgements to preserve when touching it:
+
+- **No Full Disk Access plus a working index is not a fault.** It is the
+  deliberate manual setup; reporting it as broken sends the user chasing a
+  permission they consciously withheld. It gets a `note`, not a `problem`.
+- **No fresh disk walk while a build runs.** It would compete with the build for
+  I/O, which is exactly when a percentage is wanted. The cached count from before
+  the build is a perfectly good denominator, and when there is none, no
+  `progress_percent` is reported rather than an invented one.
 
 ## Coding Standards
 
