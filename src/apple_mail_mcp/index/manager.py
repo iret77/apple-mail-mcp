@@ -234,6 +234,13 @@ class IndexManager:
         interrupted or permission-denied first build leaves an empty
         database behind, which must not be mistaken for a usable index.
         """
+        # Do NOT open a connection when the file is absent:
+        # init_database() would create it, and a *status* call that
+        # creates the index turns the next `serve` down the sync path
+        # instead of the first-build path — the tool changes the state
+        # it is asked to describe.
+        if not self._db_path.exists():
+            return 0
         try:
             row = (
                 self._get_conn()

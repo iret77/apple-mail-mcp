@@ -1029,7 +1029,10 @@ class TestUsableIndexAndErrorTracking:
 
     def test_empty_db_is_not_usable(self, temp_db_path):
         m = IndexManager(db_path=temp_db_path)
-        m.indexed_email_count()  # creates the DB file
+        # Create the file deliberately. indexed_email_count() no longer
+        # does it as a side effect: a status call must not change the
+        # state it describes.
+        m._get_conn()
         assert m.has_index() is True
         assert m.has_usable_index() is False  # file exists, but no rows
 
@@ -1188,3 +1191,20 @@ class TestEventRing:
 
         m = IndexManager(db_path=temp_db_path)
         m.record_event("info", "hostile", bad=Hostile())  # must not raise
+
+
+class TestReadingTheStatusCreatesNothing:
+    """`get_index_status()` is documented as read-only. Opening a
+    connection runs init_database(), so counting rows on a fresh install
+    created the index file — and the next `serve` then took the sync
+    path instead of building."""
+
+    def test_counting_rows_does_not_create_the_database(self, tmp_path):
+        from apple_mail_mcp.index import IndexManager
+
+        db = tmp_path / "absent.db"
+        mgr = IndexManager(db_path=db)
+
+        assert mgr.indexed_email_count() == 0
+        assert not db.exists(), "a status read created the index"
+        assert mgr.has_index() is False
