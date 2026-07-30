@@ -310,7 +310,7 @@ fails as a whole:
 | `message_ids` | `int \| list[int]` | *required* | One id, or up to 500 |
 | `color` | `string?` | `default` | `default` flags without forcing a colour, `none` unflags, or one of `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `gray` |
 | `account` | `string?` | env default | Hint; required together with `mailbox` for ids the index cannot place |
-| `mailbox` | `string?` | `INBOX` | Hint, as above |
+| `mailbox` | `string?` | — | Hint, as above. **Not defaulted**: when omitted, the id is placed by the index, or every mailbox of the account is scanned. Passing `INBOX` narrows the search rather than describing where the message is |
 
 ```python
 set_flag(12345, color="red")
@@ -332,7 +332,7 @@ set_flag([1, 2, 3], color="none")   # unflag a batch
 | `message_ids` | `int \| list[int]` | *required* | One id, or up to 500 |
 | `read` | `bool?` | `true` | `true` marks as read (seen), `false` as unread |
 | `account` | `string?` | env default | Hint, as for `set_flag()` |
-| `mailbox` | `string?` | `INBOX` | Hint, as for `set_flag()` |
+| `mailbox` | `string?` | — | Hint, as for `set_flag()` |
 
 ```python
 set_read_status([1, 2, 3])          # mark read

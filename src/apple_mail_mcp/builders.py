@@ -458,7 +458,19 @@ for (const g of groups) {{
                 }}
             }}
         }}
-        for (const id of remaining) notFound.push(id);
+        // What is left was never found — but if a mailbox refused to be
+        // read, or the scan hit its cap, the search did not cover
+        // everything, and "not found" would be a verdict nobody
+        // established. Those go to `failures` with the reason.
+        for (const id of remaining) {{
+            if (unreadableBoxes > 0 || cappedBoxes > 0) {{
+                fail([id], "the scan could not cover every mailbox (" +
+                    unreadableBoxes + " unreadable, " + cappedBoxes +
+                    " past the limit)");
+            }} else {{
+                notFound.push(id);
+            }}
+        }}
         continue;
     }}
 

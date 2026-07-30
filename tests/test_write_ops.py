@@ -537,3 +537,20 @@ class TestAmbiguousIdsAreNeverGuessed:
         assert groups == [
             {"account": "Work", "mailbox": "Archive", "ids": [42]}
         ]
+
+
+class TestAnIncompleteScanIsNotAnAbsence:
+    """A scan that could not read every mailbox has not established that
+    the message is gone — the unit's own contract says so."""
+
+    def test_the_generated_script_routes_that_to_failures(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_read(
+            [{"account": "A", "ids": [1], "scan": True}], True
+        ).build()
+
+        assert "could not cover every mailbox" in script
+        # …and the plain not-found path still exists for the case where
+        # the scan really did cover everything.
+        assert "notFound.push(id)" in script
