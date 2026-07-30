@@ -1372,7 +1372,10 @@ async def refresh_index(full: bool = False) -> dict:
         # fails one of them mid-transaction. A module-level flag is
         # enough here: this guards THIS process, which is the scope a
         # tool call has.
-        if _rebuild_in_progress.locked():
+        # acquire(blocking=False), not locked(): a check followed by an
+        # acquire is a race — two callers can both see it free and both
+        # report "started".
+        if not _rebuild_in_progress.acquire(blocking=False):
             return {
                 "status": "already_running",
                 "message": (
@@ -1388,8 +1391,9 @@ async def refresh_index(full: bool = False) -> dict:
         outcome: list[BaseException] = []
 
         def _build() -> None:
+            # The flag is already held by the caller above; this thread
+            # only has to give it back.
             try:
-                _rebuild_in_progress.acquire()
                 manager.build_from_disk(on_started=started.set)
             except BaseException as exc:
                 outcome.append(exc)
@@ -1425,6 +1429,18 @@ async def refresh_index(full: bool = False) -> dict:
                 "Building the index in the background. This can take "
                 "several minutes on a large mailbox — ask for the index "
                 "status to see progress."
+            ),
+        }
+
+    # A plain sync during a full rebuild writes the same database the
+    # rebuild is emptying and refilling. Refuse rather than interleave.
+    if _rebuild_in_progress.locked():
+        return {
+            "status": "already_running",
+            "message": (
+                "A full index rebuild is running; a sync would write the "
+                "same database. Ask for the index status to see how far "
+                "along it is."
             ),
         }
 

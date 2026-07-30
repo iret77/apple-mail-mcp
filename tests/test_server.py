@@ -1801,3 +1801,37 @@ class TestTheDocumentedToolCountMatchesReality:
                 if claim in text:
                     stale.append(f"{name}: {claim}")
         assert not stale, stale
+
+
+class TestRebuildAndSyncDoNotOverlap:
+    """A plain sync during a full rebuild writes the same database the
+    rebuild is emptying and refilling."""
+
+    @pytest.mark.asyncio
+    async def test_a_sync_during_a_rebuild_is_refused(self):
+        from unittest.mock import MagicMock, patch
+
+        import apple_mail_mcp.server as srv
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+
+        srv._rebuild_in_progress.acquire()
+        try:
+            with patch.object(srv, "_get_index_manager", return_value=mgr):
+                r = await srv.refresh_index()
+        finally:
+            srv._rebuild_in_progress.release()
+
+        assert r["status"] == "already_running"
+        mgr.sync_updates.assert_not_called()
+
+    def test_the_guard_is_an_acquire_not_a_check(self):
+        """`if locked(): ... else acquire()` is a race: two callers can
+        both see it free and both report "started"."""
+        import inspect
+
+        from apple_mail_mcp import server
+
+        src = inspect.getsource(server.refresh_index)
+        assert "_rebuild_in_progress.acquire(blocking=False)" in src
