@@ -16,7 +16,7 @@ Common issues and their solutions.
 4. **Restart your terminal** (required for changes to take effect)
 
 !!! note
-    The MCP server itself does **not** need Full Disk Access — only the `index` and `rebuild` commands do. Once the index is built, the server uses disk-based sync which works without FDA.
+    The MCP server itself does **not** need Full Disk Access — only the `index` and `rebuild` commands do, plus `serve` when `APPLE_MAIL_INDEX_AUTO_BUILD=true`, because it then runs a build itself. Once the index is built, the server uses disk-based sync, which works without FDA.
 
 ## Empty Search Results
 
