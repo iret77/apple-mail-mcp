@@ -114,6 +114,7 @@ def cmd_strip(root: Path, dest: Path) -> int:
         ),
     )
     (dest / "UPSTREAM_PR_PLAN.md").unlink(missing_ok=True)
+    shutil.rmtree(dest / "upstream-prs", ignore_errors=True)
     removed = 0
     for p in _files(dest):
         text = p.read_text()

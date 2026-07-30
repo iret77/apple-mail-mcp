@@ -43,7 +43,7 @@ upstream branch is cut mechanically rather than from memory.
 
 | Item | Where | Why |
 |---|---|---|
-| `mcpb/`, `scripts/build-mcpb.sh`, `dist/`, this file | fork branches | fork distribution; `strip` drops them |
+| `mcpb/`, `scripts/build-mcpb.sh`, `dist/`, `upstream-prs/`, this file | fork branches | fork distribution and PR prep; `strip` drops them |
 | `install_mode`, `source_ref`, `APPLE_MAIL_MCP_LAUNCHER`, `APPLE_MAIL_MCP_REF` | server.py | describes our bundle launcher |
 | `SERVER_REVISION` | server.py | our build stamp; upstream ships via PyPI, where the package version answers it |
 | The `.mcpb` paragraph in the README | README.md | fork-specific |
@@ -317,6 +317,36 @@ Track D  feat/batch-reads                        feat/cross-account-listing
 
 Two units grew a dependency that only became visible once they were cut in
 isolation — both are recorded in the tables above rather than worked around.
+
+Each branch also carries **its own share of the documentation**: the tool tables
+and counts in `CLAUDE.md`, `README.md` and `docs/tools.md`, the env-var table in
+`docs/configuration.md`, and a `docs/troubleshooting.md` entry where the change
+answers a support question. A unit that adds a tool and leaves "provides 8 MCP
+tools" standing is not mergeable, so that is part of the diff, not an
+afterthought.
+
+**No branch touches `CHANGELOG.md`, `pyproject.toml` or `server.json`.** Upstream
+writes changelog entries with issue numbers under a release heading the
+maintainer owns, and twenty-two branches editing the same `[Unreleased]` block
+would conflict twenty-two ways and force a rebase after every merge. The prose
+ships in the PR body instead — one paste for the maintainer, no conflicts — and
+the release number stays their call.
+
+# The PR bodies
+
+`upstream-prs/` (fork-only) holds one file per unit, ready to paste: title,
+what/why, the judgements a reviewer should push back on, dependencies, the
+changelog prose, the verification output, and the exact `gh pr create` command.
+`upstream-prs/README.md` explains the flow.
+
+Verified mechanically before writing them, and again after:
+
+- no branch touches `uv.lock`, `mcpb/`, `dist/`, `upstream-prs/` or this file
+- no branch carries fork-only code (`SERVER_REVISION`, `install_mode`,
+  `source_ref`, `APPLE_MAIL_MCP_*`)
+- every branch is based on `ee655d4`, still upstream's HEAD
+- `ruff check src/`, `ruff format --check src/` and `pytest` pass on all 22, and
+  the test counts quoted in the PR bodies are the measured ones
 
 # Release gate
 
