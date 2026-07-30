@@ -91,3 +91,43 @@ watching the test go red.
 Test theatre was a recurring theme: several tests passed with the fix reverted.
 Those were rewritten to exercise the tool rather than the helper, or the real
 function rather than a mock of it.
+
+### Second round
+
+Every branch was reviewed again after the first round's fixes, with the
+round-1 findings attached as a checklist to verify — `FIXED` / `NOT FIXED` /
+`PARTIAL` per item, against the diff rather than the commit message — plus two
+standing questions: *did the fixes introduce anything*, and *what did both
+rounds miss*.
+
+**Two of my own fixes were wrong, and the round caught them:**
+
+- **A9 was not fixed at all.** Moving the role table ahead of the generic match
+  did nothing, because `mailboxRole()` normalizes the hierarchy away before
+  comparing — `Projects/INBOX` still answered a request for the inbox. My test
+  passed only because it listed the real inbox first. A role request now
+  requires a *top-level* mailbox, and the tests assert both listing orders.
+- **A6's interrupt test was a stub.** Resolving a rebase conflict had moved its
+  body into a neighbouring test, leaving the named one with nothing but imports
+  — it passed unconditionally. Both are whole again, and the interrupt test
+  fails when `BaseException` is narrowed back.
+
+**And several defects that neither the mechanical gate nor round 1 found:**
+
+| Unit | Defect |
+|---|---|
+| A2 | A build that skips every file never committed its DLQ row — it survived only as a side effect of a later `executescript()` |
+| A2 | A mailbox at its cap swallowed oversized files: the cap check ran before the size check |
+| A8 | Any early failure leaked the write lock, wedging every later build and sync with "already running" |
+| B1/B4 | The rollback-on-interrupt correction reached one branch as documentation only — the code still caught plain `Exception` |
+| B2 | `get_index_status()` **created** the index database, so the next `serve` took the sync path instead of building |
+| B4 | `index`/`rebuild` installed the log handler and then reported failures to stderr only — the log stayed empty |
+| C3 | An unreadable mailbox during a scan was still reported as a missing message |
+| C4 | Stale index rows ended the search instead of falling back to a live one; `["<a@b>", "a@b"]` was written twice |
+| D2 | Excluded accounts were filtered *after* SQL `LIMIT`, so hidden mail consumed the page and visible mail was skipped |
+| D3 | `before_id` without `before` was ignored, returning the newest page — an endless loop for a backwards walk |
+
+Findings judged invalid are recorded as such rather than acted on: the
+80-column complaints about Markdown (upstream's own docs exceed it; the rule is
+ruff's, for Python), and "unfocused diff" on stacked units (that is the stack —
+GitHub shows only the top unit's changes once the parent merges).

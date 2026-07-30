@@ -50,7 +50,7 @@ release number is yours to choose.
 ```
 uv run ruff check src/          # All checks passed!
 uv run ruff format --check src/ # 16 files already formatted
-uv run pytest -q                # 495 passed
+uv run pytest -q                # 496 passed
 ```
 
 ### Open
