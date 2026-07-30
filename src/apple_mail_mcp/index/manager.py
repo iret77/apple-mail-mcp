@@ -616,7 +616,8 @@ class IndexManager:
                 # fires the trigger normally; the subsequent FTS rebuild
                 # then re-syncs everything in `emails`, double-covering rows
                 # added during the rebuild call itself.
-                conn.executescript("""
+                try:
+                    conn.executescript("""
                 CREATE TRIGGER IF NOT EXISTS emails_ai
                 AFTER INSERT ON emails BEGIN
                     INSERT INTO emails_fts(rowid, subject, sender, content)
@@ -645,6 +646,13 @@ class IndexManager:
                     VALUES (new.rowid, new.subject, new.sender, new.content);
                 END;
             """)
+                except sqlite3.Error as exc:
+                    # DROP TRIGGER autocommitted, so failing here leaves
+                    # the database FILE without its FTS triggers — every
+                    # later insert then skips the search index, and the
+                    # build must not report itself clean.
+                    finalize_error = f"{type(exc).__name__}: {exc}"
+                    logger.exception("Could not recreate the FTS triggers")
 
                 # Rebuild FTS index (must run even if scan crashed
                 # mid-iteration, otherwise emails table has rows
