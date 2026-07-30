@@ -13,7 +13,7 @@
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![CI](https://github.com/imdinu/apple-mail-mcp/actions/workflows/lint.yml/badge.svg)](https://github.com/imdinu/apple-mail-mcp/actions/workflows/lint.yml)
 
-The only Apple Mail MCP server with **full-coverage body search** — reliable on large mailboxes where AppleScript-based servers timeout. 8 tools for reading, searching, and extracting email content.
+The only Apple Mail MCP server with **full-coverage body search** — reliable on large mailboxes where AppleScript-based servers timeout. 9 tools for reading, searching, and extracting email content.
 
 **[Read the docs](https://imdinu.github.io/apple-mail-mcp/)** for the full guide.
 

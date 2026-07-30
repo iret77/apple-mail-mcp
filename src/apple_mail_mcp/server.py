@@ -145,6 +145,10 @@ def _validate_date(value: str | None, param: str) -> str | None:
 # line, which reads as success.
 BUILD_START_TIMEOUT = 5.0
 
+# One full rebuild at a time within this process. Concurrent rebuilds
+# interleave DELETE and INSERT on the same database.
+_rebuild_in_progress = threading.Lock()
+
 
 # ========== Response Type Definitions ==========
 
@@ -1339,7 +1343,7 @@ async def refresh_index(full: bool = False) -> dict:
 
     The index otherwise syncs only when the server starts, so a
     long-running client drifts out of date. Also call it when
-    `get_index_status` reports a large `staleness_hours`, or when a
+    the `index://status` resource reports a large `staleness_hours`, or when a
     message the user just received cannot be found.
 
     This touches only the local index — never the mail itself — so it is
@@ -1362,6 +1366,20 @@ async def refresh_index(full: bool = False) -> dict:
     # A full rebuild is far too slow to block an MCP call on, and so is
     # the first build of a large mailbox — run both detached.
     if full or not manager.has_index():
+        # One rebuild at a time. Two concurrent full=True calls would
+        # each report "started" and then interleave DELETE and INSERT on
+        # the same database — the index ends up incomplete, or SQLite
+        # fails one of them mid-transaction. A module-level flag is
+        # enough here: this guards THIS process, which is the scope a
+        # tool call has.
+        if _rebuild_in_progress.locked():
+            return {
+                "status": "already_running",
+                "message": (
+                    "A full index rebuild is already running. Ask for "
+                    "the index status to see how far along it is."
+                ),
+            }
         # Confirm the build actually begins before claiming it did.
         # Reporting "started" for a thread that died on the first line
         # is how a refused build looked like a running one: the status
@@ -1371,11 +1389,14 @@ async def refresh_index(full: bool = False) -> dict:
 
         def _build() -> None:
             try:
+                _rebuild_in_progress.acquire()
                 manager.build_from_disk(on_started=started.set)
             except BaseException as exc:
                 outcome.append(exc)
                 logger.warning("Background index build failed", exc_info=True)
             finally:
+                if _rebuild_in_progress.locked():
+                    _rebuild_in_progress.release()
                 started.set()  # never leave the caller waiting
 
         threading.Thread(target=_build, daemon=True).start()

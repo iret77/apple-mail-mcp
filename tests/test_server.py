@@ -1723,3 +1723,81 @@ class TestRefreshIndexTool:
         doc = (inspect.getdoc(server.refresh_index) or "").lower()
         assert "rebuild" in doc
         assert "mailbox > rebuild" in doc or "envelope index" in doc
+
+
+class TestOnlyOneRebuildAtATime:
+    """Two `full=True` calls both reported "started" and then interleaved
+    DELETE and INSERT on the same database."""
+
+    @pytest.mark.asyncio
+    async def test_a_second_full_rebuild_is_refused(self):
+        from unittest.mock import MagicMock, patch
+
+        import apple_mail_mcp.server as srv
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+
+        srv._rebuild_in_progress.acquire()  # a rebuild is running
+        try:
+            with patch.object(srv, "_get_index_manager", return_value=mgr):
+                r = await srv.refresh_index(full=True)
+        finally:
+            srv._rebuild_in_progress.release()
+
+        assert r["status"] == "already_running"
+        mgr.build_from_disk.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_flag_is_released_when_a_build_fails(self):
+        from unittest.mock import MagicMock, patch
+
+        import apple_mail_mcp.server as srv
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.build_from_disk.side_effect = RuntimeError("no Full Disk Access")
+
+        with patch.object(srv, "_get_index_manager", return_value=mgr):
+            await srv.refresh_index(full=True)
+
+        assert not srv._rebuild_in_progress.locked(), (
+            "a failed build left the rebuild flag stuck"
+        )
+
+    def test_the_docstring_does_not_promise_another_unit_s_tool(self):
+        """This PR adds no `get_index_status`; pointing an agent at it
+        yields an unknown-tool error."""
+        import inspect
+
+        from apple_mail_mcp import server
+
+        doc = inspect.getdoc(server.refresh_index) or ""
+        assert "get_index_status" not in doc
+
+
+class TestTheDocumentedToolCountMatchesReality:
+    """Six shipped files state the number. A PR that adds a tool and
+    updates one of them leaves five lying to the reader."""
+
+    def test_no_document_still_claims_the_old_count(self):
+        from pathlib import Path
+
+        stale = []
+        for name in (
+            "README.md",
+            "CLAUDE.md",
+            "CONTRIBUTING.md",
+            "docs/index.md",
+            "docs/tools.md",
+            "docs/architecture.md",
+            "docs/getting-started.md",
+        ):
+            p = Path(name)
+            if not p.exists():
+                continue
+            text = p.read_text()
+            for claim in ("8 MCP tools", "all 8 tools", "8 tools for"):
+                if claim in text:
+                    stale.append(f"{name}: {claim}")
+        assert not stale, stale
