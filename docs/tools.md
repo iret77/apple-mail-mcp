@@ -261,7 +261,7 @@ Read-only JSON snapshot of FTS5 search-index health. Lets clients render an "ind
 | `disk_email_count` | `int?` | Total `.emlx` files on disk (best-effort; `null` if Full Disk Access denied) |
 | `db_size_mb` | `float` | Size of index DB on disk, rounded to 0.01 MB |
 | `capped_mailboxes` | `int` | Number of mailboxes that hit `APPLE_MAIL_INDEX_MAX_EMAILS` cap |
-| `failed_jobs_count` | `int` | Rows in the dead-letter queue (`.emlx` parses that failed) |
+| `failed_jobs_count` | `int` | Rows in the dead-letter queue: `.emlx` files that failed to parse, plus files deliberately skipped (e.g. `too_large`) — so the gap between disk and index counts is always explainable |
 | `last_sync` | `string?` | ISO-8601 of last sync, or `null` if never synced |
 | `staleness_hours` | `float?` | Hours since `last_sync`, rounded to 0.01 |
 

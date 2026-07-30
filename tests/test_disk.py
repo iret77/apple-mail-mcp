@@ -1735,3 +1735,44 @@ class TestOversizedEmailsAreVisible:
 
         assert results == []
         assert skips == [(big, "too_large")]
+
+
+class TestTheBuildPathRecordsSkipsToo:
+    """`on_skip` existed but nobody passed it on the build path.
+
+    `apple-mail-mcp index` / `rebuild` therefore omitted every oversized
+    message with `failed_jobs_count` still 0 — on the very command most
+    likely to meet one.
+    """
+
+    def test_a_rebuild_leaves_a_dlq_row(self, tmp_path, monkeypatch):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import IndexManager
+
+        mail_dir = tmp_path / "V10"
+        box = mail_dir / "ACCT-UUID" / "INBOX.mbox" / "Data" / "Messages"
+        box.mkdir(parents=True)
+        big = box / "1.emlx"
+        payload = b"x" * (2 * 1024 * 1024)
+        big.write_bytes(f"{len(payload)}\n".encode() + payload)
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "1")
+        mgr = IndexManager(db_path=tmp_path / "idx.db")
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=mail_dir,
+            ),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+        ):
+            mgr.build_from_disk()
+
+        rows = (
+            mgr._get_conn()
+            .execute("SELECT error_message FROM failed_index_jobs")
+            .fetchall()
+        )
+        assert [r[0] for r in rows] == ["too_large"], (
+            "the oversized message vanished without a trace"
+        )

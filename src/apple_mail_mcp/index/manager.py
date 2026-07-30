@@ -331,8 +331,32 @@ class IndexManager:
         batch_size = 500
 
         try:
+
+            def _record_skip(path: Path, reason: str) -> None:
+                """Never drop a message without a trace.
+
+                The sync path records skips; the BUILD path did not, so
+                `apple-mail-mcp index` / `rebuild` silently omitted every
+                oversized message and left failed_jobs_count at 0 — the
+                gap this change exists to close, on the very command
+                most likely to hit it.
+                """
+                try:
+                    from .disk import _infer_account_mailbox
+                    from .schema import RECORD_PARSE_FAILURE_SQL, skip_row
+
+                    acct, mbox = _infer_account_mailbox(path, mail_dir)
+                    conn.execute(
+                        RECORD_PARSE_FAILURE_SQL,
+                        skip_row(str(path), acct, mbox, reason),
+                    )
+                except Exception:
+                    logger.debug("Could not record skip for %s", path)
+
             for email_data in scan_all_emails(
-                mail_dir, exclude_account_uuids=exclude_account_uuids
+                mail_dir,
+                exclude_account_uuids=exclude_account_uuids,
+                on_skip=_record_skip,
             ):
                 key = (email_data["account"], email_data["mailbox"])
                 count = mailbox_counts.get(key, 0)
