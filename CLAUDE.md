@@ -165,6 +165,7 @@ reply_to, message_id from MIME headers.
 |---------|----------|---------|
 | **Builder** | `QueryBuilder` | Safe JXA script construction, prevents injection |
 | **Singleton** | `IndexManager` | One file watcher; **one SQLite connection per thread** |
+| **Cross-process lock** | `WriteLock` | One index writer per *machine*, not per process |
 | **Facade** | `MailCore` JS | Clean API over verbose Apple Events |
 | **Factory** | `create_connection()` | Consistent DB configuration |
 | **State Reconciliation** | `sync_from_disk()` | Fast diff-based sync |
@@ -180,6 +181,27 @@ threads, and the previous single connection was guarded by one lock — so a
 background rebuild, which holds its transaction for minutes, blocked every
 request that needed the index. From outside, the server looked frozen while it
 was working exactly as designed.
+
+### One writer per machine, not per process
+
+A `threading.Lock` is not enough. Claude Desktop starts a **second instance** of
+every MCP server (upstream #106), so two processes hold connections to the same
+SQLite file. SQLite allows one writer, and a rebuild holds its transaction for
+minutes — the other process then dies on "database is locked" once
+`busy_timeout` expires. That is how a rebuild failed in practice.
+
+`WriteLock` therefore pairs a thread lock with an advisory `flock` on
+`<index>.lock`:
+
+- The **file lock** is process-wide, and the OS releases it when a process
+  dies, so a crash cannot wedge the index permanently.
+- The **thread lock** still guards threads inside one process, where `flock`
+  would not: they share the same file description.
+
+It is acquired non-blocking, so a second caller is told "already running"
+instead of queueing behind a multi-minute rebuild, and it is released **last** —
+after the final flush and the FTS rebuild, which are the heaviest writes in the
+program.
 
 ## FTS5 Search Index
 
