@@ -5,8 +5,14 @@ through it A5) — same file, both contained in this PR
 
 ---
 
-**No new tool.** This adds the internals that make an index build observable; the
-existing `index://status` resource can serve all of it.
+**No new tool.** This adds the internals that make an index build observable.
+
+To be precise about what that means: this PR does **not** change the
+`index://status` resource — it adds the state such a reader needs
+(`is_building()`, `build_progress()`, `last_error`, `recent_events()`,
+`has_usable_index()`). Wiring them into `index://status` is two lines and left
+deliberately out of this diff, so the internals can be judged on their own; say
+the word and I will add it here rather than in a follow-up.
 
 The problem: a build runs on a daemon thread and reports nothing. From outside,
 three different situations produce the same observation — zero emails indexed:
@@ -59,8 +65,7 @@ config; if you would rather they were tunable, that is one env var away.
   heartbeat (rows written, files seen, seconds since progress, a per-phase stall
   budget), records `last_error` for *every* failure rather than one case, keeps a
   50-entry ring of lifecycle events, and distinguishes an index file that exists
-  from one that holds messages (`has_usable_index()`). The existing
-  `index://status` resource can serve all of it.
+  from one that holds messages (`has_usable_index()`).
 ```
 
 ### Verification

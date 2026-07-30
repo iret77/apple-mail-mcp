@@ -64,8 +64,8 @@ that needs it, so it does not solve the same problem.
   writes are now serialized by a cross-process advisory lock (`flock` on
   `<index>.lock`) paired with the existing thread lock — acquired non-blocking, so
   a second caller is told the build is already running instead of queueing, and
-  released only after the final flush and FTS rebuild. The watcher path is not yet
-  covered — see #106. (#106)
+  released only after the final flush and FTS rebuild, and taken by `rebuild()`
+  before its first DELETE. The watcher path is not yet covered — see #106. (#106)
 ```
 
 ### Verification

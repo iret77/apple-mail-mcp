@@ -62,3 +62,32 @@ Verified against the tracker rather than assumed:
 4. **Track D** can follow at any point — none of it depends on B or C.
 5. **Then an umbrella issue** carrying the unit table. Tracks B and C become PRs
    only after the maintainer says which they want.
+
+## Review round (Codex, adversarial)
+
+Before any PR is opened, every unit was reviewed against explicit acceptance
+criteria — written first, so expectations could not be derived from the thing
+being judged. Each unit got its own `codex exec` run with the diff, the PR body
+and the criteria; all 22 came back `FIX-FIRST`.
+
+Every finding was then verified at the code level rather than taken on trust.
+The ones that survived are fixed on the branch that introduced them, each with a
+test that fails without the fix — several proved by reverting the fix and
+watching the test go red.
+
+**What the review caught that the mechanical gate could not:**
+
+| Class | Examples |
+|---|---|
+| Regression against upstream | A1 stopped decoding RFC 2047 subjects (`=?UTF-8?B?…?=` indexed literally) |
+| Hard runtime error | C2: `search(scope="attachments")` raised `KeyError` — the test mocked the very dict whose shape was wrong |
+| Silent data loss | D3: three messages in one second, `limit=2` → the third unreachable forever |
+| Persistent corruption | A7: `DROP TRIGGER` outside the `try` — one failure and the database file keeps a schema with no FTS triggers, surviving restarts |
+| Wrong-target write | C3: an id in two mailboxes resolved to an arbitrary one; A9: `Projects/INBOX` answered a request for the inbox on a German account |
+| Self-inflicted race | A6: twelve threads on a fresh database → `vtable constructor failed`, `duplicate column name` |
+| Overclaiming | A7 and A10 promised changes their diff did not contain; B1 claimed `index://status` served data it never wired up |
+| Stale documentation | Six shipped files still advertised eight tools; three still documented schema v5 |
+
+Test theatre was a recurring theme: several tests passed with the fix reverted.
+Those were rewritten to exercise the tool rather than the helper, or the real
+function rather than a mock of it.
