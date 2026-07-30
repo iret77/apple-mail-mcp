@@ -299,6 +299,19 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
 
+## Timestamps: stored UTC, reported local
+
+Mail.app shows local time, so a server that answers in UTC is wrong by the
+offset — 12:54 for a message the user sees at 14:54, and every "is this from
+this morning?" question follows the wrong answer.
+
+Storage stays UTC (the index and Apple's Envelope Index both hold epoch or
+ISO-UTC values). Conversion happens at the **output boundary**: `to_local_iso()`
+runs on every `date_received` / `date_sent` a tool returns, using the *system*
+zone via `astimezone()` so DST is correct for the date in question rather than
+for today. Never hardcode an offset, and never convert on the way in — a stored
+local time cannot be re-interpreted later.
+
 ## Coding Standards
 
 - **Python 3.11+**, type hints required

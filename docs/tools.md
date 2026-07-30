@@ -80,6 +80,11 @@ Get emails from a mailbox with optional filtering. This is the primary tool for 
 
 **Returns:** List of email summaries sorted by date (newest first), each with: `id`, `subject`, `sender`, `date_received`, `read`, `flagged`.
 
+!!! note
+    Timestamps are returned in the machine's **local** time zone, matching what
+    Mail.app displays. They are stored in UTC and converted at the output
+    boundary, so daylight saving is correct for the date of the message.
+
 ```python
 get_emails()
 # All emails from default mailbox
