@@ -138,9 +138,18 @@ class IndexManager:
         """Get or create the database connection (thread-safe)."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = init_database(self._db_path)
-            self._local.conn = conn
+            # init_database() creates the schema and runs migrations, so
+            # it must not run concurrently: with one connection per
+            # thread, several threads hitting a fresh database each try
+            # to create the same tables. Measured on 12 threads:
+            # "vtable constructor failed: emails_fts", "duplicate column
+            # name: emlx_path", and spurious migration notices. The lock
+            # is taken only on a thread's FIRST call — afterwards the
+            # thread-local short-circuits, so there is no ongoing
+            # contention, which is the whole point of this change.
             with self._conn_lock:
+                conn = init_database(self._db_path)
+                self._local.conn = conn
                 self._open_conns.append(conn)
         return conn
 

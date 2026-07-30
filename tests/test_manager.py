@@ -11,6 +11,7 @@ Tests the central orchestration class for the FTS5 search index:
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -978,6 +979,7 @@ class TestFailedSyncDoesNotWedgeTheIndex:
         same open transaction. `except Exception` does not catch it."""
         from unittest.mock import MagicMock, patch
 
+
 class TestConnectionsArePerThread:
     """A shared connection made a background rebuild block the server.
 
@@ -993,7 +995,6 @@ class TestConnectionsArePerThread:
         from apple_mail_mcp.index.manager import IndexManager
 
         mgr = IndexManager(db_path=temp_db_path)
-<<<<<<< HEAD
         conn = MagicMock()
         with (
             patch.object(mgr, "_get_conn", return_value=conn),
@@ -1011,7 +1012,6 @@ class TestConnectionsArePerThread:
             mgr.sync_updates()
 
         conn.rollback.assert_called_once()
-=======
         seen = []
 
         def grab():
@@ -1042,6 +1042,59 @@ class TestConnectionsArePerThread:
         t.join()
 
         assert len(mgr._open_conns) == 2
+        conns = list(mgr._open_conns)
         mgr.close()
         assert mgr._open_conns == []
->>>>>>> c413578 (fix: one SQLite connection per thread, not one per manager)
+
+        # Clearing the list is not closing the connections: without this,
+        # deleting the whole `for conn in conns: conn.close()` loop still
+        # passes while every file descriptor stays open.
+        for conn in conns:
+            with pytest.raises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
+
+
+class TestFirstConnectionsDoNotRaceOnSchema:
+    """One connection per thread means several threads can meet a fresh
+    database at once — and `init_database()` creates tables and runs
+    migrations. Measured before the lock was added: "vtable constructor
+    failed: emails_fts", "duplicate column name: emlx_path", and
+    spurious migration notices."""
+
+    def test_twelve_threads_on_a_fresh_database(self, tmp_path):
+        import concurrent.futures as cf
+
+        from apple_mail_mcp.index import IndexManager
+
+        mgr = IndexManager(db_path=tmp_path / "fresh.db")
+        errors: list[str] = []
+
+        def hit() -> None:
+            try:
+                mgr._get_conn().execute("SELECT 1").fetchone()
+            except Exception as exc:  # noqa: BLE001 - reporting the race
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        with cf.ThreadPoolExecutor(max_workers=12) as pool:
+            list(pool.map(lambda _: hit(), range(12)))
+
+        assert not errors, errors
+        mgr.close()
+
+    def test_the_lock_is_only_taken_on_a_first_call(self, temp_db_path):
+        """Serializing every query would undo the change this unit is
+        about, so the thread-local has to short-circuit."""
+        from apple_mail_mcp.index import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        first = mgr._get_conn()
+
+        class Tripwire:
+            def __enter__(self):
+                raise AssertionError("lock taken on a repeat call")
+
+            def __exit__(self, *a):
+                return False
+
+        mgr._conn_lock = Tripwire()
+        assert mgr._get_conn() is first
