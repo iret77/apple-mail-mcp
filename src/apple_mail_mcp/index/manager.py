@@ -413,7 +413,14 @@ class IndexManager:
             # autocommits, so this is the only thing that brings them
             # back; if a statement below throws before it runs, the
             # database file keeps a schema with no FTS triggers.
-            self._recreate_fts_triggers(conn)
+            try:
+                self._recreate_fts_triggers(conn)
+            except sqlite3.Error:
+                # Must not escape from `finally`: that would replace the
+                # original exception with this one and abandon the rest
+                # of the cleanup. The triggers being absent is already
+                # the worst case, and it is logged rather than hidden.
+                logger.exception("Could not recreate the FTS triggers")
 
             # Flush any remaining partial batch (crash-safe)
             if batch:
