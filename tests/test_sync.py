@@ -405,3 +405,30 @@ class TestAPartialInsertIsNotLeftBehind:
             "SELECT COUNT(*) FROM failed_index_jobs"
         ).fetchone()[0]
         assert dlq == 1
+
+
+class TestAnUnparseableFileIsRecordedToo:
+    """`parse_emlx()` answers a file it cannot make sense of with None
+    rather than an exception, so it never reached the DLQ path — the
+    message was absent from the index with nothing to explain the gap,
+    one branch away from the silence this unit removes."""
+
+    def test_a_none_result_lands_in_the_dlq(self, temp_db, tmp_path):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.sync import sync_from_disk
+
+        mail_dir = tmp_path / "V10"
+        box = mail_dir / "ACCT" / "INBOX.mbox" / "Data" / "Messages"
+        box.mkdir(parents=True)
+        (box / "1.emlx").write_bytes(b"12\nnot a message")
+
+        with patch("apple_mail_mcp.index.disk.parse_emlx", return_value=None):
+            sync_from_disk(temp_db, mail_dir)
+
+        rows = temp_db.execute(
+            "SELECT emlx_path FROM failed_index_jobs"
+        ).fetchall()
+        assert len(rows) == 1, (
+            "the message vanished from the index with no record"
+        )

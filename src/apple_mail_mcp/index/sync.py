@@ -257,6 +257,23 @@ def sync_from_disk(
 
         try:
             parsed = parse_emlx(Path(path))
+            if parsed is None:
+                # parse_emlx returns None for a file it cannot make
+                # sense of instead of raising, so this never reached the
+                # except below: the message was absent from the index
+                # with no DLQ row and nothing to explain the gap — the
+                # silence this unit exists to remove, one branch over.
+                conn.execute(
+                    RECORD_PARSE_FAILURE_SQL,
+                    parse_failure_row(
+                        path,
+                        account,
+                        mailbox,
+                        ValueError("parse_emlx returned no message"),
+                    ),
+                )
+                errors += 1
+                continue
             if parsed:
                 attachments = parsed.attachments or []
                 insert_row = email_to_row(
