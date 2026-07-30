@@ -742,10 +742,13 @@ async def get_email(
             exc_info=True,
         )
 
-    # Stale-entry handling: clean up the dead row and fail fast with a
-    # clear message. Skipping Strategies 1-3 here is intentional — they
-    # would also fail (the message is gone from Mail.app), with Strategy 3
-    # eating its full timeout before doing so.
+    # A recorded path that no longer exists means the PATH is stale —
+    # nothing more. It does NOT establish that the message is gone: Mail
+    # rewrites .emlx files on its own schedule, and a message filed into
+    # another mailbox has a new path while still being perfectly
+    # reachable live. So clean the dead row and CONTINUE into the live
+    # strategies. Raising here (on the reasoning that they "would also
+    # fail") reported a deletion that was never established.
     if stale_index_entry is not None:
         stale_acct, stale_mb = stale_index_entry
         try:
@@ -764,11 +767,6 @@ async def get_email(
                 message_id,
                 exc_info=True,
             )
-        raise ValueError(
-            f"Message {message_id} was deleted or moved since the last "
-            f"index sync. Run 'apple-mail-mcp rebuild' to refresh "
-            f"the index."
-        )
 
     # Strategy 1: Try specified mailbox
     mailbox_setup = build_mailbox_setup_js(resolved_account, resolved_mailbox)
@@ -871,12 +869,16 @@ async def get_email(
             # read, or an account that could not be enumerated. Absence
             # was never established, so do not claim it: the caller can
             # act on this, on "not found" it cannot.
+            # The builder already phrases the detail as a full clause
+            # ("9 mailbox(es) not searched" / "the account could not be
+            # read at all"). Appending our own "not searched" produced
+            # "9 mailbox(es) not searched not searched".
             detail = raw.split("INCOMPLETE:", 1)[-1].rstrip(")").strip()
             raise ValueError(
                 f"Message {message_id} was not found, but the search was "
-                f"incomplete ({detail} not searched). This does not mean "
-                f"the message is gone — pass `account` and `mailbox` to "
-                f"look in the right place."
+                f"incomplete: {detail}. This does not mean the message is "
+                f"gone — pass `account` and `mailbox` to look in the "
+                f"right place."
             ) from None
         if "not found" in msg or "-1728" in msg or "can't get object" in msg:
             raise ValueError(f"Message {message_id} not found.") from None

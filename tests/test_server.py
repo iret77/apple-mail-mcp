@@ -392,8 +392,15 @@ class TestGetEmail:
     async def test_strategy0_cleans_stale_index_entry(
         self, mock_exec, mock_mgr, mock_acct_map
     ):
-        """Stale FTS5 entry is auto-cleaned and a clear error is raised
-        without falling through to JXA cascade. (#74)
+        """A stale row is cleaned AND the cascade continues. (#74)
+
+        The original version of this test asserted the opposite — that
+        the JXA strategies were skipped, "no point trying strategies
+        that will all fail on a deleted message". That reasoning is the
+        defect: a missing `.emlx` proves the recorded PATH is stale, not
+        that the message is gone. Mail rewrites those files on its own
+        schedule, and a message filed into another mailbox has a new
+        path while remaining perfectly reachable live.
         """
         from pathlib import Path
         from unittest.mock import AsyncMock
@@ -411,17 +418,31 @@ class TestGetEmail:
 
         from apple_mail_mcp.server import get_email
 
+        mock_exec.return_value = {
+            "id": 42,
+            "subject": "still here",
+            "sender": "a@x",
+            "content": "body",
+            "date_received": "2026-07-28T10:00:00",
+            "date_sent": "2026-07-28T09:00:00",
+            "read": True,
+            "flagged": False,
+            "reply_to": "",
+            "message_id": "<a@x>",
+            "attachments": [],
+        }
+
         with patch("pathlib.Path.exists", return_value=False):
-            with pytest.raises(ValueError, match="deleted or moved"):
-                await get_email(42, account="Work", mailbox="INBOX")
+            result = await get_email(42, account="Work", mailbox="INBOX")
 
         # The stale entry was cleaned up with the resolved account UUID
         mock_mgr.return_value.delete_email.assert_called_once_with(
             42, account="uuid-1", mailbox="INBOX"
         )
-        # JXA cascade was skipped — no point trying strategies that will
-        # all fail on a deleted message
-        mock_exec.assert_not_called()
+        # ...and the live strategies ran, which is the whole point: the
+        # message was reachable all along.
+        mock_exec.assert_called()
+        assert result["subject"] == "still here"
 
     @pytest.mark.asyncio
     async def test_get_email_uses_index_for_fallback(self):
@@ -1729,3 +1750,44 @@ class TestAnIncompleteSearchIsNotAnAbsence:
 
             with pytest.raises(ValueError, match="not found"):
                 await get_email(42)
+
+
+class TestIncompleteWordingIsNotDoubled:
+    """The message a user actually reads."""
+
+    @pytest.mark.asyncio
+    async def test_the_detail_is_not_suffixed_twice(self):
+        """The JXA builder already phrases the detail as a full clause,
+        so appending "not searched" produced "9 mailbox(es) not searched
+        not searched"."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+
+        async def boom(script, **kw):
+            raise RuntimeError(
+                "Message not found with ID: 42 "
+                "(INCOMPLETE: 9 mailbox(es) not searched)"
+            )
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="Work"),
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=boom,
+            ),
+        ):
+            from apple_mail_mcp.server import get_email
+
+            with pytest.raises(ValueError) as err:
+                await get_email(42)
+
+        text = str(err.value)
+        assert "not searched not searched" not in text
+        assert "9 mailbox(es) not searched" in text
+        assert "incomplete" in text.lower()
