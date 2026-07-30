@@ -271,9 +271,18 @@ class IndexManager:
         """Get or create the database connection (thread-safe)."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = init_database(self._db_path)
-            self._local.conn = conn
+            # init_database() creates the schema and runs migrations, so
+            # it must not run concurrently: with one connection per
+            # thread, several threads hitting a fresh database each try
+            # to create the same tables. Measured on 12 threads:
+            # "vtable constructor failed: emails_fts", "duplicate column
+            # name: emlx_path", and spurious migration notices. The lock
+            # is taken only on a thread's FIRST call — afterwards the
+            # thread-local short-circuits, so there is no ongoing
+            # contention, which is the whole point of this change.
             with self._conn_lock:
+                conn = init_database(self._db_path)
+                self._local.conn = conn
                 self._open_conns.append(conn)
         return conn
 
@@ -469,6 +478,10 @@ class IndexManager:
         # below now has to cope with never having opened anything —
         # which is precisely the failure this build reports.
         conn: sqlite3.Connection | None = None
+        # Set when a failure in the cleanup block means the index is NOT
+        # complete — e.g. the FTS rebuild failed, leaving rows that body
+        # search can never find.
+        finalize_error: str | None = None
 
         try:
             # Verify we can access the mail directory
@@ -572,22 +585,26 @@ class IndexManager:
             # return — returning from `finally` would swallow the
             # exception that brought us here.
             if conn is not None:
-                # Flush any remaining partial batch (crash-safe)
-                if batch:
-                    self._flush_batch(conn, batch, batch_attachments)
-                    total_indexed += len(batch)
+                try:
+                    # Flush any remaining partial batch (crash-safe)
+                    if batch:
+                        self._flush_batch(conn, batch, batch_attachments)
+                        total_indexed += len(batch)
 
-                # Update sync state for whatever we managed to index
-                if mailbox_counts:
-                    now = datetime.now().isoformat()
-                    for (account, mailbox), count in mailbox_counts.items():
-                        conn.execute(
-                            """INSERT OR REPLACE INTO sync_state
-                               (account, mailbox, last_sync, message_count)
-                               VALUES (?, ?, ?, ?)""",
-                            (account, mailbox, now, count),
-                        )
-                    conn.commit()
+                    # Update sync state for whatever we managed to index
+                    if mailbox_counts:
+                        now = datetime.now().isoformat()
+                        for (acct_, mbox_), count in mailbox_counts.items():
+                            conn.execute(
+                                """INSERT OR REPLACE INTO sync_state
+                                 (account, mailbox, last_sync, message_count)
+                                 VALUES (?, ?, ?, ?)""",
+                                (acct_, mbox_, now, count),
+                            )
+                        conn.commit()
+                except sqlite3.Error as exc:
+                    finalize_error = f"{type(exc).__name__}: {exc}"
+                    logger.exception("Could not finalize index build")
 
                 # Re-enable triggers BEFORE rebuilding FTS to close the
                 # watcher race condition: if the file watcher (or any other
@@ -637,8 +654,15 @@ class IndexManager:
                         msg = "Building search index..."
                         progress_callback(total_indexed, total_indexed, msg)
 
-                    rebuild_fts_index(conn)
-                    optimize_fts_index(conn)
+                    try:
+                        rebuild_fts_index(conn)
+                        optimize_fts_index(conn)
+                    except sqlite3.Error as exc:
+                        # Rows exist but body search cannot find them —
+                        # the one outcome that must never read as
+                        # success.
+                        finalize_error = f"{type(exc).__name__}: {exc}"
+                        logger.exception("FTS rebuild failed")
 
                 # Log cap warnings (aggregate summary)
                 if capped_mailboxes:
@@ -658,8 +682,24 @@ class IndexManager:
         # Disk inventory just changed — drop the cache so the next
         # status call reflects truth.
         self.invalidate_disk_count_cache()
-        self._last_error = None  # a clean build clears prior failures
-        self.record_event("info", "Index build finished", emails=total_indexed)
+        if finalize_error:
+            # The heaviest writes in the program are in the `finally`
+            # above — the final flush and the FTS rebuild — and they run
+            # PAST the `except`. Rows can exist while body search cannot
+            # find them, so this is not a success: reporting one is how
+            # "every failure is recorded" became untrue.
+            self._last_error = finalize_error
+            self.record_event(
+                "error",
+                "Index build finished with errors; search may be incomplete",
+                error=finalize_error,
+                emails=total_indexed,
+            )
+        else:
+            self._last_error = None  # a clean build clears prior failures
+            self.record_event(
+                "info", "Index build finished", emails=total_indexed
+            )
         return total_indexed
 
     @staticmethod

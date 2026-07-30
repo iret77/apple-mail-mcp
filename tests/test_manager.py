@@ -11,6 +11,7 @@ Tests the central orchestration class for the FTS5 search index:
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1188,3 +1189,56 @@ class TestEventRing:
 
         m = IndexManager(db_path=temp_db_path)
         m.record_event("info", "hostile", bad=Hostile())  # must not raise
+
+
+class TestFinalizationFailuresAreRecorded:
+    """ "Every failure" has to include the ones after the except block.
+
+    The heaviest writes — the final flush and the FTS rebuild — happen in
+    the cleanup block, past the `except`. A failure there escaped with
+    `last_error` still None, so a build that left rows body search can
+    never find reported itself as clean.
+    """
+
+    def test_a_failing_fts_rebuild_is_not_a_clean_build(self, tmp_path):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import IndexManager
+
+        mgr = IndexManager(db_path=tmp_path / "idx.db")
+
+        def one_email(*a, **kw):
+            yield {
+                "id": 1,
+                "account": "acct",
+                "mailbox": "INBOX",
+                "subject": "s",
+                "sender": "a@x",
+                "content": "body",
+                "date_received": "2026-07-28",
+                "emlx_path": "/tmp/1.emlx",
+                "attachments": [],
+            }
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                side_effect=one_email,
+            ),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.manager.rebuild_fts_index",
+                side_effect=sqlite3.OperationalError("disk I/O error"),
+            ),
+        ):
+            mgr.build_from_disk()
+
+        assert mgr.last_error is not None, (
+            "a build whose FTS rebuild failed reported itself as clean"
+        )
+        assert "disk I/O error" in mgr.last_error
+        assert any(e["level"] == "error" for e in mgr.recent_events())
