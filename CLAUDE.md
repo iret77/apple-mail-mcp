@@ -33,7 +33,7 @@ src/apple_mail_mcp/
 |------|---------|----------------|
 | `list_accounts()` | List email accounts | - |
 | `list_mailboxes(account?)` | List mailboxes | account (optional) |
-| `get_emails(...)` | Unified listing | filter: all/unread/flagged/today/last_7_days |
+| `get_emails(...)` | Unified listing, walkable backwards | filter, before, after, offset |
 | `get_email(id)` | Full email content + attachments | message_id |
 | `search(query, ...)` | Unified search | scope, before, after, offset, highlight |
 | `get_email_links(id)` | Extract links from an email | message_id |
@@ -298,6 +298,27 @@ from apple_mail_mcp.index.sync import (
 result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
+
+## The backlog has to be reachable
+
+`get_emails` returned the newest N per mailbox and nothing else, so anything
+older than one page was **unreachable** — not slow, unreachable. A run that
+stored a cursor deep in a mailbox could not get back to it, and `search()` is no
+substitute: it needs keywords, and a gapless reverse scan has none.
+
+`before` / `after` / `offset` are two WHERE clauses and an OFFSET on the
+Envelope Index query. Two rules:
+
+- **`before` is the cursor to prefer.** Hand it the oldest `date_received` you
+  have seen and the walk continues from there, unaffected by mail arriving
+  mid-walk. `offset` shifts under new mail, so it is for one snapshot only.
+- **The JXA fallback refuses these three rather than dropping them.** A silently
+  ignored window returns the same newest N on every page, so the caller pages
+  forever and concludes the backlog is empty. An error is the only honest answer
+  when the window cannot be applied.
+
+Naive input is read as local time, because that is what a caller typing a date
+means; the column stores Unix epoch.
 
 ## Coding Standards
 

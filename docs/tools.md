@@ -8,7 +8,7 @@ Apple Mail MCP provides **8 MCP tools** — a consolidated API designed for AI a
 |------|---------|------------|
 | `list_accounts()` | List email accounts | — |
 | `list_mailboxes()` | List mailboxes | `account?` |
-| `get_emails()` | Get emails with filtering | `account?`, `mailbox?`, `filter?`, `limit?` |
+| `get_emails()` | Get emails with filtering and paging | `account?`, `mailbox?`, `filter?`, `limit?`, `before?`, `after?`, `offset?` |
 | `get_email()` | Get single email with content + attachments | `message_id`, `account?`, `mailbox?` |
 | `search()` | Search emails | `query`, `account?`, `mailbox?`, `scope?`, `limit?`, `exclude_mailboxes?`, `before?`, `after?`, `highlight?` |
 | `get_email_links()` | Extract links from an email | `message_id`, `account?`, `mailbox?` |
@@ -66,6 +66,9 @@ Get emails from a mailbox with optional filtering. This is the primary tool for 
 | `mailbox` | `string?` | `INBOX` | Mailbox name |
 | `filter` | `string?` | `all` | Filter type (see below) |
 | `limit` | `int?` | `50` | Max emails to return |
+| `before` | `string?` | `None` | Only messages received BEFORE this ISO date/datetime (`2026-07-28` or `2026-07-28T09:30`) |
+| `after` | `string?` | `None` | Only messages received AFTER this ISO date/datetime |
+| `offset` | `int?` | `0` | Rows to skip before returning `limit` |
 
 **Filters:**
 
@@ -89,7 +92,23 @@ get_emails(filter="unread", limit=10)
 
 get_emails("Work", "INBOX", filter="today")
 # Today's work emails
+
+get_emails(before="2026-01-01")
+# The page just before 2026 — pass the oldest date_received you saw
+# to walk further back
 ```
+
+!!! tip
+    `before` is the cursor to prefer for a long walk: hand it the oldest
+    `date_received` you have seen and the next page continues from there,
+    unaffected by mail arriving mid-walk. `offset` shifts under new mail, so use
+    it within one snapshot only. A naive date is read as local time.
+
+!!! warning
+    These three need Apple's Envelope Index (Full Disk Access). The JXA fallback
+    has no date window and no offset, so it **refuses** rather than ignoring
+    them — a dropped window would return the same newest N on every page and let
+    the caller conclude the backlog is empty.
 
 ---
 
