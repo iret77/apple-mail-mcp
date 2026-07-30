@@ -8,7 +8,7 @@ Apple Mail MCP provides **8 MCP tools** — a consolidated API designed for AI a
 |------|---------|------------|
 | `list_accounts()` | List email accounts | — |
 | `list_mailboxes()` | List mailboxes | `account?` |
-| `get_emails()` | Get emails with filtering | `account?`, `mailbox?`, `filter?`, `limit?` |
+| `get_emails()` | Get emails with filtering, one account or all | `account?` (`"all"`), `mailbox?`, `filter?`, `limit?` |
 | `get_email()` | Get single email with content + attachments | `message_id`, `account?`, `mailbox?` |
 | `search()` | Search emails | `query`, `account?`, `mailbox?`, `scope?`, `limit?`, `exclude_mailboxes?`, `before?`, `after?`, `highlight?` |
 | `get_email_links()` | Extract links from an email | `message_id`, `account?`, `mailbox?` |
@@ -62,8 +62,8 @@ Get emails from a mailbox with optional filtering. This is the primary tool for 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `account` | `string?` | env default | Account name |
-| `mailbox` | `string?` | `INBOX` | Mailbox name |
+| `account` | `string?` | env default | Account name, or `"all"` for every visible account |
+| `mailbox` | `string?` | `INBOX` | Mailbox name. Not defaulted when `account="all"` — see the note below |
 | `filter` | `string?` | `all` | Filter type (see below) |
 | `limit` | `int?` | `50` | Max emails to return |
 
@@ -89,7 +89,21 @@ get_emails(filter="unread", limit=10)
 
 get_emails("Work", "INBOX", filter="today")
 # Today's work emails
+
+get_emails(account="all", filter="unread")
+# Unread across every visible account, in one call
 ```
+
+!!! note
+    With `account="all"` and no explicit `mailbox`, the `INBOX` default is
+    dropped: it would keep only the accounts that happen to have a mailbox by
+    that name, which on a localized Mail is none of them. Pass `mailbox`
+    explicitly to narrow it.
+
+!!! warning
+    Listing across accounts requires Apple's Envelope Index (Full Disk Access).
+    The JXA fallback walks one account at a time, so it **refuses** the request
+    rather than silently answering for one account.
 
 ---
 

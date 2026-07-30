@@ -33,7 +33,7 @@ src/apple_mail_mcp/
 |------|---------|----------------|
 | `list_accounts()` | List email accounts | - |
 | `list_mailboxes(account?)` | List mailboxes | account (optional) |
-| `get_emails(...)` | Unified listing | filter: all/unread/flagged/today/last_7_days |
+| `get_emails(...)` | Unified listing; `account="all"` lists across every visible account in one call | filter, account ("all" supported) |
 | `get_email(id)` | Full email content + attachments | message_id |
 | `search(query, ...)` | Unified search | scope, before, after, offset, highlight |
 | `get_email_links(id)` | Extract links from an email | message_id |
@@ -298,6 +298,27 @@ from apple_mail_mcp.index.sync import (
 result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
+
+## `account="all"` — the capability was already there
+
+"What is unread?" is one question, and answering it cost one call per account,
+after first discovering the account names. The Envelope Index query already
+means "every account" when given no UUID; only this tool's defaulting stood in
+the way. Two defaults, in fact:
+
+- the **account** default, which scoped the query to the first account, and
+- the **`INBOX` mailbox** default, which under `"all"` would keep only those
+  accounts that happen to have a mailbox by that name — on a localized Mail,
+  none of them. So `"all"` without an explicit `mailbox` drops that default too;
+  an explicit `mailbox` still applies.
+
+Exclusions are unaffected: they filter on **UUIDs** further down, not on the
+account name, so `"all"` cannot become a hole in the excluded-account boundary
+(#90) — there is a test for exactly that.
+
+**The JXA fallback refuses rather than answering narrowly.** It walks one account
+at a time, so silently falling through would answer a different question than the
+one that was asked, and the caller would have no way to notice.
 
 ## Coding Standards
 

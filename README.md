@@ -62,7 +62,7 @@ for the full schema and precedence rules.
 |------|---------|
 | `list_accounts()` | List email accounts |
 | `list_mailboxes(account?)` | List mailboxes |
-| `get_emails(filter?, limit?)` | Get emails — all, unread, flagged, today, last_7_days |
+| `get_emails(filter?, limit?)` | Get emails — all, unread, flagged, today, last_7_days; `account="all"` spans every account |
 | `get_email(message_id)` | Get single email with full content + attachments |
 | `search(query, scope?, before?, after?, highlight?)` | Search — all, subject, sender, body, attachments |
 | `get_email_links(message_id)` | Extract links from an email |
