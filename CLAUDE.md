@@ -171,7 +171,7 @@ reply_to, message_id from MIME headers.
 
 ## FTS5 Search Index
 
-### Database Schema (v5)
+### Database Schema (v6)
 
 ```sql
 -- Email content cache
@@ -185,6 +185,7 @@ CREATE TABLE emails (
     content TEXT,                    -- Body text
     date_received TEXT,
     emlx_path TEXT,                  -- Path for sync
+    rfc822_message_id TEXT,          -- Stable identity (v6), survives moves
     attachment_count INTEGER DEFAULT 0,
     indexed_at TEXT DEFAULT (datetime('now')),
     UNIQUE(account, mailbox, message_id)
@@ -239,6 +240,29 @@ CREATE TABLE failed_index_jobs (
 CREATE INDEX idx_failed_jobs_mailbox
     ON failed_index_jobs(account, mailbox);
 ```
+
+### Why the schema needs a second identity
+
+`emails.message_id` is Mail.app's id, and **Mail.app's id is a per-mailbox
+ROWID**. It is exact while the message stays put and dead the moment the message
+is filed elsewhere — which happens routinely, since most accounts are also open
+on a phone and a tablet. After such a move the index still holds a row, the
+ROWID in it now belongs to a *different* message, and nothing in the schema can
+tell the difference.
+
+The RFC822 `Message-ID` header survives moves and is globally unique, so v6 adds
+`rfc822_message_id` plus an index on it, populated by every write path: the bulk
+build, the disk sync and the file watcher. (`parse_emlx()` already extracted the
+header; it was simply dropped on the floor.)
+
+The v5→v6 migration is an in-place `ALTER TABLE`, deliberately: a 70k index must
+not have to be re-read just to open. Existing rows keep NULL, which every
+lookup has to treat as "unknown" and fall back to the ROWID path — so a
+partially migrated index stays correct, just less able to recover moved
+messages. A full rebuild backfills them.
+
+A missing header is stored as **NULL, never `""`**, so it can never match a
+query for the empty header and hand back a stranger's message.
 
 ### IndexManager API
 
