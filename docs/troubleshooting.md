@@ -4,7 +4,7 @@ Common issues and their solutions.
 
 ## Full Disk Access
 
-**Symptom:** `apple-mail-mcp index` fails with permission errors, or the index has 0 emails.
+**Symptom:** `apple-mail-mcp index` fails with permission errors, the index has 0 emails, or `serve` with `APPLE_MAIL_INDEX_AUTO_BUILD=true` reports that its background build failed.
 
 **Cause:** The indexer reads `.emlx` files from `~/Library/Mail/V10/`, which macOS protects.
 
