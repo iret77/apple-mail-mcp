@@ -979,19 +979,6 @@ class TestFailedSyncDoesNotWedgeTheIndex:
         same open transaction. `except Exception` does not catch it."""
         from unittest.mock import MagicMock, patch
 
-
-class TestConnectionsArePerThread:
-    """A shared connection made a background rebuild block the server.
-
-    SQLite connections are not safe to share across threads, and the
-    single instance-level one meant every request needing the index
-    waited behind a rebuild — from outside, the server simply looked
-    frozen.
-    """
-
-    def test_each_thread_gets_its_own(self, temp_db_path):
-        import threading
-
         from apple_mail_mcp.index.manager import IndexManager
 
         mgr = IndexManager(db_path=temp_db_path)
@@ -1012,6 +999,23 @@ class TestConnectionsArePerThread:
             mgr.sync_updates()
 
         conn.rollback.assert_called_once()
+
+
+class TestConnectionsArePerThread:
+    """A shared connection made a background rebuild block the server.
+
+    SQLite connections are not safe to share across threads, and the
+    single instance-level one meant every request needing the index
+    waited behind a rebuild — from outside, the server simply looked
+    frozen.
+    """
+
+    def test_each_thread_gets_its_own(self, temp_db_path):
+        import threading
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
         seen = []
 
         def grab():
