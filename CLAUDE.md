@@ -319,8 +319,10 @@ and **every later write failed with "database is locked" until the process was
 restarted.** From outside, the index looked dead while nothing was actually wrong
 with it.
 
-Any code path that writes to the index therefore rolls back on failure before
-re-raising. The rollback itself is best-effort (it can fail too, on a connection
+The sync path therefore rolls back on failure before re-raising — including on
+`KeyboardInterrupt` and `SystemExit`, which leave the same open transaction as a
+bug does. (This is the sync path specifically; the other write paths are not
+claimed to be covered by it.) The rollback itself is best-effort (it can fail too, on a connection
 that is already broken), but it must be attempted, and the original exception is
 the one that propagates.
 

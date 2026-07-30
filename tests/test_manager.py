@@ -11,6 +11,7 @@ Tests the central orchestration class for the FTS5 search index:
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1078,3 +1079,124 @@ class TestRebuildDoesNotFireOneDeletePerRow:
             )
         }
         assert {"emails_ai", "emails_ad", "emails_au"} <= names
+
+
+class TestFirstConnectionsDoNotRaceOnSchema:
+    """One connection per thread means several threads can meet a fresh
+    database at once — and `init_database()` creates tables and runs
+    migrations. Measured before the lock was added: "vtable constructor
+    failed: emails_fts", "duplicate column name: emlx_path", and
+    spurious migration notices."""
+
+    def test_twelve_threads_on_a_fresh_database(self, tmp_path):
+        import concurrent.futures as cf
+
+        from apple_mail_mcp.index import IndexManager
+
+        mgr = IndexManager(db_path=tmp_path / "fresh.db")
+        errors: list[str] = []
+
+        def hit() -> None:
+            try:
+                mgr._get_conn().execute("SELECT 1").fetchone()
+            except Exception as exc:  # noqa: BLE001 - reporting the race
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        with cf.ThreadPoolExecutor(max_workers=12) as pool:
+            list(pool.map(lambda _: hit(), range(12)))
+
+        assert not errors, errors
+        mgr.close()
+
+    def test_an_interrupt_also_rolls_back(self, temp_db_path):
+        """Ctrl-C lands mid-sync as easily as a bug does, and leaves the
+        same open transaction. `except Exception` does not catch it."""
+        from unittest.mock import MagicMock, patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        conn = MagicMock()
+        with (
+            patch.object(mgr, "_get_conn", return_value=conn),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch(
+                "apple_mail_mcp.index.sync.sync_from_disk",
+                side_effect=KeyboardInterrupt(),
+            ),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            mgr.sync_updates()
+
+        conn.rollback.assert_called_once()
+
+
+class TestTriggersSurviveAFailureBeforeTheLoop:
+    """`DROP TRIGGER` is DDL: it autocommits, and a rollback does not
+    bring the triggers back.
+
+    With the drop outside the `try`, a failure in any statement between
+    it and the loop — a corrupt FTS table makes `'delete-all'` raise —
+    left the database FILE without its triggers. That survives restarts,
+    and from then on every insert lands in `emails` but never in
+    `emails_fts`: body search silently stops seeing new mail.
+    """
+
+    def _trigger_names(self, conn) -> set[str]:
+        return {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+
+    def test_a_failure_while_clearing_leaves_the_triggers_in_place(
+        self, tmp_path
+    ):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import IndexManager
+
+        mgr = IndexManager(db_path=tmp_path / "idx.db")
+        conn = mgr._get_conn()
+        assert self._trigger_names(conn) >= {
+            "emails_ai",
+            "emails_ad",
+            "emails_au",
+        }
+
+        # Fail after the triggers are dropped, exactly where a corrupt
+        # FTS table would. sqlite3.Connection.execute is read-only, so
+        # the connection is wrapped rather than patched.
+        class Failing:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *a, **kw):
+                if "delete-all" in sql:
+                    raise sqlite3.OperationalError("vtable constructor failed")
+                return self._inner.execute(sql, *a, **kw)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        with (
+            patch.object(mgr, "_get_conn", return_value=Failing(conn)),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            pytest.raises(sqlite3.OperationalError),
+        ):
+            mgr.build_from_disk()
+
+        assert self._trigger_names(mgr._get_conn()) >= {
+            "emails_ai",
+            "emails_ad",
+            "emails_au",
+        }, "the database file lost its FTS triggers permanently"

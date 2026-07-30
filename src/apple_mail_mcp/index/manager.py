@@ -138,9 +138,18 @@ class IndexManager:
         """Get or create the database connection (thread-safe)."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = init_database(self._db_path)
-            self._local.conn = conn
+            # init_database() creates the schema and runs migrations, so
+            # it must not run concurrently: with one connection per
+            # thread, several threads hitting a fresh database each try
+            # to create the same tables. Measured on 12 threads:
+            # "vtable constructor failed: emails_fts", "duplicate column
+            # name: emlx_path", and spurious migration notices. The lock
+            # is taken only on a thread's FIRST call — afterwards the
+            # thread-local short-circuits, so there is no ongoing
+            # contention, which is the whole point of this change.
             with self._conn_lock:
+                conn = init_database(self._db_path)
+                self._local.conn = conn
                 self._open_conns.append(conn)
         return conn
 
@@ -327,28 +336,38 @@ class IndexManager:
         capped_mailboxes: set[tuple[str, str]] = set()
         total_indexed = 0
 
-        # Drop the triggers BEFORE clearing, not after: with them in
-        # place the DELETE fires emails_ad once per row, which on a
-        # 64k-message index is minutes of pure trigger work for a table
-        # that is about to be empty anyway.
-        conn.execute("DROP TRIGGER IF EXISTS emails_ai")
-        conn.execute("DROP TRIGGER IF EXISTS emails_ad")
-        conn.execute("DROP TRIGGER IF EXISTS emails_au")
-
-        # Clear existing data for rebuild
-        conn.execute("DELETE FROM attachments")
-        conn.execute("DELETE FROM emails")
-        conn.execute("DELETE FROM sync_state")
-        # With no triggers running, the FTS table has to be emptied
-        # explicitly — one statement instead of one delete per row.
-        conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('delete-all')")
-
         batch: list[tuple] = []
         # Deferred attachment rows: (email_tuple_index, attachments)
         batch_attachments: list[tuple[int, list]] = []
         batch_size = 500
 
+        # NOTE: dropping the triggers happens INSIDE the try. DROP
+        # TRIGGER is DDL and autocommits, so a rollback does not bring
+        # them back — if anything between the drop and the `finally`
+        # raises, the triggers are gone from the database FILE, survive
+        # restarts, and every later insert lands in `emails` but never
+        # in `emails_fts`. Body search then silently stops seeing new
+        # mail. Outside the try, a corrupt FTS table (which makes
+        # 'delete-all' raise) was enough to trigger exactly that.
         try:
+            # Drop the triggers BEFORE clearing, not after: with them in
+            # place the DELETE fires emails_ad once per row, which on a
+            # 64k-message index is minutes of pure trigger work for a
+            # table that is about to be empty anyway.
+            conn.execute("DROP TRIGGER IF EXISTS emails_ai")
+            conn.execute("DROP TRIGGER IF EXISTS emails_ad")
+            conn.execute("DROP TRIGGER IF EXISTS emails_au")
+
+            # Clear existing data for rebuild
+            conn.execute("DELETE FROM attachments")
+            conn.execute("DELETE FROM emails")
+            conn.execute("DELETE FROM sync_state")
+            # With no triggers running, the FTS table has to be emptied
+            # explicitly — one statement instead of one delete per row.
+            conn.execute(
+                "INSERT INTO emails_fts(emails_fts) VALUES('delete-all')"
+            )
+
             for email_data in scan_all_emails(
                 mail_dir, exclude_account_uuids=exclude_account_uuids
             ):
@@ -390,6 +409,12 @@ class IndexManager:
                     batch_attachments = []
 
         finally:
+            # FIRST, before anything else in this block. DROP TRIGGER
+            # autocommits, so this is the only thing that brings them
+            # back; if a statement below throws before it runs, the
+            # database file keeps a schema with no FTS triggers.
+            self._recreate_fts_triggers(conn)
+
             # Flush any remaining partial batch (crash-safe)
             if batch:
                 self._flush_batch(conn, batch, batch_attachments)
@@ -406,46 +431,6 @@ class IndexManager:
                         (account, mailbox, now, count),
                     )
                 conn.commit()
-
-            # Re-enable triggers BEFORE rebuilding FTS to close the
-            # watcher race condition: if the file watcher (or any other
-            # writer) inserts a row after the bulk loop ends but before
-            # the FTS rebuild — or between rebuild and trigger
-            # recreation in the original ordering — that row would land
-            # in `emails` but never enter `emails_fts`. By recreating
-            # triggers first, any concurrent INSERT after this point
-            # fires the trigger normally; the subsequent FTS rebuild
-            # then re-syncs everything in `emails`, double-covering rows
-            # added during the rebuild call itself.
-            conn.executescript("""
-                CREATE TRIGGER IF NOT EXISTS emails_ai
-                AFTER INSERT ON emails BEGIN
-                    INSERT INTO emails_fts(rowid, subject, sender, content)
-                    VALUES (new.rowid, new.subject, new.sender, new.content);
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS emails_ad
-                AFTER DELETE ON emails BEGIN
-                    INSERT INTO emails_fts(
-                        emails_fts, rowid, subject, sender, content
-                    ) VALUES(
-                        'delete', old.rowid, old.subject,
-                        old.sender, old.content
-                    );
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS emails_au
-                AFTER UPDATE ON emails BEGIN
-                    INSERT INTO emails_fts(
-                        emails_fts, rowid, subject, sender, content
-                    ) VALUES(
-                        'delete', old.rowid, old.subject,
-                        old.sender, old.content
-                    );
-                    INSERT INTO emails_fts(rowid, subject, sender, content)
-                    VALUES (new.rowid, new.subject, new.sender, new.content);
-                END;
-            """)
 
             # Rebuild FTS index (must run even if scan crashed
             # mid-iteration, otherwise emails table has rows
@@ -477,6 +462,52 @@ class IndexManager:
         # status call reflects truth.
         self.invalidate_disk_count_cache()
         return total_indexed
+
+    @staticmethod
+    def _recreate_fts_triggers(conn: sqlite3.Connection) -> None:
+        """Restore the FTS sync triggers.
+
+        `DROP TRIGGER` is DDL and autocommits, so a rollback never brings
+        them back. If a build ends without running this, the triggers are
+        gone from the database FILE — surviving restarts — and every
+        later insert lands in `emails` but never in `emails_fts`: body
+        search silently stops seeing new mail.
+
+        Recreated BEFORE the FTS rebuild, which closes the watcher race:
+        a row inserted by the watcher after the bulk loop but before the
+        rebuild would otherwise land in `emails` and never in
+        `emails_fts`. With the triggers back first, such an insert fires
+        normally and the subsequent rebuild re-syncs everything anyway.
+        """
+        conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS emails_ai
+            AFTER INSERT ON emails BEGIN
+                INSERT INTO emails_fts(rowid, subject, sender, content)
+                VALUES (new.rowid, new.subject, new.sender, new.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS emails_ad
+            AFTER DELETE ON emails BEGIN
+                INSERT INTO emails_fts(
+                    emails_fts, rowid, subject, sender, content
+                ) VALUES(
+                    'delete', old.rowid, old.subject,
+                    old.sender, old.content
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS emails_au
+            AFTER UPDATE ON emails BEGIN
+                INSERT INTO emails_fts(
+                    emails_fts, rowid, subject, sender, content
+                ) VALUES(
+                    'delete', old.rowid, old.subject,
+                    old.sender, old.content
+                );
+                INSERT INTO emails_fts(rowid, subject, sender, content)
+                VALUES (new.rowid, new.subject, new.sender, new.content);
+            END;
+        """)
 
     @staticmethod
     def _flush_batch(
@@ -546,7 +577,10 @@ class IndexManager:
                 progress_callback,
                 exclude_account_uuids=exclude_account_uuids,
             )
-        except Exception:
+        except BaseException:
+            # BaseException, not Exception: a Ctrl-C (KeyboardInterrupt)
+            # or a SystemExit lands mid-sync just as easily as a bug,
+            # and leaves exactly the same open transaction behind.
             # A sync that raises mid-run leaves its write transaction
             # open, and every later write then fails with "database is
             # locked" until the process restarts. The index looks dead
