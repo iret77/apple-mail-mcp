@@ -3,7 +3,7 @@
 **Branch:** `iret77:fix/cross-process-write-lock` · **Depends on:** **A6** (and
 through it A5) — same file, both contained in this PR
 
-**Addresses:** #106
+**Related:** #106 — see the scope note below
 
 ---
 
@@ -11,8 +11,7 @@ A `threading.Lock` is not enough. Claude Desktop starts a **second instance** of
 every MCP server (#106), so two processes hold connections to the same SQLite
 file. SQLite allows one writer, and a rebuild holds its transaction for minutes —
 the other process then dies on "database is locked" once `busy_timeout` expires.
-That is how a rebuild failed here in practice, and it is the same root cause as
-the report in #106.
+That is how a rebuild failed here in practice.
 
 ### What changed
 
@@ -28,6 +27,23 @@ It is acquired **non-blocking**, so a second caller is told "already running"
 released **last**, after the final flush and the FTS rebuild — the heaviest
 writes in the program. Releasing early let a waiting sync grab the lock, whose
 open transaction then made those writes fail from inside the `finally`.
+
+### Scope against #106 — what this does *not* fix
+
+#106 reports two `--watch` instances in a reconciliation ping-pong: WAL growth to
+74 MB in 13 minutes and FTS queries blocked for minutes. This PR shares that
+issue's root cause — Claude Desktop spawning two instances that write the same
+SQLite file — and removes the "database is locked" failure and the concurrent
+writers behind the WAL storm, because a second caller is told the work is already
+running instead of queueing.
+
+**But it does not cover the watcher path.** `WriteLock` is taken by
+`build_from_disk()` and `sync_updates()`; `watcher.py` writes without it, so two
+watchers can still duplicate each other's work. Making the watcher take the lock
+needs its own decision — a non-blocking acquire there would *drop* a batch of file
+events rather than defer it, so the queue would have to survive the skip — and I
+did not want to improvise that into this PR. Happy to do it as a follow-up if you
+want it, in whichever shape you prefer.
 
 ### Worth pushing back on
 
@@ -48,7 +64,8 @@ that needs it, so it does not solve the same problem.
   writes are now serialized by a cross-process advisory lock (`flock` on
   `<index>.lock`) paired with the existing thread lock — acquired non-blocking, so
   a second caller is told the build is already running instead of queueing, and
-  released only after the final flush and FTS rebuild. (#106)
+  released only after the final flush and FTS rebuild. The watcher path is not yet
+  covered — see #106. (#106)
 ```
 
 ### Verification

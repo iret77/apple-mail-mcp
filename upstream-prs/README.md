@@ -42,6 +42,16 @@ PAT and lacks the scope for this fork.
 **Nothing in this directory has been sent anywhere.** No PR, no issue, no push
 to upstream.
 
+## Upstream issues these touch
+
+Verified against the tracker rather than assumed:
+
+| Issue | State | Unit |
+|---|---|---|
+| #80 — `APPLE_MAIL_READ_ONLY` is set up but never enforced | closed | **C3** gives the gate something to guard |
+| #90 — account-level index exclusion | closed | **C3**, **D2** keep the boundary intact |
+| #106 — two `--watch` instances cause a write storm | **open** | **A8** removes the concurrent-writer failure, but **not** the watcher path — the PR body says so explicitly rather than claiming the issue |
+
 ## Sequencing (from UPSTREAM_PR_PLAN.md)
 
 1. **First wave:** A1, A3, A4 — three small fixes, reviewable in minutes.
