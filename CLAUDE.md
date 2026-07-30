@@ -27,7 +27,7 @@ src/apple_mail_mcp/
     └── mail_core.js    # Shared JXA utilities (MailCore object)
 ```
 
-## MCP Tools (8 total)
+## MCP Tools (10 total)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -39,6 +39,8 @@ src/apple_mail_mcp/
 | `get_email_links(id)` | Extract links from an email | message_id |
 | `get_email_attachment(id, filename)` | Extract attachment content | message_id, filename |
 | `get_attachment(id, filename)` | *Deprecated* — use `get_email_attachment()` | message_id, filename |
+| `set_flag(ids, color?)` | *Write* — flag/unflag single or batch, optional color | message_ids, color, account?, mailbox? |
+| `set_read_status(ids, read?)` | *Write* — mark read (seen) / unread (unseen) | message_ids, read, account?, mailbox? |
 
 ## MCP Resources (1 total)
 
@@ -323,6 +325,52 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
 
+## Write tools (`set_flag`, `set_read_status`)
+
+The first mutating tools. Both accept a single id or a list and return per-id
+buckets `{updated, unchanged, not_found, skipped_hidden}` (+ optional `failed`,
+`error`, `hint`) — **a batch never fails as a whole**, because a partial success
+is information and an exception is not.
+
+Design points to preserve:
+
+- **Read-only gate first line.** `_ensure_writable()` is the first statement of
+  every mutating tool; the regression test scans this module for write-implying
+  tool names (`set_`/`flag_`/`mark_`/…) and asserts the guard.
+- **A Mail.app id is a per-mailbox ROWID**, so `byId()` has to be told which
+  mailbox. `_resolve_write_targets()` places each id via the index's location
+  resolver (the machinery `get_email` Strategy 2 already uses), then an explicit
+  `account` + `mailbox` hint, then a bounded all-mailbox **scan** of a visible
+  account — mirroring Strategy 3, so writes work with no index at all.
+- **Located and scan groups run in separate `osascript` calls.** A slow or
+  timed-out scan must not discard the fast, precise writes that already
+  succeeded.
+- **`applyToMessage()` re-verifies `msg.id()` before writing.** The id array is a
+  snapshot; if mail arrives or is filed between fetching it and writing,
+  positions shift and the same index points at a different message. On a mismatch
+  it re-resolves by id and skips rather than writing to the wrong mail.
+- **No-ops are skipped, from live state.** Every write is a server round-trip on
+  IMAP/Exchange (and rotates the Exchange ItemId), so `unchanged` is a deliberate
+  outcome — and the current state is read from Mail, never from an index that
+  could be stale.
+- **`not_found` stays a statement about the MESSAGE.** Anything that went wrong
+  on the way — no such account, an unreadable mailbox, Apple Events refused —
+  goes to `failed` with its reason and a cause-specific hint. Merging the two
+  made a broken account lookup look like a batch of deleted mail.
+- **Excluded accounts (#90) never reach JXA.** An id resolving into a hidden
+  account goes to `skipped_hidden`; naming a hidden `account` skips the whole
+  batch at the entry gate.
+- **Nothing untrusted is interpolated into JS.** The mutating statement comes
+  from the operation and a validated int/bool; ids and names cross over only
+  through `json.dumps`.
+
+**Flag colours** are Apple's seven (`msg.flagIndex`: red 0, orange 1, yellow 2,
+green 3, blue 4, purple 5, gray 6), with `color="none"` to unflag and
+`"default"` to flag without forcing a colour. The server attaches **no meaning**
+to any colour — what a colour stands for is the user's own convention, so ask
+rather than assume. No index write is needed: flag and read state are served
+live from the Envelope Index and the `.emlx` footer, not from the cache.
+
 ## Message identity: hand out both, tell the caller which to keep
 
 A Mail.app message id is a **per-mailbox ROWID**. It is exact while the message
@@ -604,6 +652,8 @@ Chart PNGs are committed (they ARE the results). JSON and HTML in `benchmarks/re
 | **DoS via Large Files** | 25 MB file size limit (`MAX_EMLX_SIZE`) | disk.py |
 | **DoS via Spam** | Max emails per mailbox limit (configurable) | manager.py |
 | **Path Traversal** | Path validation in file watcher | watcher.py |
+| **Unauthorized Writes** | `_ensure_writable()` refuses every mutating tool under read-only mode (#80); a regression test scans for write-implying tool names | server.py |
+| **Silent write failure** | `not_found` means only "Mail was reachable and the message was not there". Anything else — no such account, mailbox unreadable, Apple Events refused — goes to `failed` with `error` and a cause-specific hint | server.py, builders.py |
 | **Data Exposure** | Database and attachment cache files created with 0o600 permissions | schema.py, server.py |
 | **Unbounded Memory** | Pending changes limit in watcher | watcher.py |
 | **Excluded-Account Exposure** | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` boundary (#90). Every NEW tool/read path must gate: `_hidden_account()` at tool entry, `exclude_accounts` in SQL search, `_path_in_excluded_account()` before disk reads, `_resolve_visible_account()` before any JXA call that defaults to `Mail.accounts()[0]` | server.py, index/search.py |

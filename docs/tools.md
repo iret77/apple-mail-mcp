@@ -1,6 +1,6 @@
 # Tools
 
-Apple Mail MCP provides **8 MCP tools** — a consolidated API designed for AI assistants.
+Apple Mail MCP provides **10 MCP tools** — a consolidated API designed for AI assistants.
 
 ## Overview
 
@@ -14,6 +14,8 @@ Apple Mail MCP provides **8 MCP tools** — a consolidated API designed for AI a
 | `get_email_links()` | Extract links from an email | `message_id`, `account?`, `mailbox?` |
 | `get_email_attachment()` | Extract attachment content | `message_id`, `filename`, `account?`, `mailbox?` |
 | `get_attachment()` | *Deprecated* — use `get_email_attachment()` | `message_id`, `filename`, `account?`, `mailbox?` |
+| `set_flag()` | *Write* — flag or unflag one or many | `message_ids`, `color?`, `account?`, `mailbox?` |
+| `set_read_status()` | *Write* — mark read or unread | `message_ids`, `read?`, `account?`, `mailbox?` |
 
 ---
 
@@ -284,3 +286,71 @@ Read-only JSON snapshot of FTS5 search-index health. Lets clients render an "ind
   "message": "No index found. Run 'apple-mail-mcp index' to build it."
 }
 ```
+
+---
+
+## Write tools
+
+Two tools change mail state. Both are refused outright in read-only mode
+(`APPLE_MAIL_READ_ONLY=true`, `[server] read_only = true`, or
+`apple-mail-mcp serve -r`).
+
+Both accept a single id or a list and return **per-id buckets** — a batch never
+fails as a whole:
+
+| Bucket | Meaning |
+|--------|---------|
+| `updated` | The write was applied |
+| `unchanged` | The message already held that state, so nothing was written |
+| `not_found` | Mail was reachable and the message was not where it was expected |
+| `skipped_hidden` | The id resolves into an excluded account, so it was never sent to Mail |
+| `failed` (+ `error`, `hint`) | The write never reached the message: no such account, an unreadable mailbox, Apple Events refused |
+
+!!! warning
+    `failed` is **not** a statement about the mail. It means Apple Mail never
+    carried the write out — the message is most likely fine. Only `not_found`
+    says anything about the message itself, and the accompanying `hint` says how
+    complete the search was.
+
+### `set_flag()`
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `message_ids` | `int \| list[int]` | *required* | One id, or up to 500 |
+| `color` | `string?` | `default` | `default` flags without forcing a colour, `none` unflags, or one of `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `gray` |
+| `account` | `string?` | env default | Hint; required together with `mailbox` for ids the index cannot place |
+| `mailbox` | `string?` | `INBOX` | Hint, as above |
+
+```python
+set_flag(12345, color="red")
+# → {"updated": [12345], "unchanged": [], "not_found": [], "skipped_hidden": []}
+
+set_flag([1, 2, 3], color="none")   # unflag a batch
+```
+
+!!! note
+    The server attaches **no meaning** to any flag colour — what a colour stands
+    for is your own convention. An assistant should ask rather than assume.
+
+### `set_read_status()`
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `message_ids` | `int \| list[int]` | *required* | One id, or up to 500 |
+| `read` | `bool?` | `true` | `true` marks as read (seen), `false` as unread |
+| `account` | `string?` | env default | Hint, as for `set_flag()` |
+| `mailbox` | `string?` | `INBOX` | Hint, as for `set_flag()` |
+
+```python
+set_read_status([1, 2, 3])          # mark read
+set_read_status(12345, read=False)  # back to unread
+```
+
+!!! tip
+    A message that already holds the requested state lands in `unchanged` rather
+    than being written again. That is deliberate: every write is a server
+    round-trip on IMAP/Exchange accounts.

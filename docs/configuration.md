@@ -113,6 +113,12 @@ same information after the fact.
 
 ## Read-only mode
 
+!!! note
+    As of the write tools (`set_flag`, `set_read_status`), this setting guards
+    real mutations: both refuse to run and raise a `PermissionError` naming the
+    setting. Read tools are unaffected.
+
+
 Use `--read-only` (or `-r`) on the `serve` command to prevent any write
 operations. This can also be set via the `APPLE_MAIL_READ_ONLY`
 environment variable or `[server] read_only = true` in `config.toml`.
