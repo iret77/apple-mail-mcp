@@ -366,13 +366,9 @@ async def list_mailboxes(account: str | None = None) -> list[Mailbox]:
     List all mailboxes for an email account.
 
     Args:
-        account: Account name, or "all" (or "*") to list across EVERY
-                 visible account in one call — each row then carries an
-                 `account` field, since a flat list is otherwise
-                 impossible to group. Both spellings are reserved: an
-                 account literally named "all" cannot be targeted by
-                 name. Uses APPLE_MAIL_DEFAULT_ACCOUNT env var or the
-                 first account if not specified.
+        account: Account name. Uses APPLE_MAIL_DEFAULT_ACCOUNT env var or
+                 first account if not specified. (This tool has no "all"
+                 mode — only get_emails() does.)
 
     Returns:
         List of mailbox dictionaries with 'name' and 'unreadCount' fields.
@@ -527,6 +523,7 @@ async def get_emails(
                     mailbox_name=target_mailbox,
                     filter_kind=filter,
                     limit=limit,
+                    exclude_account_uuids=excluded_uuids,
                 )
                 return [
                     EmailSummary(

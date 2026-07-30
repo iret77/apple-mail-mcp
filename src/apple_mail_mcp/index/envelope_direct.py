@@ -178,6 +178,7 @@ def fetch_recent_messages(
     mailbox_name: str | None,
     filter_kind: str,
     limit: int,
+    exclude_account_uuids: set[str] | None = None,
 ) -> list[EnvelopeMessageRow]:
     """Read up to `limit` recent messages via direct SQL.
 
@@ -195,6 +196,9 @@ def fetch_recent_messages(
         envelope_path: Path to Apple's Envelope Index SQLite.
         account_uuid: Account UUID to restrict to, or None for
             all accounts.
+        exclude_account_uuids: Accounts to leave out of the query
+            entirely. Filtering them from the result instead would let
+            them consume the LIMIT.
         mailbox_name: Mailbox name to restrict to (matched
             case-insensitively against the percent-decoded URL
             path or its final segment), or None for all mailboxes
@@ -222,6 +226,7 @@ def fetch_recent_messages(
             mailbox_name=mailbox_name,
             filter_kind=filter_kind,
             limit=limit,
+            exclude_account_uuids=exclude_account_uuids,
         )
     finally:
         conn.close()
@@ -234,6 +239,7 @@ def _fetch_recent_messages(
     mailbox_name: str | None,
     filter_kind: str,
     limit: int,
+    exclude_account_uuids: set[str] | None = None,
 ) -> list[EnvelopeMessageRow]:
     """Body of fetch_recent_messages, on an open connection."""
     where_clauses: list[str] = ["m.deleted = 0"]
@@ -261,6 +267,15 @@ def _fetch_recent_messages(
     elif account_uuid:
         where_clauses.append("mb.url LIKE ?")
         params.append(f"%://{account_uuid}/%")
+
+    # Excluded accounts are filtered HERE, not after the fact. Dropping
+    # them from the returned rows leaves them counted against LIMIT: if
+    # hidden mail happens to be the newest 50 messages, a caller asking
+    # for 50 gets an empty list, and the next page skips visible mail it
+    # never saw.
+    for hidden in sorted(exclude_account_uuids or ()):
+        where_clauses.append("mb.url NOT LIKE ?")
+        params.append(f"%://{hidden}/%")
 
     if filter_kind == "unread":
         where_clauses.append("m.read = 0")

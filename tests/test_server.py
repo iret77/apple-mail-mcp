@@ -1913,3 +1913,64 @@ class TestCrossAccountListing:
             from apple_mail_mcp.server import get_emails
 
             await get_emails(account="all")
+
+
+class TestHiddenMailDoesNotConsumeThePage:
+    """Excluded accounts are filtered in the QUERY, not afterwards.
+
+    Dropping their rows from the result leaves them counted against
+    LIMIT: if hidden mail happens to be the newest 50 messages, a caller
+    asking for 50 receives an empty list, and the next page skips
+    visible mail it never saw.
+    """
+
+    def test_the_query_excludes_them(self, tmp_path):
+        import sqlite3
+
+        from apple_mail_mcp.index.envelope_direct import (
+            fetch_recent_messages,
+        )
+
+        path = tmp_path / "Envelope Index"
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE messages (
+                ROWID INTEGER PRIMARY KEY, message_id INTEGER,
+                subject INTEGER, sender INTEGER, date_received INTEGER,
+                mailbox INTEGER, read INTEGER, flagged INTEGER,
+                deleted INTEGER DEFAULT 0
+            );
+            CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
+            CREATE TABLE addresses (
+                ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT
+            );
+            CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);
+            INSERT INTO mailboxes VALUES (1, 'imap://uuid-secret/INBOX');
+            INSERT INTO mailboxes VALUES (2, 'imap://uuid-work/INBOX');
+            INSERT INTO addresses VALUES (1, 'a@x', '');
+        """)
+        # The two NEWEST messages are in the hidden account.
+        for rid, mbox, ts in ((1, 1, 3000), (2, 1, 2000), (3, 2, 1000)):
+            conn.execute("INSERT INTO subjects VALUES (?, ?)", (rid, f"m{rid}"))
+            conn.execute(
+                "INSERT INTO messages (ROWID, message_id, subject, sender,"
+                " date_received, mailbox, read, flagged, deleted)"
+                " VALUES (?, ?, ?, 1, ?, ?, 0, 0, 0)",
+                (rid, rid, rid, ts, mbox),
+            )
+        conn.commit()
+        conn.close()
+
+        rows = fetch_recent_messages(
+            path,
+            account_uuid=None,
+            mailbox_name=None,
+            filter_kind="all",
+            limit=2,
+            exclude_account_uuids={"uuid-secret"},
+        )
+
+        assert [r.subject for r in rows] == ["m3"], (
+            "hidden mail consumed the page and the visible message "
+            "never appeared"
+        )
