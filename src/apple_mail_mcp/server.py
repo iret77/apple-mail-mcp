@@ -464,6 +464,15 @@ async def get_emails(
         >>> get_emails(before="2026-01-01")  # walk into the backlog
     """
     limit, offset = _validate_pagination(limit, offset)
+    if before_id is not None and before is None:
+        # Silently ignoring it returns the NEWEST page, which a caller
+        # paging backwards reads as "start again" — an endless loop over
+        # the same rows. The two halves of the cursor belong together.
+        raise ValueError(
+            "`before_id` is the second half of a cursor and needs "
+            "`before` as well: pass the `date_received` and the `id` of "
+            "the oldest row you have seen."
+        )
     before_ts = _parse_date_bound(before, "before")
     after_ts = _parse_date_bound(after, "after")
     if _hidden_account(account):

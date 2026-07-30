@@ -1844,3 +1844,16 @@ class TestEnvelopeWindowSql:
     def test_a_window_and_offset_compose(self, tmp_path):
         rows = self._fetch(self._db(tmp_path), before=4000, offset=1)
         assert [r.subject for r in rows] == ["msg 2000", "msg 1000"]
+
+
+class TestHalfACursorIsRefused:
+    """`before_id` without `before` used to be dropped, and the caller
+    got the NEWEST page back — which a backwards walk reads as "start
+    again", looping over the same rows forever."""
+
+    @pytest.mark.asyncio
+    async def test_before_id_without_before_is_an_error(self):
+        from apple_mail_mcp.server import get_emails
+
+        with pytest.raises(ValueError, match="second half of a cursor"):
+            await get_emails(before_id=123)
