@@ -33,6 +33,7 @@ import sqlite3
 import warnings
 from dataclasses import dataclass
 from email.header import decode_header, make_header
+from email.message import Message
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -322,7 +323,7 @@ def _format_timestamp(timestamp: float | int | None) -> str:
         return ""
 
 
-def _filename_text(part) -> str:
+def _filename_text(part: Message) -> str:
     """Attachment filename as plain text.
 
     ``get_filename()`` is header-derived and can hand back a ``Header``
@@ -343,7 +344,7 @@ def _filename_text(part) -> str:
         return str(raw)
 
 
-def header_text(message, name: str, default: str = "") -> str:
+def header_text(message: Message, name: str, default: str = "") -> str:
     """Return a header as plain, decoded text — always a real ``str``.
 
     Python's email parser returns a ``Header`` object instead of a

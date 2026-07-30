@@ -291,6 +291,16 @@ def sync_from_disk(
         except Exception as e:
             logger.debug("Failed to parse %s: %s", path, e)
             errors += 1
+            # A failure AFTER the email row went in leaves a half-indexed
+            # message: the row exists, so the next sync sees the id in
+            # the DB inventory and never revisits it — its attachments
+            # stay missing forever, and the DLQ row says "will retry"
+            # about something nothing will retry. Remove the partial row
+            # so the message is genuinely absent and gets another chance.
+            try:
+                conn.execute("DELETE FROM emails WHERE emlx_path = ?", (path,))
+            except sqlite3.Error:
+                logger.debug("Could not remove partial row for %s", path)
             # Record into the DLQ for visibility / future retry.
             try:
                 conn.execute(

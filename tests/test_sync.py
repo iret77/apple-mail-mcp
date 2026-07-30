@@ -359,3 +359,49 @@ class TestOneBadMessageCannotAbortTheSync:
             (str(bad),),
         ).fetchone()
         assert row is not None and row[0] == "AttributeError"
+
+
+class TestAPartialInsertIsNotLeftBehind:
+    """A failure AFTER the email row went in leaves a half-indexed
+    message: the row exists, so the next sync sees the id in the DB
+    inventory and never revisits it. Its attachments stay missing
+    forever, while the DLQ row claims it will be retried."""
+
+    def test_the_row_is_removed_so_the_next_sync_retries(
+        self, temp_db, tmp_path
+    ):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.sync import sync_from_disk
+
+        mail_dir = tmp_path / "V10"
+        box = mail_dir / "ACCT" / "INBOX.mbox" / "Data" / "Messages"
+        box.mkdir(parents=True)
+        emlx = box / "1.emlx"
+        mime = (
+            b"From: a@b.com\r\nSubject: s\r\n"
+            b"Date: Mon, 1 Jan 2026 10:00:00 +0100\r\n"
+            b'Content-Type: multipart/mixed; boundary="B"\r\n\r\n--B\r\n'
+            b"Content-Type: text/plain\r\n\r\nbody\r\n--B\r\n"
+            b"Content-Type: application/pdf\r\n"
+            b'Content-Disposition: attachment; filename="a.pdf"\r\n\r\n'
+            b"XX\r\n--B--\r\n"
+        )
+        emlx.write_bytes(f"{len(mime)}\n".encode() + mime + b"<plist/>")
+
+        # The email row goes in; the attachments do not.
+        with patch(
+            "apple_mail_mcp.index.sync.insert_attachments",
+            side_effect=sqlite3.ProgrammingError("bad parameter"),
+        ):
+            sync_from_disk(temp_db, mail_dir)
+
+        rows = temp_db.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
+        assert rows == 0, (
+            "a half-indexed message stayed in the index, so the next "
+            "sync will skip it and its attachments are lost for good"
+        )
+        dlq = temp_db.execute(
+            "SELECT COUNT(*) FROM failed_index_jobs"
+        ).fetchone()[0]
+        assert dlq == 1
