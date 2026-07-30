@@ -134,7 +134,9 @@ Strategy 2: Index lookup + JXA   ← finds mailbox via SQLite, then JXA
 Strategy 3: Iterate all mailboxes ← slowest, always works (with timeout)
 ```
 
-All strategies return an identical response schema. Strategy 0 extracts read/flagged status from the plist footer flags bitmask (bit 0 = read, bit 4 = flagged) and `date_sent`, `reply_to`, `message_id` from MIME headers.
+All strategies return an identical response schema. Strategy 0 reads `date_sent`, `reply_to` and `message_id` from the MIME headers.
+
+Read and flagged state does **not** come from the `.emlx` footer. The plist footer carries a flags bitmask (bit 0 = read, bit 4 = flagged), but Mail does not reliably rewrite the file when that state changes — a message read on another device keeps its old bits for as long as the file lives. Both fields are therefore overlaid from Apple's Envelope Index with one read-only `SELECT`, and the bitmask is used only as the fallback when that database cannot be read.
 
 ---
 

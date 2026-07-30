@@ -1737,3 +1737,67 @@ class TestLiveFlagOverlay:
 
         assert fetch_message_flags(env, rowid) == (True, False)
         assert fetch_message_flags(env, 9999) is None
+
+
+class TestStrategy0OverlaysFlagsEndToEnd:
+    """Testing the helper is not testing the tool.
+
+    Every existing test here drives `_overlay_live_flags()` directly, so
+    deleting the single `await _overlay_live_flags(...)` call inside
+    `get_email()` leaves them all green while the tool goes back to
+    reporting whatever the `.emlx` footer said.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_email_returns_the_live_flags(self, tmp_path):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        emlx = tmp_path / "42.emlx"
+        emlx.write_bytes(b"stub")
+
+        parsed = MagicMock()
+        parsed.id = 42
+        parsed.subject = "s"
+        parsed.sender = "a@x"
+        parsed.content = "body"
+        parsed.date_received = "2026-07-28T10:00:00"
+        parsed.date_sent = "2026-07-28T09:00:00"
+        parsed.reply_to = ""
+        parsed.message_id_header = "<a@x>"
+        parsed.attachments = []
+        # What the footer claims — stale.
+        parsed.read = False
+        parsed.flagged = False
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.find_email_path.return_value = emlx
+        amap = MagicMock()
+        amap.ensure_loaded = AsyncMock()
+        amap.name_to_uuid.return_value = "uuid-work"
+        amap.names_to_uuids.return_value = set()
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch("apple_mail_mcp.index.disk.parse_emlx", return_value=parsed),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_message_flags",
+                # What Mail actually knows.
+                return_value=(True, True),
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            from apple_mail_mcp.server import get_email
+
+            out = await get_email(42, account="Work", mailbox="INBOX")
+
+        assert out["read"] is True, "footer said unread; Mail says read"
+        assert out["flagged"] is True
