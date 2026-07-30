@@ -315,15 +315,20 @@ German install.
    account and then the application. Language- and provider-independent where
    the property exists; the probe never throws, it returns null and the chain
    continues.
-3. **Normalized match** — `normalizeMailboxName()` lowercases and drops
-   provider hierarchy (`[Gmail]/…`, a leading `INBOX.`), then compares the last
-   path segment. This is what makes `INBOX.Sent` answer a request for `Sent`.
-4. **The role table** (`MAILBOX_ROLES`) — localized and legacy names, covering
+3. **The role table** (`MAILBOX_ROLES`) — localized and legacy names, covering
    de, fr, es, it, pt-BR, nl, sv, da, fi, no, pl, ru, tr, ja, ko, zh-Hans and
    zh-Hant. **Every entry is sourced from Apple's localized Mail user guide or
    is a documented provider/legacy name.** Do not add a translation you have not
    verified: a wrong name here is worse than a missing one, because it can match
    somebody's real folder.
+4. **Normalized match** — `normalizeMailboxName()` lowercases and drops
+   provider hierarchy (`[Gmail]/…`, a leading `INBOX.`), then compares the last
+   path segment. This is what makes `INBOX.Sent` answer a request for `Sent`.
+   **It runs after the role table, and that order is load-bearing:** dropping
+   hierarchy makes a user's own `Projects/INBOX` normalize to "inbox", so on a
+   German account holding `Posteingang` *and* `Projects/INBOX` the generic match
+   answered a request for the inbox with the subfolder — silently, on reads and
+   writes alike.
 5. **Fail loudly** — the error names the role and lists the mailboxes that
    actually exist, so the caller can act on it.
 

@@ -219,3 +219,64 @@ const account = {{ mailboxes }};
             f"console.log(MailCore.isDiscardMailbox({name!r}));"
         )
         assert got == ("true" if discard else "false")
+
+
+class TestARoleRequestIsNotAnsweredByAUserFolder:
+    """Order matters between the role table and the normalized match.
+
+    Normalization drops provider hierarchy, so a user's own
+    `Projects/INBOX` normalizes to "inbox". With the generic match
+    running first, a German account holding `Posteingang` **and**
+    `Projects/INBOX` answered a request for the inbox with the
+    subfolder — the wrong mailbox, silently, on a read or a write.
+    """
+
+    def _resolve(self, names, wanted):
+        import json
+        import subprocess
+
+        js = f"""
+var Mail = {{}};
+const MailCore = {_mail_core_literal()};
+const names = {json.dumps(names)};
+const mailboxes = {{}};
+Object.defineProperty(mailboxes, 'name', {{ value: () => names }});
+mailboxes.byName = (n) => {{
+    if (names.includes(n)) return {{ name: () => n }};
+    throw new Error('-1728');
+}};
+const account = {{ mailboxes }};
+try {{
+    console.log(JSON.stringify(
+        String(MailCore.getMailbox(account, {json.dumps(wanted)}).name())
+    ));
+}} catch (e) {{ console.log(JSON.stringify(null)); }}
+"""
+        out = subprocess.run(
+            [_node_bin(), "-e", js],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    def test_a_localized_inbox_wins_over_a_lookalike_subfolder(self):
+        assert (
+            self._resolve(["Posteingang", "Projects/INBOX"], "INBOX")
+            == "Posteingang"
+        )
+
+    def test_provider_hierarchy_still_resolves(self):
+        assert (
+            self._resolve(["[Gmail]/Sent Mail", "INBOX"], "Sent Mail")
+            == "[Gmail]/Sent Mail"
+        )
+
+    def test_a_non_role_name_still_uses_the_normalized_match(self):
+        """The reorder must not break ordinary folders: `Projects` has
+        no role, so shape matching is all there is."""
+        assert (
+            self._resolve(["INBOX", "INBOX.Projects"], "Projects")
+            == "INBOX.Projects"
+        )
