@@ -180,6 +180,9 @@ class IndexManager:
         "clearing": 120.0,
         "reading_metadata": 600.0,
         "indexing": 120.0,
+        # The FTS rebuild is one long statement with no progress to
+        # report; on a large index it legitimately runs for minutes.
+        "finalizing": 600.0,
     }
 
     def build_progress(self) -> dict | None:
@@ -271,9 +274,18 @@ class IndexManager:
         """Get or create the database connection (thread-safe)."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = init_database(self._db_path)
-            self._local.conn = conn
+            # init_database() creates the schema and runs migrations, so
+            # it must not run concurrently: with one connection per
+            # thread, several threads hitting a fresh database each try
+            # to create the same tables. Measured on 12 threads:
+            # "vtable constructor failed: emails_fts", "duplicate column
+            # name: emlx_path", and spurious migration notices. The lock
+            # is taken only on a thread's FIRST call — afterwards the
+            # thread-local short-circuits, so there is no ongoing
+            # contention, which is the whole point of this change.
             with self._conn_lock:
+                conn = init_database(self._db_path)
+                self._local.conn = conn
                 self._open_conns.append(conn)
         return conn
 
@@ -564,8 +576,12 @@ class IndexManager:
             # The build is no longer running, however it ended. Set
             # before the flush below so a failure in cleanup cannot
             # leave a phantom in-progress build on display.
-            self._building = False
-            self._build_progress = None
+            # NOT cleared here. The heaviest writes in the program run
+            # below — the final flush and the FTS rebuild — and a status
+            # call during them would report "ready", which also lets a
+            # fresh disk walk start against a database still being
+            # rewritten. The flag is cleared once the cleanup is done.
+            self._mark_progress("finalizing")
 
             # Nothing was opened (Mail unreadable, say): no schema
             # state to restore. A conditional rather than an early
@@ -654,6 +670,10 @@ class IndexManager:
                             f"hit cap ({max_per_mailbox})"
                         )
                         progress_callback(total_indexed, total_indexed, msg)
+
+            # Cleanup is complete: only now is the build really over.
+            self._building = False
+            self._build_progress = None
 
         # Disk inventory just changed — drop the cache so the next
         # status call reflects truth.

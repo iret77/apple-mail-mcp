@@ -1840,3 +1840,89 @@ class TestIndexStatusTool:
 
         assert r["state"] == "ready"
         assert "walk exploded" in r["stats_error"]
+
+
+class TestStatusDoesNotMisreadTheFinalPhase:
+    """Two ways `get_index_status()` misread the world."""
+
+    @pytest.mark.asyncio
+    async def test_absent_mail_is_not_diagnosed_as_a_permission_problem(
+        self, tmp_path
+    ):
+        """On a Mac where Mail was never set up there is nothing to
+        read. Sending that user to Full Disk Access has them grant
+        access to a directory that does not exist."""
+        from unittest.mock import MagicMock, patch
+
+        mgr = MagicMock()
+        mgr.is_building.return_value = False
+        mgr.has_index.return_value = False
+        mgr.indexed_email_count.return_value = 0
+        mgr.last_error = None
+        mgr.recent_events.return_value = []
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=FileNotFoundError("no ~/Library/Mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert "Full Disk Access" not in r["problem"]
+        assert "not a permissions problem" in r["user_message"]
+
+    def test_the_build_flag_outlives_the_bulk_loop(self, tmp_path):
+        """The final flush and the FTS rebuild are the heaviest writes in
+        the program. Reporting "ready" during them also lets a fresh disk
+        walk start against a database still being rewritten."""
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import IndexManager
+
+        mgr = IndexManager(db_path=tmp_path / "idx.db")
+        seen: list[bool] = []
+
+        def one_email(*a, **kw):
+            yield {
+                "id": 1,
+                "account": "acct",
+                "mailbox": "INBOX",
+                "subject": "s",
+                "sender": "a@x",
+                "content": "body",
+                "date_received": "2026-07-28",
+                "emlx_path": "/tmp/1.emlx",
+                "attachments": [],
+            }
+
+        real_rebuild = None
+
+        def spy(conn):
+            # Called during finalization — the build must still say so.
+            seen.append(mgr.is_building())
+            return real_rebuild(conn)
+
+        from apple_mail_mcp.index import manager as mgr_mod
+
+        real_rebuild = mgr_mod.rebuild_fts_index
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                side_effect=one_email,
+            ),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            patch.object(mgr_mod, "rebuild_fts_index", side_effect=spy),
+        ):
+            mgr.build_from_disk()
+
+        assert seen == [True], "status said 'ready' mid-finalization"
+        assert mgr.is_building() is False

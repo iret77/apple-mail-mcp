@@ -1513,11 +1513,21 @@ async def get_index_status() -> dict:
     # failure (no Full Disk Access) and it must be reported even when
     # no index exists yet.
     mail_dir_accessible = True
+    mail_dir_missing = False
     mail_dir: str | None = None
     try:
         from .index.disk import find_mail_directory
 
         mail_dir = str(await asyncio.to_thread(find_mail_directory))
+    except FileNotFoundError as exc:
+        # No ~/Library/Mail at all. Diagnosing that as a missing
+        # permission sends the user into System Settings to grant access
+        # to something that does not exist — Mail has simply never been
+        # set up on this Mac.
+        mail_dir_accessible = False
+        mail_dir = None
+        mail_dir_missing = True
+        logger.debug("Mail directory absent: %s", exc)
     except Exception as exc:
         mail_dir_accessible = False
         mail_dir = None
@@ -1610,6 +1620,24 @@ async def get_index_status() -> dict:
     # Raw fields alone leave a non-technical user stranded: derive an
     # explicit diagnosis plus ordered, GUI-first steps the assistant can
     # read out verbatim.
+    if mail_dir_missing:
+        # Not a permission problem: there is nothing to read.
+        result["problem"] = (
+            "No Apple Mail data directory on this Mac "
+            "(~/Library/Mail is absent)."
+        )
+        result["next_steps"] = [
+            "Open Mail.app and add at least one account.",
+            "Let it finish downloading, then ask for the index status again.",
+        ]
+        result["user_message"] = (
+            "There is no Apple Mail archive on this machine yet — Mail "
+            "has not been set up, so there is nothing to index. This is "
+            "not a permissions problem."
+        )
+        result["recent_events"] = manager.recent_events()
+        return result
+
     problem, note, next_steps, user_message = _index_guidance(
         state=state,
         mail_dir_accessible=mail_dir_accessible,
