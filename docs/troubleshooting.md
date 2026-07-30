@@ -112,6 +112,33 @@ silently using degraded config.
 - **Force a retry** by rebuilding the index: `apple-mail-mcp rebuild`. This re-parses every `.emlx` from disk; entries that succeed are removed from the DLQ.
 - **DLQ writes themselves failing** (logged at `ERROR` level with `"DLQ write failed"`): indicates a deeper problem — disk full or DB corruption. Check disk space and SQLite integrity (`PRAGMA integrity_check;`).
 
+## Mailbox Not Found on a Localized Mail
+
+**Symptom:** `get_emails()` or `get_email()` reports that a mailbox does not
+exist, on a Mail whose interface is not in English — `INBOX`, `Sent` or `Trash`
+cannot be found even though you can see them in the sidebar.
+
+**Cause:** A mailbox name is provider- and language-specific. A German install
+has `Posteingang`, older macOS wrote `Eingang`, Exchange uses `Deleted Items`,
+Gmail nests everything under `[Gmail]/`, and dovecot-style servers prefix with
+`INBOX.`. Asking for the literal string `INBOX` matches none of them.
+
+**Fix:** Nothing, in current versions — resolution goes by *role* rather than by
+name: Mail's own `sentMailbox` / `draftsMailbox` / `trashMailbox` /
+`junkMailbox` properties first, then a normalized comparison that strips
+provider hierarchy, then a table of localized names taken from Apple's own
+localized Mail user guide.
+
+If a mailbox still cannot be resolved, the error lists the mailboxes that
+actually exist in that account — pass one of those names verbatim. If your
+language is missing from the table, that is a bug worth reporting: include the
+exact names Mail shows and your system language.
+
+!!! note
+    Only *well-known* mailboxes are resolved by role. A mailbox you created
+    yourself is matched by name, normalized (case and provider prefix), so
+    `INBOX.Projects` answers a request for `Projects`.
+
 ## Mail.app Not Running
 
 **Symptom:** JXA-fallback tools (`list_mailboxes`, `get_email` cascade strategies 1–3, cold `list_accounts()` calls, and `get_emails()` when the Envelope Index path is unavailable) fail with AppleScript errors.
