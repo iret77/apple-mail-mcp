@@ -267,6 +267,36 @@ try {{
             == "Posteingang"
         )
 
+    def test_it_wins_regardless_of_listing_order(self):
+        """The first version of this test only listed the real inbox
+        first, so it passed while the defect was still there — the role
+        table itself matched the subfolder, because normalization drops
+        the hierarchy before comparing."""
+        assert (
+            self._resolve(["Projects/INBOX", "Posteingang"], "INBOX")
+            == "Posteingang"
+        )
+
+    def test_a_nested_folder_cannot_claim_a_role_on_its_own(self):
+        """With no real inbox present, a nested lookalike must not be
+        promoted into the role — the request fails loudly, naming what
+        does exist, and stage 1 still matches the exact name."""
+        assert self._resolve(["Projects/INBOX"], "INBOX") is None
+        assert (
+            self._resolve(["Projects/INBOX"], "Projects/INBOX")
+            == "Projects/INBOX"
+        )
+
+    def test_provider_hierarchy_is_still_hierarchy_we_may_ignore(self):
+        """The distinction is provider prefix versus user folder:
+        "[Gmail]/Sent Mail" and "INBOX.Sent" are the same mailbox under a
+        different naming scheme; "Projects/INBOX" is not."""
+        assert (
+            self._resolve(["[Gmail]/Trash", "INBOX"], "Trash")
+            == "[Gmail]/Trash"
+        )
+        assert self._resolve(["INBOX", "INBOX.Trash"], "Trash") == "INBOX.Trash"
+
     def test_provider_hierarchy_still_resolves(self):
         assert (
             self._resolve(["[Gmail]/Sent Mail", "INBOX"], "Sent Mail")

@@ -120,6 +120,25 @@ const MailCore = {
     },
 
     /** Which well-known role does this name denote, if any? */
+    /**
+     * True when `name` is a mailbox Mail itself would place at the top
+     * of an account, rather than a folder the user nested somewhere.
+     *
+     * The distinction decides whether the role table may claim it.
+     * `normalizeMailboxName` deliberately drops hierarchy, so
+     * "Projects/INBOX" — somebody's own subfolder — reduces to "inbox"
+     * and would otherwise answer a request for the real inbox. Only the
+     * PROVIDER prefixes are hierarchy we are entitled to ignore:
+     * "[Gmail]/Sent Mail" and dovecot's "INBOX.Sent" are the same
+     * mailbox under a different naming scheme; "Projects/INBOX" is not.
+     */
+    isTopLevelMailbox(name) {
+        let n = String(name == null ? "" : name).trim();
+        n = n.replace(/^\[[^\]]*\][\/.]?/, "");   // "[Gmail]/…"
+        n = n.replace(/^INBOX[\/.]/i, "");        // "INBOX.Sent"
+        return !/[\/.]/.test(n);
+    },
+
     mailboxRole(name) {
         const n = this.normalizeMailboxName(name);
         if (!n) return null;
@@ -212,7 +231,14 @@ const MailCore = {
         //    role; only a non-role name falls through to shape matching.
         if (role) {
             for (const actual of names) {
-                if (this.mailboxRole(actual) === role) {
+                // A nested user folder must not claim a role. Without
+                // the top-level test, "Projects/INBOX" answers a request
+                // for the inbox whenever it happens to be listed first —
+                // and a test that fixes the listing order hides it.
+                if (
+                    this.mailboxRole(actual) === role &&
+                    this.isTopLevelMailbox(actual)
+                ) {
                     return account.mailboxes.byName(actual);
                 }
             }
@@ -223,9 +249,15 @@ const MailCore = {
         //    "INBOX.Projects" answers "Projects".
         const wanted = this.normalizeMailboxName(name);
         for (const actual of names) {
-            if (this.normalizeMailboxName(actual) === wanted) {
-                return account.mailboxes.byName(actual);
-            }
+            if (this.normalizeMailboxName(actual) !== wanted) continue;
+            // When a ROLE was requested, only a top-level mailbox may
+            // answer it here too. Otherwise an account whose only
+            // "inbox-shaped" name is the user's own "Projects/INBOX"
+            // silently reads and writes in that subfolder. Failing
+            // loudly lists what does exist, and the caller can name it
+            // exactly — stage 1 still matches an exact name.
+            if (role && !this.isTopLevelMailbox(actual)) continue;
+            return account.mailboxes.byName(actual);
         }
 
         // 5. Nothing matched. Name what IS there: the caller can only
