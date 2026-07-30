@@ -12,12 +12,16 @@ kilobytes.
 
 ### What changed
 
-`get_email` also takes a list of up to 50 ids and returns one entry per id, in the
-order given, each either `{"ref", "email"}` or `{"ref", "error"}`.
+`get_email` also takes a list of up to 50 ids and returns one entry per
+**distinct** id, in the order given, each either `{"ref", "email"}` or
+`{"ref", "error"}`. A repeated id is read once — the same id twice is the same
+message — so the result can be shorter than the input; if you would rather have
+positional alignment with the request, say so and I will keep the duplicates.
 
 - **One unreadable message never sinks the batch** — the caller asked about 50
   messages, and 49 answers are worth more than one exception.
-- **Duplicates are read once.**
+- **Duplicates are read once**, which is why the answer is one entry per
+  distinct id rather than per submitted element.
 - **A single id keeps its old single-object shape**, so existing callers and their
   parsers are untouched.
 - The cascade moves into `_get_email_by_id()` unchanged; `get_email` becomes the

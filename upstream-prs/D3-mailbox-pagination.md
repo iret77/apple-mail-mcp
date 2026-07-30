@@ -27,15 +27,28 @@ more than it sounds: a silently ignored window returns the same newest N on ever
 page, so the caller pages forever and concludes the backlog is empty. An error is
 the only honest answer when the window cannot be applied.
 
+### The cursor is `(before, before_id)`
+
+Mail stores whole seconds, so a timestamp alone is not a position. Reproduced:
+three messages received in the same second with `limit=2` — page one returns
+two, page two with `before=<oldest date_received>` returns **nothing**, and the
+third message is unreachable forever. That is the defect this unit exists to
+remove, reintroduced at the page boundary.
+
+So `before_id` carries the ROWID tie-break, the ordering becomes
+`date_received DESC, ROWID DESC` to give it a defined meaning, and both values
+are fields of the last row the caller already saw — no new concept. `before`
+alone still works where timestamps are distinct; `before_id` without `before` is
+refused, because silently ignoring it returns the newest page and a backwards
+walk reads that as "start again".
+
 ### Worth pushing back on
 
-- `before`/`after` are exclusive (`<` / `>`), so handing back the oldest
-  `date_received` you saw cannot re-deliver that same row. With second resolution,
-  two messages sharing a timestamp at a page boundary could be skipped — a
-  `(date, rowid)` keyset cursor would be exact, at the cost of a compound
-  parameter.
-- Three new parameters on an already wide tool. They are all optional and default
-  to today's behaviour.
+- Four new parameters on an already wide tool. All optional, all defaulting to
+  today's behaviour — but if you would rather have one opaque `cursor` string
+  than `before` + `before_id`, that is a reasonable trade and easy to change.
+- The tie-break assumes ROWID order agrees with arrival order within one second,
+  which holds for Apple's Envelope Index but is an assumption.
 
 ### Changelog
 

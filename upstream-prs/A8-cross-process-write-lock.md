@@ -23,10 +23,23 @@ That is how a rebuild failed here in practice.
   not — they share the same file description.
 
 It is acquired **non-blocking**, so a second caller is told "already running"
-(`IndexBusyError`) instead of queueing behind a multi-minute rebuild, and it is
-released **last**, after the final flush and the FTS rebuild — the heaviest
-writes in the program. Releasing early let a waiting sync grab the lock, whose
-open transaction then made those writes fail from inside the `finally`.
+(`IndexBusyError`) instead of queueing behind a multi-minute rebuild. Within
+`build_from_disk()` it is released **last** — after the final flush and the FTS
+rebuild, the heaviest writes in the program. Releasing early let a waiting sync
+grab the lock, whose open transaction then made those writes fail from inside the
+`finally`.
+
+`rebuild()` is the one place that hands the lock over rather than holding it
+throughout: it takes the lock for its own DELETE, releases it, and calls
+`build_from_disk()`, which takes it again. There is a gap between the two, so
+`rebuild()` is serialized against other writers in each half rather than as one
+atomic operation. Closing that would mean a reentrant lock; it did not seem worth
+the machinery, but say the word.
+
+Every acquire is paired with a `finally`, including the paths that can fail
+before any work starts — an unreadable mail directory, a JXA failure while
+resolving exclusions. Leaking it once wedges every later build and sync with
+"already running" until the process restarts.
 
 ### Scope against #106 — what this does *not* fix
 

@@ -33,6 +33,11 @@ one that was asked, and the caller would have no way to notice.
 - The result is a flat list ordered by date across accounts, with no per-account
   grouping. Each row carries `account`, so grouping is the caller's job; a
   `group_by` parameter felt like scope creep.
+- `"all"` and `"*"` become reserved words, and the match is
+  case-insensitive after trimming — so an account named "All" or " all "
+  cannot be targeted by name either. Documented rather than worked around; a
+  separate `scope` parameter would avoid the collision entirely if you prefer
+  that shape.
 - `"all"` requires Full Disk Access (the Envelope Index). Users without it get an
   error naming the reason rather than a partial answer — deliberate, but it does
   mean the parameter is unavailable in exactly the setup that most needs the

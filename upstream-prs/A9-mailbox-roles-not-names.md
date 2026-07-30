@@ -20,11 +20,19 @@ make.
    `draftsMailbox` / `trashMailbox` / `junkMailbox` on the account and then the
    application. Language- and provider-independent where the property exists; the
    probe never throws, it returns null and the chain continues.
-3. **Normalized match** — lowercase, drop provider hierarchy (`[Gmail]/…`, a
+3. **The role table** — localized and legacy names for de, fr, es, it, pt-BR, nl,
+   sv, da, fi, no, pl, ru, tr, ja, ko, zh-Hans, zh-Hant.
+4. **Normalized match** — lowercase, drop provider hierarchy (`[Gmail]/…`, a
    leading `INBOX.`), compare the last path segment. This is what makes
    `INBOX.Sent` answer a request for `Sent`.
-4. **The role table** — localized and legacy names for de, fr, es, it, pt-BR, nl,
-   sv, da, fi, no, pl, ru, tr, ja, ko, zh-Hans, zh-Hant.
+
+   Stages 3 and 4 are in that order on purpose, and both refuse a **nested**
+   mailbox when a role was requested. Normalization drops hierarchy, so a user's
+   own `Projects/INBOX` reduces to "inbox" — without the top-level test it
+   answers a request for the real inbox whenever it is listed first, which is
+   also the kind of defect a test can hide by fixing the listing order.
+   `[Gmail]/Sent Mail` and `INBOX.Sent` still resolve: a provider prefix is
+   hierarchy we are entitled to ignore, a user folder is not.
 5. **Fail loudly** — the error names the role and lists the mailboxes that
    actually exist.
 

@@ -5,11 +5,16 @@
 
 ---
 
-`IndexManager` held a single connection guarded by one lock. `sqlite3` connections
-are not safe to share across threads, and the lock made that safety expensive: a
-background rebuild holds its transaction for minutes, so every request that
-needed the index blocked behind it. From outside the server looked frozen while
-it was working exactly as designed.
+`IndexManager` held a single connection shared by every thread. `sqlite3`
+connections are not safe to share that way, and here the sharing was not merely
+unsafe in theory: a background rebuild holds its transaction for minutes, and
+every request that used the index during that window ran on the same connection
+— so it either serialized behind the rebuild's statements or read the rebuild's
+uncommitted, half-emptied state. From outside, the server looked frozen or
+inexplicably empty while it was working exactly as designed.
+
+(To be precise about what the lock did and did not do: `_conn_lock` guarded
+creation of the connection, not the queries running on it.)
 
 ### What changed
 
