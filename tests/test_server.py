@@ -1757,3 +1757,59 @@ class TestTimestampsAreLocal:
 
         assert r["date_received"].startswith("2026-07-27T14:54")
         assert r["date_sent"].startswith("2026-07-27T14:50")
+
+
+class TestEveryOutputBoundaryConverts:
+    """ "Every output boundary" has to mean every one of them.
+
+    The JXA listing fallback was left in UTC, so the same tool answered
+    in two different zones depending on whether Apple's Envelope Index
+    happened to be readable — the inconsistency is worse than either
+    choice on its own.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_jxa_listing_fallback_is_converted(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        rows = [
+            {
+                "id": 1,
+                "subject": "s",
+                "sender": "a@x",
+                "date_received": "2026-07-28T10:00:00+00:00",
+                "read": False,
+                "flagged": False,
+            }
+        ]
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=FileNotFoundError("no envelope index"),
+            ),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="Work"),
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_query_async",
+                AsyncMock(return_value=rows),
+            ),
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=MagicMock(),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails, to_local_iso
+
+            out = await get_emails()
+
+        assert out[0]["date_received"] == to_local_iso(
+            "2026-07-28T10:00:00+00:00"
+        )
+        # And that is genuinely a conversion, not a pass-through, unless
+        # this machine happens to run in UTC.
+        import time
+
+        if time.timezone or time.altzone:
+            assert out[0]["date_received"] != "2026-07-28T10:00:00+00:00"

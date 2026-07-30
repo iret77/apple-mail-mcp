@@ -563,7 +563,15 @@ async def get_emails(
     query = query.order_by("date_received", descending=True).limit(limit)
 
     try:
-        return await execute_query_async(query)
+        rows = await execute_query_async(query)
+        # The JXA path is an output boundary too. Leaving it in UTC made
+        # the same tool answer in two different zones depending on
+        # whether the Envelope Index happened to be readable.
+        for row in rows:
+            for field in ("date_received", "date_sent"):
+                if field in row:
+                    row[field] = to_local_iso(row[field])
+        return rows
     except Exception as exc:
         # An unknown mailbox makes JXA fail with a raw "...Error:
         # Error: Can't get object. (-1728)". Surface a clean,

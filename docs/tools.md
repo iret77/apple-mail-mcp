@@ -116,6 +116,11 @@ Get a single email with full content. Uses a 3-strategy cascade to find the mess
 
 **Returns:** Full email with: `id`, `subject`, `sender`, `content` (full body text), `date_received`, `date_sent`, `read`, `flagged`, `reply_to`, `message_id` (RFC 822 Message-ID header), `attachments` (list of `{filename, mime_type, size}`).
 
+!!! note
+    `date_received` and `date_sent` are returned in the machine's local time
+    zone, matching Mail.app. They are stored in UTC and converted at the output
+    boundary.
+
 ```python
 get_email(12345)
 # → {"id": 12345, "subject": "Meeting notes", "content": "Hi team,...",
@@ -160,6 +165,9 @@ Search emails with automatic FTS5 optimization. Uses the FTS5 index for fast sea
 | `attachments` | Attachment filenames | SQL (requires index) |
 
 **Returns:** List of results sorted by relevance (FTS5) or date (JXA fallback), each with: `id`, `subject`, `sender`, `date_received`, `score`, `matched_in`, and optionally `content_snippet`, `account`, `mailbox`.
+
+!!! note
+    `date_received` is local time, as everywhere else in the API.
 
 ```python
 search("invoice")
