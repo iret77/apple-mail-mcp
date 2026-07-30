@@ -299,6 +299,38 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
 
+## Well-known mailboxes: resolve by role, never by name
+
+A mailbox name is the weakest handle in this codebase. It changes with the
+system language (`Posteingang`), with the macOS version (Apple's own docs still
+say `Eingang`), and with the provider (`Deleted Items`, `[Gmail]/Sent Mail`,
+`INBOX.Trash`). Defaulting to the string `INBOX` therefore fails outright on a
+German install.
+
+`MailCore.getMailbox()` resolves in this order, most reliable first:
+
+1. **Exact name** — cheap, and right when it hits.
+2. **Mail's own notion of the role** — `specialMailbox()` probes
+   `sentMailbox` / `draftsMailbox` / `trashMailbox` / `junkMailbox` on the
+   account and then the application. Language- and provider-independent where
+   the property exists; the probe never throws, it returns null and the chain
+   continues.
+3. **Normalized match** — `normalizeMailboxName()` lowercases and drops
+   provider hierarchy (`[Gmail]/…`, a leading `INBOX.`), then compares the last
+   path segment. This is what makes `INBOX.Sent` answer a request for `Sent`.
+4. **The role table** (`MAILBOX_ROLES`) — localized and legacy names, covering
+   de, fr, es, it, pt-BR, nl, sv, da, fi, no, pl, ru, tr, ja, ko, zh-Hans and
+   zh-Hant. **Every entry is sourced from Apple's localized Mail user guide or
+   is a documented provider/legacy name.** Do not add a translation you have not
+   verified: a wrong name here is worse than a missing one, because it can match
+   somebody's real folder.
+5. **Fail loudly** — the error names the role and lists the mailboxes that
+   actually exist, so the caller can act on it.
+
+`isDiscardMailbox()` (trash or junk) rides on the same role logic, so any rule
+of the form "never touch a discard mailbox" holds on a German, Japanese or
+Exchange account too, without a word list of its own.
+
 ## Coding Standards
 
 - **Python 3.11+**, type hints required
