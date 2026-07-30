@@ -27,7 +27,7 @@ src/apple_mail_mcp/
     └── mail_core.js    # Shared JXA utilities (MailCore object)
 ```
 
-## MCP Tools (8 total)
+## MCP Tools (9 total)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -39,6 +39,7 @@ src/apple_mail_mcp/
 | `get_email_links(id)` | Extract links from an email | message_id |
 | `get_email_attachment(id, filename)` | Extract attachment content | message_id, filename |
 | `get_attachment(id, filename)` | *Deprecated* — use `get_email_attachment()` | message_id, filename |
+| `refresh_index(full?)` | Sync the index on demand; `full=True` rebuilds in the background | full |
 
 ## MCP Resources (1 total)
 
@@ -298,6 +299,28 @@ from apple_mail_mcp.index.sync import (
 result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
+
+## `refresh_index()` — and the vocabulary it deliberately claims
+
+The index syncs when the server starts and never again, so a client that stays
+open for a day drifts: a message that arrived an hour ago is not in the index,
+`search` cannot find it, and the only way out was to restart the client.
+
+Two details are the point of the tool rather than incidental to it:
+
+- **A detached build that never started must not report "started".** A build
+  refused on its first line is otherwise indistinguishable from a running one —
+  and since nothing is building, the status says "ready" forever with no
+  explanation for the mismatch. `build_from_disk()` takes an `on_started`
+  callback that fires once the build is really under way, and the tool waits up
+  to `BUILD_START_TIMEOUT` for it. No signal plus an exception in hand means
+  `failed`, with the reason.
+- **The docstring claims the words users actually use** — "rebuild",
+  "re-index", "from scratch", "recreate" — *and* states that this is the
+  server's own FTS5 index, not Apple Mail's envelope index, and nothing to do
+  with Mail.app's "Mailbox > Rebuild" menu item. Without that, a model asked to
+  "rebuild the mail index" sends the user into Mail.app's menus, which does
+  something else entirely and takes hours.
 
 ## Coding Standards
 

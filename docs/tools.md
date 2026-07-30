@@ -1,6 +1,6 @@
 # Tools
 
-Apple Mail MCP provides **8 MCP tools** — a consolidated API designed for AI assistants.
+Apple Mail MCP provides **9 MCP tools** — a consolidated API designed for AI assistants.
 
 ## Overview
 
@@ -14,6 +14,7 @@ Apple Mail MCP provides **8 MCP tools** — a consolidated API designed for AI a
 | `get_email_links()` | Extract links from an email | `message_id`, `account?`, `mailbox?` |
 | `get_email_attachment()` | Extract attachment content | `message_id`, `filename`, `account?`, `mailbox?` |
 | `get_attachment()` | *Deprecated* — use `get_email_attachment()` | `message_id`, `filename`, `account?`, `mailbox?` |
+| `refresh_index()` | Update or rebuild the search index | `full?` |
 
 ---
 
@@ -273,3 +274,45 @@ Read-only JSON snapshot of FTS5 search-index health. Lets clients render an "ind
   "message": "No index found. Run 'apple-mail-mcp index' to build it."
 }
 ```
+
+---
+
+## `refresh_index()`
+
+Update the server's own FTS5 search index without restarting it.
+
+The index syncs at startup and not again, so a long-running client drifts out of
+date: a message that arrived during the session is not in the index and
+`search()` cannot find it.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `full` | `bool?` | `false` | `false` syncs changes since the last run and returns when done. `true` discards the index and rebuilds from scratch — minutes on a large mailbox, so it runs in the background and returns immediately |
+
+**Returns:** `status` (`"completed"`, `"started"`, `"already_running"` or
+`"failed"`), a `message` to relay, and `changes` (added + deleted + moved) for a
+completed sync.
+
+```python
+refresh_index()
+# → {"status": "completed", "changes": 7, "message": "Index updated: 7 change(s)."}
+
+refresh_index(full=True)
+# → {"status": "started", "message": "Building the index in the background..."}
+```
+
+!!! note
+    This is the **server's** FTS5 index at `~/.apple-mail-mcp/index.db`. It is
+    not Apple Mail's envelope index, and it has nothing to do with Mail.app's
+    "Mailbox → Rebuild" menu item — that rebuilds Mail's own database and can
+    take hours.
+
+!!! tip
+    Only `full=True` is expensive. A plain `refresh_index()` is the same disk
+    sync the server runs at startup (typically under 5 seconds), so it is cheap
+    enough to call whenever a just-received message cannot be found.
+
+This tool touches only the local index — never the mail itself — so it is
+allowed in read-only mode.
