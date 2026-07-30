@@ -293,14 +293,17 @@ async def _resolve_write_targets(
     `skipped_hidden` and is never dispatched to JXA. Only ids with no
     visible account to scan land in `not_found`.
 
-    Returns ``(groups, not_found, skipped_hidden)``. Located groups are
+    Returns ``(groups, not_found, skipped_hidden, ambiguous)``, where
+    ``ambiguous`` holds ids the index maps to more than one mailbox —
+    those are never written, since the number alone does not say which
+    message was meant. Located groups are
     ``{"account", "mailbox", "ids"}``; the optional scan group is
     ``{"account", "ids", "scan": True}``.
     """
     # Explicit hidden account: refuse the whole batch up front, exactly
     # as the read tools do at their entry gate.
     if _hidden_account(account):
-        return [], [], list(ids)
+        return [], [], list(ids), []
 
     manager = _get_index_manager()
     has_index = manager.has_index()
@@ -327,10 +330,26 @@ async def _resolve_write_targets(
     scan_ids: list[int] = []
     not_found: list[int] = []
     skipped_hidden: list[int] = []
+    # Ids the index cannot resolve to ONE message (see below).
+    ambiguous: list[int] = []
 
     for mid in ids:
         located: tuple[str, str] | None = None
         if has_index:
+            # A Mail.app id is a per-mailbox ROWID, so the index can
+            # legitimately hold several rows for the same number. Taking
+            # the first would write to a message the caller never named
+            # — for a WRITE that is the worst possible guess, so an
+            # ambiguous id is reported instead of resolved.
+            if (
+                mailbox is None
+                and manager.count_email_locations(
+                    mid, account=idx_acct_uuid
+                )
+                > 1
+            ):
+                ambiguous.append(mid)
+                continue
             loc = manager.find_email_location(
                 mid, account=idx_acct_uuid, mailbox=mailbox
             )
@@ -367,7 +386,7 @@ async def _resolve_write_targets(
                 {"account": scan_account, "ids": scan_ids, "scan": True}
             )
 
-    return groups, not_found, skipped_hidden
+    return groups, not_found, skipped_hidden, ambiguous
 
 
 def _absorb_failures(res: dict, failed: list, errors: list) -> None:
@@ -406,9 +425,12 @@ async def _apply_write(
     Every id comes back in exactly one bucket.
     """
     ids = _normalize_message_ids(message_ids)
-    groups, not_found, skipped_hidden = await _resolve_write_targets(
-        ids, account, mailbox
-    )
+    (
+        groups,
+        not_found,
+        skipped_hidden,
+        ambiguous,
+    ) = await _resolve_write_targets(ids, account, mailbox)
 
     located = [g for g in groups if not g.get("scan")]
     scan = [g for g in groups if g.get("scan")]
@@ -479,6 +501,25 @@ async def _apply_write(
             "accounts_scanned": [g.get("account") for g in scan],
             "mailboxes_not_searched": unsearched,
         }
+    if ambiguous:
+        # Never guessed at: the same number names a different message in
+        # another mailbox, and picking one would write to mail the
+        # caller did not ask about.
+        failed.extend(ambiguous)
+        errors.append(
+            f"{len(ambiguous)} id(s) exist in more than one mailbox"
+        )
+        result["failed"] = failed
+        result["error"] = "; ".join(dict.fromkeys(errors))[:500]
+        result["hint"] = (
+            f"{len(ambiguous)} id(s) name a message in more than one "
+            f"mailbox — a Mail.app id is only unique within its mailbox, "
+            f"so the number alone does not say which message you mean. "
+            f"Pass `mailbox` (and `account`) to say which one, and "
+            f"nothing was written for them."
+        )
+        return result
+
     if failed:
         # Say plainly that Apple Mail never carried the write out, and
         # what it said — the caller must not read this as "deleted".

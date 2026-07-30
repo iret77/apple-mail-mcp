@@ -18,6 +18,8 @@ def _mock_index(location=None, has_index=True):
     mgr = MagicMock()
     mgr.has_index.return_value = has_index
     mgr.find_email_location.return_value = location
+    # One indexed location unless a test says otherwise.
+    mgr.count_email_locations.return_value = 1 if location else 0
     return mgr
 
 
@@ -137,7 +139,7 @@ class TestTargetResolution:
                 return_value=_mock_acct_map(),
             ),
         ):
-            groups, not_found, hidden = await _resolve_write_targets(
+            groups, not_found, hidden, _amb = await _resolve_write_targets(
                 [7], None, None
             )
 
@@ -158,7 +160,9 @@ class TestTargetResolution:
                 return_value=_mock_acct_map(),
             ),
         ):
-            groups, _, _ = await _resolve_write_targets([7], "Work", "Sent")
+            groups, _, _, _amb = await _resolve_write_targets(
+                [7], "Work", "Sent"
+            )
 
         assert groups == [{"account": "Work", "mailbox": "Sent", "ids": [7]}]
 
@@ -182,7 +186,9 @@ class TestTargetResolution:
                 AsyncMock(return_value="Work"),
             ),
         ):
-            groups, not_found, _ = await _resolve_write_targets([7], None, None)
+            groups, not_found, _, _amb = await _resolve_write_targets(
+                [7], None, None
+            )
 
         assert groups == [{"account": "Work", "ids": [7], "scan": True}]
         assert not not_found
@@ -194,6 +200,7 @@ class TestTargetResolution:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_email_location.side_effect = lambda mid, **kw: {
             1: ("uuid-work", "INBOX"),
             2: ("uuid-work", "INBOX"),
@@ -206,7 +213,9 @@ class TestTargetResolution:
                 return_value=_mock_acct_map(),
             ),
         ):
-            groups, _, _ = await _resolve_write_targets([1, 2, 3], None, None)
+            groups, _, _, _amb = await _resolve_write_targets(
+                [1, 2, 3], None, None
+            )
 
         assert sorted(len(g["ids"]) for g in groups) == [1, 2]
 
@@ -230,7 +239,7 @@ class TestExcludedAccountBoundary:
                 return_value=_mock_acct_map(excluded_uuids={"uuid-secret"}),
             ),
         ):
-            groups, not_found, hidden = await _resolve_write_targets(
+            groups, not_found, hidden, _amb = await _resolve_write_targets(
                 [7], None, None
             )
 
@@ -245,7 +254,7 @@ class TestExcludedAccountBoundary:
             "apple_mail_mcp.server._excluded_account_names",
             return_value={"Secret"},
         ):
-            groups, not_found, hidden = await _resolve_write_targets(
+            groups, not_found, hidden, _amb = await _resolve_write_targets(
                 [1, 2], "Secret", None
             )
 
@@ -370,6 +379,7 @@ class TestBucketContract:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_email_location.side_effect = lambda mid, **kw: (
             ("uuid-work", "INBOX") if mid == 1 else None
         )
@@ -465,3 +475,65 @@ class TestReadOnlyMode:
                 await set_read_status(1)
         finally:
             set_read_only_mode(False)
+
+
+class TestAmbiguousIdsAreNeverGuessed:
+    """A Mail.app id is a per-mailbox ROWID.
+
+    The index schema's UNIQUE is `(account, mailbox, message_id)`, so the
+    same number legitimately names a different message in another
+    mailbox. Resolving it to one location silently picks one — for a
+    WRITE that means flagging mail the caller never named.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_id_in_two_mailboxes_is_not_written(self):
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 2  # INBOX *and* Archive
+        mgr.find_email_location.return_value = ("uuid-work", "INBOX")
+        exec_mock = AsyncMock()
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch("apple_mail_mcp.server.execute_with_core_async", exec_mock),
+        ):
+            out = await _apply_write(
+                [42], None, None, lambda g: WriteBuilder.set_read(g, True)
+            )
+
+        exec_mock.assert_not_called()  # nothing was written
+        assert out["failed"] == [42]
+        assert "more than one mailbox" in out["hint"]
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_mailbox_resolves_the_ambiguity(self):
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 2
+        mgr.find_email_location.return_value = ("uuid-work", "Archive")
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+        ):
+            groups, _, _, ambiguous = await _resolve_write_targets(
+                [42], "Work", "Archive"
+            )
+
+        assert not ambiguous
+        assert groups == [
+            {"account": "Work", "mailbox": "Archive", "ids": [42]}
+        ]

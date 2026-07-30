@@ -79,6 +79,7 @@ in CI or in MCP client launch configs.
 | `APPLE_MAIL_INDEX_EXCLUDE_MAILBOXES` | `Drafts` | Comma-separated mailboxes to skip in search |
 | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` | _unset_ | Comma-separated account names (exact, case-sensitive) hidden from the entire server: never indexed, filtered from search, invisible to the list/get tools |
 | `APPLE_MAIL_READ_ONLY` | `false` | When `true`, disables any write operations |
+| `APPLE_MAIL_WRITE_TIMEOUT` | `30` | Seconds a located write may take before it is abandoned. The all-mailbox scan uses the Strategy 3 budget instead |
 
 ## Precedence
 

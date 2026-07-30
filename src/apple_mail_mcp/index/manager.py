@@ -690,6 +690,28 @@ class IndexManager:
             return (row["account"], row["mailbox"])
         return None
 
+    def count_email_locations(
+        self, message_id: int, account: str | None = None
+    ) -> int:
+        """How many indexed mailboxes hold this Mail.app id.
+
+        A Mail.app id is a per-mailbox ROWID — the schema's UNIQUE is
+        ``(account, mailbox, message_id)``, so the same number can name
+        a different message in another mailbox. A caller that resolves
+        such an id to ONE location silently picks one of them; for a
+        write that means flagging a message the caller never named.
+        """
+        sql = "SELECT COUNT(*) AS n FROM emails WHERE message_id = ?"
+        params: list = [message_id]
+        if account:
+            sql += " AND account = ?"
+            params.append(account)
+        try:
+            row = self._get_conn().execute(sql, params).fetchone()
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
     def find_email_path(
         self,
         message_id: int,

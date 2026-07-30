@@ -329,8 +329,13 @@ Design points to preserve:
   IMAP/Exchange (and rotates the Exchange ItemId), so `unchanged` is a deliberate
   outcome — and the current state is read from Mail, never from an index that
   could be stale.
+- **An ambiguous id is never guessed at.** The schema's UNIQUE is
+  `(account, mailbox, message_id)`, so the index can hold several rows for one
+  number. Resolving that to a single location writes to a message the caller
+  never named, which for a write is the worst possible guess — such ids are
+  reported with a hint to pass `mailbox` instead.
 - **`not_found` stays a statement about the MESSAGE.** Anything that went wrong
-  on the way — no such account, an unreadable mailbox, Apple Events refused —
+  on the way — no such account, an unreadable mailbox, Apple Events refused, or the message shifting position between the id snapshot and the write —
   goes to `failed` with its reason and a cause-specific hint. Merging the two
   made a broken account lookup look like a batch of deleted mail.
 - **Excluded accounts (#90) never reach JXA.** An id resolving into a hidden
