@@ -247,6 +247,8 @@ def sync_from_disk(
     )
 
     skipped_per_mailbox: dict[tuple[str, str], int] = {}
+    # Counted apart from cap skips: different cause, different remedy.
+    oversized = 0
 
     # Process NEW emails (parse content and insert)
     for row in sorted_new:
@@ -254,26 +256,32 @@ def sync_from_disk(
         mailbox = row["mailbox"]
         path = row["emlx_path"]
 
-        # Check mailbox limit (None means uncapped)
         mb_key = (account, mailbox)
         current_count = mailbox_counts.get(mb_key, 0)
-        if max_per_mailbox is not None and current_count >= max_per_mailbox:
-            skipped_per_mailbox[mb_key] = skipped_per_mailbox.get(mb_key, 0) + 1
-            continue
 
+        # Size BEFORE the cap. A mailbox already at its limit would
+        # otherwise swallow an oversized file with no DLQ row — the
+        # exact silence this change exists to remove, restored by
+        # ordering. The two are also counted separately: "hit cap" and
+        # "too large" have different remedies, and reporting a size skip
+        # as a cap skip advises raising a limit that is not the problem.
         try:
-            # Oversized files are skipped by parse_emlx with a bare
-            # None; check first so the skip is recorded instead of
-            # vanishing.
             if emlx_too_large(Path(path)):
                 conn.execute(
                     RECORD_PARSE_FAILURE_SQL,
                     skip_row(path, account, mailbox, SKIP_REASON_TOO_LARGE),
                 )
-                skipped_per_mailbox[mb_key] = (
-                    skipped_per_mailbox.get(mb_key, 0) + 1
-                )
+                oversized += 1
                 continue
+        except OSError as exc:
+            logger.debug("Could not stat %s: %s", path, exc)
+
+        # Check mailbox limit (None means uncapped)
+        if max_per_mailbox is not None and current_count >= max_per_mailbox:
+            skipped_per_mailbox[mb_key] = skipped_per_mailbox.get(mb_key, 0) + 1
+            continue
+
+        try:
             parsed = parse_emlx(Path(path))
             if parsed:
                 attachments = parsed.attachments or []
@@ -329,10 +337,18 @@ def sync_from_disk(
             progress_callback(processed, total_ops, f"Added {added} emails...")
 
     # Log aggregate cap warning with summary + per-mailbox detail
+    if oversized:
+        logger.warning(
+            "%d message(s) exceeded APPLE_MAIL_INDEX_MAX_EMAIL_MB and were "
+            "recorded as too_large. Raise the limit and re-index to "
+            "include them.",
+            oversized,
+        )
+
     if skipped_per_mailbox:
         total_skipped = sum(skipped_per_mailbox.values())
         logger.warning(
-            "%d mailbox(es) hit cap (%d), %d new emails skipped. "
+            "%d mailbox(es) hit cap (%s), %d new emails skipped. "
             "Increase APPLE_MAIL_INDEX_MAX_EMAILS to index more.",
             len(skipped_per_mailbox),
             max_per_mailbox,

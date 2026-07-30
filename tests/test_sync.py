@@ -302,3 +302,37 @@ class TestSyncFromDisk:
             sync_from_disk(sync_db, mail_dir)
 
         assert "hit cap" in caplog.text
+
+
+class TestOversizedIsRecordedEvenAtTheCap:
+    """The size check has to run before the mailbox cap.
+
+    A mailbox already at MAX_EMAILS swallowed the file with no DLQ row —
+    the exact silence this unit removes, restored by ordering. And a
+    size skip must not be counted as a cap skip: the remedies differ,
+    and "hit cap" advises raising a limit that is not the problem.
+    """
+
+    def test_a_capped_mailbox_still_records_the_size_skip(
+        self, temp_db, tmp_path, monkeypatch
+    ):
+        from apple_mail_mcp.index.sync import sync_from_disk
+
+        mail_dir = tmp_path / "V10"
+        box = mail_dir / "ACCT" / "INBOX.mbox" / "Data" / "Messages"
+        box.mkdir(parents=True)
+        payload = b"x" * (2 * 1024 * 1024)
+        (box / "1.emlx").write_bytes(f"{len(payload)}\n".encode() + payload)
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "1")
+        # Cap of zero: every mailbox counts as already full.
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAILS", "0")
+
+        sync_from_disk(temp_db, mail_dir)
+
+        rows = temp_db.execute(
+            "SELECT error_message FROM failed_index_jobs"
+        ).fetchall()
+        assert [r[0] for r in rows] == ["too_large"], (
+            "the oversized message vanished because the mailbox was capped"
+        )

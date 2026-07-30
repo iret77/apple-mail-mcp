@@ -350,6 +350,13 @@ class IndexManager:
                         RECORD_PARSE_FAILURE_SQL,
                         skip_row(str(path), acct, mbox, reason),
                     )
+                    # Commit the row itself. A build that skips every
+                    # file writes nothing else, so the sync-state commit
+                    # below never runs — and the row then survives only
+                    # as a side effect of the later executescript(),
+                    # which commits any pending transaction. Persisting
+                    # a diagnostic by accident is not persisting it.
+                    conn.commit()
                 except Exception:
                     logger.debug("Could not record skip for %s", path)
 
