@@ -503,3 +503,55 @@ account = "NowSet"
         assert get_default_account() is None
         _invalidate_config_cache()
         assert get_default_account() == "NowSet"
+
+
+class TestMaxEmailMbConfig:
+    """`[index] max_email_mb` — the per-message size ceiling."""
+
+    def test_default_is_25_mb(self, config_file):
+        from apple_mail_mcp.config import get_index_max_email_mb
+
+        assert get_index_max_email_mb() == 25.0
+
+    def test_the_toml_key_validates(self, config_file):
+        """A documented key missing from CONFIG_SCHEMA is worse than an
+        undocumented one: the loader rejects unknown keys, so setting it
+        would refuse to start the server."""
+        from apple_mail_mcp.config import get_index_max_email_mb
+
+        _write(
+            config_file,
+            """
+            config_version = 1
+            [index]
+            max_email_mb = 50
+            """,
+        )
+        _invalidate_config_cache()
+        assert get_index_max_email_mb() == 50.0
+
+    def test_env_overrides_file(self, monkeypatch, config_file):
+        from apple_mail_mcp.config import get_index_max_email_mb
+
+        _write(
+            config_file,
+            """
+            config_version = 1
+            [index]
+            max_email_mb = 50
+            """,
+        )
+        _invalidate_config_cache()
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "5")
+        assert get_index_max_email_mb() == 5.0
+
+    def test_a_nonsense_value_falls_back_to_the_default(
+        self, monkeypatch, config_file
+    ):
+        """A ceiling of zero or less would skip every message."""
+        from apple_mail_mcp.config import get_index_max_email_mb
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "0")
+        assert get_index_max_email_mb() == 25.0
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "not-a-number")
+        assert get_index_max_email_mb() == 25.0

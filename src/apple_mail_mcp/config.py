@@ -32,6 +32,7 @@ CONFIG_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "exclude_mailboxes": (list,),
         "exclude_accounts": (list,),
         "include_mailboxes": (list,),
+        "max_email_mb": (int, float),
     },
     "server": {
         "read_only": (bool,),
@@ -387,6 +388,13 @@ config_version = 1
 # to get_emails/get_email/list_mailboxes. No default (nothing hidden).
 # Env: APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS (comma-separated)
 # exclude_accounts = ["Work PHI"]
+
+# Largest single .emlx to parse, in MB. Bigger messages are skipped and
+# recorded in the index's dead-letter queue as "too_large" rather than
+# dropped silently, so the gap between disk and index counts stays
+# explainable.
+# Env: APPLE_MAIL_INDEX_MAX_EMAIL_MB
+# max_email_mb = 25
 
 
 [server]

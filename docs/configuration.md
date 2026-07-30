@@ -36,6 +36,7 @@ config_version = 1
 # staleness_hours = 24.0        # Hours before re-sync
 # exclude_mailboxes = ["Drafts"]   # Mailboxes to skip during indexing
 # exclude_accounts = ["Work PHI"]  # Accounts to hide from the whole server
+# max_email_mb = 25               # Largest single .emlx to parse (MB)
 
 [server]
 # read_only = false             # Disable write operations
@@ -78,6 +79,7 @@ in CI or in MCP client launch configs.
 | `APPLE_MAIL_INDEX_STALENESS_HOURS` | `24` | Hours before index is considered stale |
 | `APPLE_MAIL_INDEX_EXCLUDE_MAILBOXES` | `Drafts` | Comma-separated mailboxes to skip in search |
 | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` | _unset_ | Comma-separated account names (exact, case-sensitive) hidden from the entire server: never indexed, filtered from search, invisible to the list/get tools |
+| `APPLE_MAIL_INDEX_MAX_EMAIL_MB` | `25` | Largest single `.emlx` to parse. Bigger messages are skipped, recorded in the index's dead-letter queue as `too_large`, and counted by `failed_jobs_count` — never dropped silently |
 | `APPLE_MAIL_READ_ONLY` | `false` | When `true`, disables any write operations |
 
 ## Precedence

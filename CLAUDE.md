@@ -299,6 +299,20 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
 
+## Oversized messages are skipped, never dropped silently
+
+`parse_emlx()` refuses a file larger than `APPLE_MAIL_INDEX_MAX_EMAIL_MB`
+(default 25) — an unbounded read is a memory DoS on a mailbox that contains a
+400 MB attachment. Refusing is right; refusing *quietly* was not: the message
+simply never appeared in the index, and `disk_email_count` sat permanently above
+`email_count` with nothing to explain the difference.
+
+A skipped file is now recorded in the dead-letter queue
+(`failed_index_jobs`, `error_type = "Skipped"`, `error_message = "too_large"`),
+so it is counted by the existing `failed_jobs_count` in `index://status` and
+`apple-mail-mcp status`. A later re-parse that succeeds clears the row. Nothing
+new had to be added to the tool surface for the gap to become explainable.
+
 ## Coding Standards
 
 - **Python 3.11+**, type hints required
