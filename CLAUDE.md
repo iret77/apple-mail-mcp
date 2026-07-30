@@ -164,10 +164,22 @@ reply_to, message_id from MIME headers.
 | Pattern | Location | Purpose |
 |---------|----------|---------|
 | **Builder** | `QueryBuilder` | Safe JXA script construction, prevents injection |
-| **Singleton** | `IndexManager` | Single SQLite writer, one file watcher |
+| **Singleton** | `IndexManager` | One file watcher; **one SQLite connection per thread** |
 | **Facade** | `MailCore` JS | Clean API over verbose Apple Events |
 | **Factory** | `create_connection()` | Consistent DB configuration |
 | **State Reconciliation** | `sync_from_disk()` | Fast diff-based sync |
+
+### Connections are per thread, not per manager
+
+`IndexManager` is a singleton, but its SQLite connection is not: `self._local`
+is a `threading.local()`, and `_get_conn()` opens one connection per thread and
+remembers every one of them so `close()` can shut them all.
+
+This is not tidiness. `sqlite3` connections are not safe to share across
+threads, and the previous single connection was guarded by one lock — so a
+background rebuild, which holds its transaction for minutes, blocked every
+request that needed the index. From outside, the server looked frozen while it
+was working exactly as designed.
 
 ## FTS5 Search Index
 
