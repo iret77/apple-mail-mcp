@@ -68,6 +68,8 @@ for the full schema and precedence rules.
 | `get_email_links(message_id)` | Extract links from an email |
 | `get_email_attachment(message_id, filename)` | Extract attachment content |
 | `get_attachment(message_id, filename)` | *Deprecated* — use `get_email_attachment()` |
+| `set_flag(message_ids, color?)` | *Write* — flag or unflag one or many, in any of Apple's colors |
+| `set_read_status(message_ids, read?)` | *Write* — mark one or many read or unread |
 
 ## Performance
 
