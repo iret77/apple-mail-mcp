@@ -393,6 +393,56 @@ since most accounts are also open on a phone and a tablet. The RFC822
 The docstrings say which one to keep, because a model handed two identifiers will
 otherwise use the shorter one.
 
+### A header is never translated back into a ROWID and then trusted
+
+Every tool that takes a message accepts **either** form — `get_email`,
+`get_email_links`, `get_email_attachment`, `get_attachment`, `set_flag`,
+`set_read_status` — and this is the rule that makes that safe. An index row can
+be stale, and by then its ROWID may belong to a *different* message.
+
+- **Writes** match `msg.messageId()` in JXA (`applyByHeader`). The index is
+  consulted only to pick the account and to order the mailbox scan
+  (`prefer_mailboxes`), so a stale row can misdirect the search but can never
+  write the wrong message.
+- **Reads** (`_get_email_by_header`, `_resolve_emlx_path_by_header`) fetch each
+  candidate the index offers and **verify** the header on what came back, moving
+  to the next candidate on a mismatch and raising rather than returning a
+  stranger's mail.
+- **The index orders the search; it never limits it.** A header is looked for in
+  the account the index points at FIRST, then in every other visible account.
+  Group order is insertion order — sorting the groups by name throws that
+  priority away.
+- **A header the index cannot place searches EVERY visible account.** That case
+  is not exotic: it is every message that arrived after the last sync. The JXA
+  script retires a header globally (`settled`) the moment it lands, so fanning
+  out never writes two copies and never reports a miss another account already
+  settled.
+- **A recovered write never lands in a discard mailbox** unless the index expects
+  the message there. The same mail often still sits in Trash after being
+  re-filed, and flagging that copy would leave the visible one untouched — while
+  a message that genuinely lives in Junk is still a legitimate target. Trash and
+  junk are decided by role (`isDiscardMailbox`), and skipped mailboxes are
+  counted, because "deliberately not searched" is still not searched.
+
+**Angle brackets are not part of the identity.** The `.emlx` header keeps them
+(`<a@b>`), Apple Mail's `messageId` property drops them (`a@b`). Every comparison
+goes through `_header_key()` in Python or `normHeader()` /
+`MailCore.normHeaderValue()` in JS, and `find_by_rfc822()` matches either stored
+form plus a normalized fallback for folded headers. A strict comparison here
+fails *silently*: nothing throws, so nothing is logged, and every Message-ID
+lookup reports a missing message that is sitting in the mailbox.
+
+**`get_email` reports the current `account` and `mailbox`.** Addressing a message
+by its header makes its location the one thing the caller cannot derive — and
+after a move the most useful.
+
+**A stringified list and HTML-escaped brackets are unwrapped.** Some clients
+serialize a list parameter as JSON text or escape the angle brackets; taken
+literally, `'["<a@b>"]'` is a Message-ID nothing will ever match, and the caller
+gets a mute `not_found` for a message that is right there. `&amp;` is
+deliberately NOT decoded: `&` is legal in a Message-ID local part, so decoding it
+could aim the write at a different real message while reporting success.
+
 **`MailCore.batchFetch` degrades per property.** Carrying one more property means
 one more bulk call that Mail could refuse on some build, and a single refusal used
 to take the whole listing down. A refused property is padded with nulls so the

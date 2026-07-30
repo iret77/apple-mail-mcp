@@ -113,11 +113,19 @@ Get a single email with full content. Uses a 3-strategy cascade to find the mess
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `message_id` | `int` | *required* | Email ID (from list/search results) |
+| `message_id` | `int \| string` | *required* | Email ID, or the RFC822 `message_id` header from a read result (preferred — see the tip below) |
 | `account` | `string?` | env default | Helps find the message faster |
 | `mailbox` | `string?` | `INBOX` | Helps find the message faster |
 
-**Returns:** Full email with: `id`, `subject`, `sender`, `content` (full body text), `date_received`, `date_sent`, `read`, `flagged`, `reply_to`, `message_id` (RFC 822 Message-ID header), `attachments` (list of `{filename, mime_type, size}`).
+**Returns:** Full email with: `id`, `message_id` (RFC 822 Message-ID header), `account`, `mailbox` (where the message is *now*), `subject`, `sender`, `content` (full body text), `date_received`, `date_sent`, `read`, `flagged`, `reply_to`, `attachments` (list of `{filename, mime_type, size}`).
+
+!!! tip
+    Pass the `message_id` header rather than the numeric id for anything you
+    looked up earlier. The numeric id is a per-mailbox ROWID: it stops resolving
+    as soon as any device files the message elsewhere, and it cannot be searched
+    for in another account, because the same number is a different message
+    there. A header is verified against the message that comes back, so a stale
+    index row can never return the wrong mail.
 
 ```python
 get_email(12345)
@@ -205,7 +213,7 @@ Extract all links (URLs) from an email's body content.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `message_id` | `int` | *required* | Email ID |
+| `message_id` | `int \| string` | *required* | Email ID or RFC822 `message_id` header |
 | `account` | `string?` | `None` | Account (helps disambiguate) |
 | `mailbox` | `string?` | `None` | Mailbox (helps disambiguate) |
 
@@ -226,7 +234,7 @@ Extract attachment content from an email. Parses the raw `.emlx` MIME structure,
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `message_id` | `int` | *required* | Email ID |
+| `message_id` | `int \| string` | *required* | Email ID or RFC822 `message_id` header |
 | `filename` | `string` | *required* | Attachment filename to extract |
 | `account` | `string?` | `None` | Account (helps disambiguate) |
 | `mailbox` | `string?` | `None` | Mailbox (helps disambiguate) |
@@ -318,7 +326,7 @@ fails as a whole:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `message_ids` | `int \| list[int]` | *required* | One id, or up to 500 |
+| `message_ids` | `int \| string \| list` | *required* | One reference, or up to 500. A reference is a numeric id or an RFC822 `message_id` header — prefer the header |
 | `color` | `string?` | `default` | `default` flags without forcing a colour, `none` unflags, or one of `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `gray` |
 | `account` | `string?` | env default | Hint; required together with `mailbox` for ids the index cannot place |
 | `mailbox` | `string?` | `INBOX` | Hint, as above |
@@ -340,7 +348,7 @@ set_flag([1, 2, 3], color="none")   # unflag a batch
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `message_ids` | `int \| list[int]` | *required* | One id, or up to 500 |
+| `message_ids` | `int \| string \| list` | *required* | One reference, or up to 500. A reference is a numeric id or an RFC822 `message_id` header — prefer the header |
 | `read` | `bool?` | `true` | `true` marks as read (seen), `false` as unread |
 | `account` | `string?` | env default | Hint, as for `set_flag()` |
 | `mailbox` | `string?` | `INBOX` | Hint, as for `set_flag()` |
