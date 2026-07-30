@@ -9,7 +9,7 @@ Apple Mail MCP provides **8 MCP tools** — a consolidated API designed for AI a
 | `list_accounts()` | List email accounts | — |
 | `list_mailboxes()` | List mailboxes | `account?` |
 | `get_emails()` | Get emails with filtering | `account?`, `mailbox?`, `filter?`, `limit?` |
-| `get_email()` | Get single email with content + attachments | `message_id`, `account?`, `mailbox?` |
+| `get_email()` | Get one email, or a batch of up to 50 | `message_id` (id or list), `account?`, `mailbox?` |
 | `search()` | Search emails | `query`, `account?`, `mailbox?`, `scope?`, `limit?`, `exclude_mailboxes?`, `before?`, `after?`, `highlight?` |
 | `get_email_links()` | Extract links from an email | `message_id`, `account?`, `mailbox?` |
 | `get_email_attachment()` | Extract attachment content | `message_id`, `filename`, `account?`, `mailbox?` |
@@ -105,7 +105,7 @@ Get a single email with full content. Uses a 3-strategy cascade to find the mess
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `message_id` | `int` | *required* | Email ID (from list/search results) |
+| `message_id` | `int \| list[int]` | *required* | Email ID, or a list of up to 50 (from list/search results) |
 | `account` | `string?` | env default | Helps find the message faster |
 | `mailbox` | `string?` | `INBOX` | Helps find the message faster |
 
@@ -116,6 +116,26 @@ get_email(12345)
 # → {"id": 12345, "subject": "Meeting notes", "content": "Hi team,...",
 #    "attachments": [{"filename": "notes.pdf", "mime_type": "application/pdf", "size": 52340}], ...}
 ```
+
+Pass a **list** to fetch a page of messages in one round-trip. The result is one
+entry per id, in the order given:
+
+```python
+get_email([12345, 12346, 99999])
+# → [{"ref": 12345, "email": {...}},
+#    {"ref": 12346, "email": {...}},
+#    {"ref": 99999, "error": "Message 99999 not found."}]
+```
+
+!!! tip
+    Each read is a few milliseconds from disk, so the round-trip dominates —
+    fetching the page you just listed is nearly free. One unreadable message
+    never takes the batch down; it comes back with an `error` while the rest
+    return normally.
+
+!!! note
+    The 50-id cap is about how much text fits in the model's context, not about
+    speed. Split larger lists.
 
 !!! tip
     If `account` and `mailbox` are not provided, the server searches all mailboxes in the default account to find the message.

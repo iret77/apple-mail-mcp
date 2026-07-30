@@ -34,7 +34,7 @@ src/apple_mail_mcp/
 | `list_accounts()` | List email accounts | - |
 | `list_mailboxes(account?)` | List mailboxes | account (optional) |
 | `get_emails(...)` | Unified listing | filter: all/unread/flagged/today/last_7_days |
-| `get_email(id)` | Full email content + attachments | message_id |
+| `get_email(ref)` | Full email content + attachments. Takes a **list** (max 50) for one-round-trip batches | message_id (id or list) |
 | `search(query, ...)` | Unified search | scope, before, after, offset, highlight |
 | `get_email_links(id)` | Extract links from an email | message_id |
 | `get_email_attachment(id, filename)` | Extract attachment content | message_id, filename |
@@ -298,6 +298,27 @@ from apple_mail_mcp.index.sync import (
 result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
+
+## The round-trip is the cost, not the read
+
+A single message comes off disk in 1-5 ms. So any task that touches a page of
+messages — triage, a survey of what is flagged, summarising a thread — spends
+nearly all of its time in call overhead, not in reading mail.
+
+`get_email` therefore also takes a **list** of up to `MAX_READ_BATCH` (50) ids
+and returns one entry per id, in the order given, each either
+`{"ref", "email"}` or `{"ref", "error"}`. Rules that matter:
+
+- **One unreadable message never sinks the batch.** The caller asked about 50
+  messages; 49 answers are worth more than one exception.
+- **A single id keeps its old single-object shape**, so existing callers and
+  their parsers are untouched.
+- **The cap is about context, not speed** — 50 full message bodies is already a
+  lot of text for a model — and the error says so, or the caller cannot tell
+  whether retrying differently would help.
+
+The cascade itself is unchanged; it moved to `_get_email_by_id()` and
+`get_email` became the front end that drives it once per id.
 
 ## Coding Standards
 
