@@ -159,7 +159,9 @@ class TestTargetResolution:
                 return_value=_mock_acct_map(),
             ),
         ):
-            groups, _, _, _amb = await _resolve_write_targets([7], "Work", "Sent")
+            groups, _, _, _amb = await _resolve_write_targets(
+                [7], "Work", "Sent"
+            )
 
         assert groups == [{"account": "Work", "mailbox": "Sent", "ids": [7]}]
 
@@ -183,7 +185,9 @@ class TestTargetResolution:
                 AsyncMock(return_value="Work"),
             ),
         ):
-            groups, not_found, _, _amb = await _resolve_write_targets([7], None, None)
+            groups, not_found, _, _amb = await _resolve_write_targets(
+                [7], None, None
+            )
 
         assert groups == [{"account": "Work", "ids": [7], "scan": True}]
         assert not not_found
@@ -208,7 +212,9 @@ class TestTargetResolution:
                 return_value=_mock_acct_map(),
             ),
         ):
-            groups, _, _, _amb = await _resolve_write_targets([1, 2, 3], None, None)
+            groups, _, _, _amb = await _resolve_write_targets(
+                [1, 2, 3], None, None
+            )
 
         assert sorted(len(g["ids"]) for g in groups) == [1, 2]
 
@@ -531,7 +537,9 @@ class TestHeaderIsAFirstClassReference:
                 AsyncMock(return_value=["Alpha", "Work", "Zeta"]),
             ),
         ):
-            groups, _, _, _amb = await _resolve_write_targets(["<a@x>"], None, None)
+            groups, _, _, _amb = await _resolve_write_targets(
+                ["<a@x>"], None, None
+            )
 
         # Insertion order, not alphabetical: sorting would throw the
         # index's priority away.
@@ -822,7 +830,7 @@ class TestHeaderReads:
             ),
             patch("apple_mail_mcp.server._get_email_by_id", side_effect=by_id),
         ):
-            with pytest.raises(ValueError, match="stale"):
+            with pytest.raises(ValueError, match="stale|not where"):
                 await _get_email_by_header("<a@x>", None, None)
 
     @pytest.mark.asyncio
@@ -885,3 +893,61 @@ class TestHeaderReads:
 
         assert "could not be completed" in str(err.value)
         assert "deleted" not in str(err.value).lower()
+
+
+class TestAStaleIndexIsNotTheEndOfTheSearch:
+    """Every indexed location being stale says the INDEX is out of date,
+    not that the message is gone. The read path used to stop there,
+    which contradicts the rule this unit states: the index orders the
+    search, it never limits it."""
+
+    @pytest.mark.asyncio
+    async def test_a_live_search_runs_after_every_row_proves_stale(self):
+        from apple_mail_mcp.server import _get_email_by_header
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        # The index points at a ROWID that now holds a different message.
+        mgr.find_by_rfc822.return_value = [("uuid-work", "INBOX", 1)]
+
+        async def by_id(mid, acct=None, mbox=None):
+            return {
+                "id": mid,
+                "message_id": "<somebody-else@x>" if mid == 1 else "<a@x>",
+            }
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._locate_header_via_jxa",
+                AsyncMock(return_value=("Private", "Archive", 99)),
+            ),
+            patch("apple_mail_mcp.server._get_email_by_id", side_effect=by_id),
+        ):
+            out = await _get_email_by_header("<a@x>", None, None)
+
+        assert out["id"] == 99, (
+            "the message had moved to another account; the stale row "
+            "must not end the search"
+        )
+
+
+class TestBracketsAreNotPartOfDeduplication:
+    """`["<a@b>", "a@b"]` is one message twice. Collapsing on the raw
+    string writes it twice and reports it as both updated and unchanged
+    — against the bracket-insensitive identity this unit declares."""
+
+    def test_the_two_spellings_collapse(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids(["<a@b>", "a@b"]) == ["<a@b>"]
+        assert _normalize_message_ids(["a@b", "<a@b>"]) == ["a@b"]
+
+    def test_different_messages_still_survive(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert len(_normalize_message_ids(["<a@b>", "<c@d>"])) == 2

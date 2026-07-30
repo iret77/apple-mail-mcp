@@ -298,7 +298,7 @@ def _normalize_message_ids(
         )
 
     ids: list[MessageRef] = []
-    seen: set[MessageRef] = set()
+    seen: set[object] = set()
     for item in raw:
         if isinstance(item, bool) or not isinstance(item, (int, str)):
             raise ValueError(
@@ -362,8 +362,14 @@ def _normalize_message_ids(
                     f"the `message_id` field from a search or get_emails "
                     f"result, or a list of them."
                 )
-        if item not in seen:
-            seen.add(item)
+        # Collapse on the COMPARISON key, not the raw string. Angle
+        # brackets are not part of the identity, so ["<a@b>", "a@b"] is
+        # one message twice — writing it twice reports it as both
+        # updated and unchanged, which contradicts the very contract
+        # this unit states.
+        key = _header_key(item) if isinstance(item, str) else item
+        if key not in seen:
+            seen.add(key)
             ids.append(item)
 
     if not ids:
@@ -1748,6 +1754,19 @@ async def _resolve_header_to_location(
     if candidates:
         return candidates
 
+    return await _live_header_candidates(header, account, excluded)
+
+
+async def _live_header_candidates(
+    header: str,
+    account: str | None,
+    excluded: set[str],
+) -> list[tuple[str, str, int]]:
+    """Ask Apple Mail directly. Separated so the read paths can fall
+    back to it AFTER the index's candidates all turned out stale —
+    otherwise a message the index misplaces is reported missing while it
+    sits in another account, which is exactly what "the index orders the
+    search, it never limits it" forbids."""
     live = await _locate_header_via_jxa(header)
     if live is None:
         return []
@@ -1808,11 +1827,34 @@ async def _get_email_by_header(
             result.get("message_id"),
         )
 
+    # Every indexed location was stale. That says the INDEX is out of
+    # date, not that the message is gone — ask Mail before concluding
+    # anything.
+    try:
+        live = await _live_header_candidates(
+            header, account, _excluded_account_names()
+        )
+    except _LiveLookupIncomplete as exc:
+        raise ValueError(
+            f"Email {header!r} was not where the index expected it, and "
+            f"the live search could not be completed: {exc}. This says "
+            f"nothing about whether the message exists."
+        ) from None
+    for acct_name, mbox, rowid in live:
+        try:
+            result = await _get_email_by_id(rowid, acct_name, mbox)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if _header_key(result.get("message_id")) == _header_key(header):
+            return result
+
     if last_error is not None:
         logger.debug("header lookup last error: %s", last_error)
     raise ValueError(
         f"Email {header!r} could not be retrieved: every location on "
-        f"record is stale. Re-index and try again."
+        f"record is stale, and a live search of the visible accounts "
+        f"did not find it either."
     )
 
 
