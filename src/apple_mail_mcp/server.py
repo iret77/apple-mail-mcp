@@ -632,8 +632,9 @@ async def get_email(
             few milliseconds from disk — so fetching the page you just
             listed is nearly free. A list returns a list of
             {"ref": id, "email": {...}} or {"ref": id, "error": "..."}
-            entries, in the order given: one unreadable message never
-            takes the batch down.
+            entries, one per DISTINCT id, in the order given — a repeated
+            id is read once. One unreadable message never takes the batch
+            down.
         account: Optional hint (speeds up lookup, not required)
         mailbox: Optional hint (speeds up lookup, not required)
 
@@ -667,26 +668,30 @@ async def get_email(
         # callers and their parsers depend on it.
         return await _get_email_by_id(message_id, account, mailbox)
 
+    # Bound what the CALLER sent, before collapsing duplicates. Checking
+    # the deduplicated list would let [1] * 51 through the cap.
+    if len(message_id) > MAX_READ_BATCH:
+        raise ValueError(
+            f"Too many ids ({len(message_id)}); max {MAX_READ_BATCH} per "
+            f"call. Each one is a disk read of a few milliseconds, so the "
+            f"limit is about how much text fits in your context, not "
+            f"speed — split the list."
+        )
+
     refs: list[int] = []
     for raw in message_id:
-        try:
-            ref = int(raw)
-        except (TypeError, ValueError):
+        # Reject rather than coerce. int(1.9) is 1, which would quietly
+        # fetch a DIFFERENT message than the caller named — an id is
+        # exact or it is a mistake worth reporting.
+        if isinstance(raw, bool) or not isinstance(raw, int):
             raise ValueError(
                 f"Invalid message id {raw!r}: expected an integer."
-            ) from None
-        if ref not in refs:
-            refs.append(ref)
+            )
+        if raw not in refs:
+            refs.append(raw)
 
     if not refs:
         return []
-    if len(refs) > MAX_READ_BATCH:
-        raise ValueError(
-            f"Too many ids ({len(refs)}); max {MAX_READ_BATCH} per call. "
-            f"Each one is a disk read of a few milliseconds, so the limit "
-            f"is about how much text fits in your context, not speed — "
-            f"split the list."
-        )
 
     async def fetch(ref: int) -> dict:
         try:

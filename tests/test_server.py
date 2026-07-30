@@ -1735,6 +1735,26 @@ class TestBatchReads:
             await get_email([1, "not-a-number"])
 
     @pytest.mark.asyncio
+    async def test_a_float_is_rejected_not_truncated(self):
+        """int(1.9) is 1 — coercing would quietly fetch a DIFFERENT
+        message than the caller named."""
+        from apple_mail_mcp.server import get_email
+
+        with pytest.raises(ValueError, match="1.9"):
+            await get_email([1.9])
+
+    @pytest.mark.asyncio
+    async def test_the_cap_counts_what_was_sent_not_what_survives_dedup(
+        self,
+    ):
+        """[1] * 51 collapses to one id, so a cap applied after
+        deduplication does not cap anything."""
+        from apple_mail_mcp.server import MAX_READ_BATCH, get_email
+
+        with pytest.raises(ValueError, match="Too many"):
+            await get_email([1] * (MAX_READ_BATCH + 1))
+
+    @pytest.mark.asyncio
     async def test_an_empty_list_is_an_empty_answer(self):
         from apple_mail_mcp.server import get_email
 
