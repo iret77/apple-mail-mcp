@@ -50,6 +50,15 @@ needed (a first run that fails). Flipping the default is one line in
   (containing mail paths and account names) world-readable from the first rotation.
 ```
 
+
+### Changelog and version
+
+Deliberately not in the diff. Upstream's changelog entries carry issue numbers
+under a release heading the maintainer owns, and twenty-two prepared branches
+each editing the same `[Unreleased]` block would conflict twenty-two ways and
+force a rebase after every merge. The prose is above, ready to paste; the
+release number is yours to choose.
+
 ### Verification
 
 ```
