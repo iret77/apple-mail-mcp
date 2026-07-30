@@ -8,6 +8,7 @@ helper *is* the new behavior; the CLI surface around it is unchanged.
 from __future__ import annotations
 
 import pstats
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -142,6 +143,43 @@ class TestAutoBuildOnFirstRun:
 
         manager.build_from_disk.assert_called_once()
         assert "building in the background" in err
+
+    def test_the_build_really_is_in_the_background(self, monkeypatch, capsys):
+        """The other test passes even if the build were synchronous,
+        because the mock returns instantly. Make it slow: mcp.run() has
+        to be reached before the build finishes, or 'background' is just
+        a word in a message."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_build(*a, **kw):
+            started.set()
+            release.wait(timeout=5)
+            return 0
+
+        mock_manager = MagicMock()
+        mock_manager.has_index.return_value = False
+        mock_manager.build_from_disk.side_effect = slow_build
+        mock_mcp = MagicMock()
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", "true")
+
+        try:
+            with (
+                patch(
+                    "apple_mail_mcp.index.IndexManager.get_instance",
+                    return_value=mock_manager,
+                ),
+                patch("apple_mail_mcp.server.mcp", mock_mcp),
+                patch("apple_mail_mcp.server._cleanup_old_attachments"),
+            ):
+                from apple_mail_mcp.cli import _run_serve
+
+                _run_serve(watch=False)
+
+            assert started.wait(timeout=5), "the build never started"
+            mock_mcp.run.assert_called_once()  # reached while it runs
+        finally:
+            release.set()
 
 
 class TestAnEmptyIndexIsBuiltNotSynced:
