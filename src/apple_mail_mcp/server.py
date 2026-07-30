@@ -155,10 +155,14 @@ class Mailbox(TypedDict):
     unreadCount: int
 
 
-class EmailSummary(TypedDict):
+class EmailSummary(TypedDict, total=False):
     """Summary of an email (used in list/search results)."""
 
     id: int
+    # Which account this message is in. Only set when the listing can
+    # span more than one (account="all"), where a flat list is otherwise
+    # impossible to group.
+    account: str
     subject: str
     sender: str
     date_received: str
@@ -362,9 +366,13 @@ async def list_mailboxes(account: str | None = None) -> list[Mailbox]:
     List all mailboxes for an email account.
 
     Args:
-        account: Account name, or "all" to list across EVERY visible
-                 account in one call. Uses APPLE_MAIL_DEFAULT_ACCOUNT
-                 env var or the first account if not specified.
+        account: Account name, or "all" (or "*") to list across EVERY
+                 visible account in one call — each row then carries an
+                 `account` field, since a flat list is otherwise
+                 impossible to group. Both spellings are reserved: an
+                 account literally named "all" cannot be targeted by
+                 name. Uses APPLE_MAIL_DEFAULT_ACCOUNT env var or the
+                 first account if not specified.
 
     Returns:
         List of mailbox dictionaries with 'name' and 'unreadCount' fields.
@@ -523,6 +531,20 @@ async def get_emails(
                 return [
                     EmailSummary(
                         id=r.message_id,
+                        # Only under "all": a single-account listing
+                        # already knows its account, and adding the
+                        # field there would change every existing
+                        # response for no gain.
+                        **(
+                            {
+                                "account": _get_account_map().uuid_to_name(
+                                    r.account_uuid
+                                )
+                                or r.account_uuid
+                            }
+                            if all_accounts
+                            else {}
+                        ),
                         subject=r.subject,
                         sender=r.sender,
                         date_received=r.date_received,

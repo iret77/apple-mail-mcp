@@ -1760,6 +1760,96 @@ class TestCrossAccountListing:
         assert captured["mailbox_name"] == "Sent"
 
     @pytest.mark.asyncio
+    async def test_every_row_names_its_account(self):
+        """A flat list across six accounts is unusable without it — the
+        caller cannot tell whose inbox a message came from."""
+        from types import SimpleNamespace
+
+        rows = [
+            SimpleNamespace(
+                message_id=i,
+                subject=f"s{i}",
+                sender="a@x",
+                date_received="2026-07-28T10:00:00",
+                read=False,
+                flagged=False,
+                account_uuid=uuid,
+                mailbox_name="INBOX",
+            )
+            for i, uuid in ((1, "uuid-work"), (2, "uuid-private"))
+        ]
+        amap = _acct_map()
+        amap.uuid_to_name.side_effect = lambda u: {
+            "uuid-work": "Work",
+            "uuid-private": "Private",
+        }.get(u)
+        amap.get_cached_accounts.return_value = []
+        with (
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                return_value=rows,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            out = await get_emails(account="all")
+
+        assert [e["account"] for e in out] == ["Work", "Private"]
+
+    @pytest.mark.asyncio
+    async def test_a_single_account_listing_keeps_its_old_shape(self):
+        """Adding the field everywhere would change every existing
+        response for no gain."""
+        from types import SimpleNamespace
+
+        rows = [
+            SimpleNamespace(
+                message_id=1,
+                subject="s",
+                sender="a@x",
+                date_received="2026-07-28T10:00:00",
+                read=False,
+                flagged=False,
+                account_uuid="uuid-work",
+                mailbox_name="INBOX",
+            )
+        ]
+        amap = _acct_map()
+        amap.name_to_uuid.return_value = "uuid-work"
+        amap.get_cached_accounts.return_value = [
+            {"name": "Work", "id": "uuid-work"}
+        ]
+        with (
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                return_value=rows,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            out = await get_emails(account="Work")
+
+        assert "account" not in out[0]
+
+    @pytest.mark.asyncio
     async def test_excluded_accounts_survive_the_shortcut(self):
         """ "all" must not become a hole in the exclusion boundary."""
         from types import SimpleNamespace

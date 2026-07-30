@@ -316,6 +316,11 @@ Exclusions are unaffected: they filter on **UUIDs** further down, not on the
 account name, so `"all"` cannot become a hole in the excluded-account boundary
 (#90) — there is a test for exactly that.
 
+Rows returned under `"all"` carry an **`account`** field; a single-account
+listing does not, since it would change every existing response for no gain.
+`"all"` and `"*"` are reserved words — an account literally named "all" cannot
+be targeted by name, which is documented rather than worked around.
+
 **The JXA fallback refuses rather than answering narrowly.** It walks one account
 at a time, so silently falling through would answer a different question than the
 one that was asked, and the caller would have no way to notice.

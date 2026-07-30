@@ -62,7 +62,7 @@ Get emails from a mailbox with optional filtering. This is the primary tool for 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `account` | `string?` | env default | Account name, or `"all"` for every visible account |
+| `account` | `string?` | env default | Account name, or `"all"` (`"*"`) for every visible account. Reserved: an account literally named "all" cannot be targeted by name |
 | `mailbox` | `string?` | `INBOX` | Mailbox name. Not defaulted when `account="all"` — see the note below |
 | `filter` | `string?` | `all` | Filter type (see below) |
 | `limit` | `int?` | `50` | Max emails to return |
@@ -93,6 +93,11 @@ get_emails("Work", "INBOX", filter="today")
 get_emails(account="all", filter="unread")
 # Unread across every visible account, in one call
 ```
+
+!!! note
+    Under `account="all"` every returned row carries an `account` field — a flat
+    list across several accounts is otherwise impossible to group. A
+    single-account listing does not add the field.
 
 !!! note
     With `account="all"` and no explicit `mailbox`, the `INBOX` default is
