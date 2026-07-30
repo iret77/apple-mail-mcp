@@ -299,6 +299,28 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
 
+## The server writes its own log
+
+Run under a desktop client, an MCP server's stderr goes wherever that client
+decided — in practice nowhere the user can reach. A build that dies during
+startup leaves no trace at all, and "it doesn't work" is the entire bug report.
+
+So the server logs to `~/.apple-mail-mcp/server.log`, rotating at 1 MB with
+three backups. `APPLE_MAIL_LOG_PATH` relocates it; an **empty value disables**
+it.
+
+Two details that are easy to get wrong:
+
+- **The mode is re-applied on every open, not chmod'ed once.** On rollover
+  `RotatingFileHandler` reopens the path with plain `open()`, i.e. 0644 under the
+  usual umask. The log carries mail paths and account names, so from the first
+  rotation onward it would silently have become world-readable.
+  `_OwnerOnlyRotatingFileHandler` opens with 0600 itself, which covers the
+  rotated file too.
+- **"Disabled" must be an explicit `None`.** `Path("")` normalizes to `"."`,
+  which is a truthy directory, so a falsy guard never fires and the handler tries
+  to open the current directory as a file.
+
 ## Coding Standards
 
 - **Python 3.11+**, type hints required

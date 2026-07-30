@@ -112,6 +112,27 @@ silently using degraded config.
 - **Force a retry** by rebuilding the index: `apple-mail-mcp rebuild`. This re-parses every `.emlx` from disk; entries that succeed are removed from the DLQ.
 - **DLQ writes themselves failing** (logged at `ERROR` level with `"DLQ write failed"`): indicates a deeper problem — disk full or DB corruption. Check disk space and SQLite integrity (`PRAGMA integrity_check;`).
 
+## Where Are the Logs?
+
+**Symptom:** Something goes wrong under a desktop client (Claude Desktop, an
+IDE) and there is no error to point at — search comes back empty, or a tool
+fails with nothing on screen.
+
+**Cause:** An MCP server's stderr goes wherever the client decided, which is
+usually nowhere you can reach. A build that dies during startup leaves no trace
+in the conversation.
+
+**Fix:** Read `~/.apple-mail-mcp/server.log`. It rotates at 1 MB (three
+backups), is created readable only by you, and records what the server did —
+including the build or sync that failed.
+
+```bash
+tail -n 50 ~/.apple-mail-mcp/server.log
+```
+
+Set `APPLE_MAIL_LOG_PATH` to move it elsewhere, or to an empty string to turn
+file logging off.
+
 ## Mail.app Not Running
 
 **Symptom:** JXA-fallback tools (`list_mailboxes`, `get_email` cascade strategies 1–3, cold `list_accounts()` calls, and `get_emails()` when the Envelope Index path is unavailable) fail with AppleScript errors.

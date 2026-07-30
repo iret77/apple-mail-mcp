@@ -78,6 +78,7 @@ in CI or in MCP client launch configs.
 | `APPLE_MAIL_INDEX_STALENESS_HOURS` | `24` | Hours before index is considered stale |
 | `APPLE_MAIL_INDEX_EXCLUDE_MAILBOXES` | `Drafts` | Comma-separated mailboxes to skip in search |
 | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` | _unset_ | Comma-separated account names (exact, case-sensitive) hidden from the entire server: never indexed, filtered from search, invisible to the list/get tools |
+| `APPLE_MAIL_LOG_PATH` | `~/.apple-mail-mcp/server.log` | Where the server writes its own log (rotating, 1 MB × 3, created `0600`). Set to an empty string to disable file logging |
 | `APPLE_MAIL_READ_ONLY` | `false` | When `true`, disables any write operations |
 
 ## Precedence
