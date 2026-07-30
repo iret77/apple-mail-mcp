@@ -323,6 +323,35 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
 
+## Message identity: hand out both, tell the caller which to keep
+
+A Mail.app message id is a **per-mailbox ROWID**. It is exact while the message
+stays put and dead the moment it is filed elsewhere — which happens routinely,
+since most accounts are also open on a phone and a tablet. The RFC822
+`Message-ID` header survives that. Therefore **every read path hands out both**:
+
+- `search()` — full text and attachment scopes — reads it from the
+  `rfc822_message_id` column.
+- `get_emails()` fast path takes it from our own index in ONE batched
+  `IndexManager.get_rfc822_ids()` lookup for the whole page. Apple's Envelope
+  Index has no header column, so this is the only source; a per-row query would
+  undo the reason that path exists. A row the index does not know simply yields
+  `None` — never a wrong header — and a failed lookup degrades the listing
+  instead of failing it.
+- The JXA paths take it from `messageId` in `PROPERTY_SETS["standard"]`: one more
+  bulk IPC call for an entire listing, not one per message.
+- `get_email()` returns it as `message_id`.
+
+The docstrings say which one to keep, because a model handed two identifiers will
+otherwise use the shorter one.
+
+**`MailCore.batchFetch` degrades per property.** Carrying one more property means
+one more bulk call that Mail could refuse on some build, and a single refusal used
+to take the whole listing down. A refused property is padded with nulls so the
+caller's per-index arithmetic still lines up — while a fetch where *nothing*
+could be read still raises, because an unreadable mailbox must never read as
+"0 messages".
+
 ## Coding Standards
 
 - **Python 3.11+**, type hints required

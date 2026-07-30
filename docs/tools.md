@@ -78,7 +78,13 @@ Get emails from a mailbox with optional filtering. This is the primary tool for 
 | `last_7_days` | Emails from the last 7 days |
 | `this_week` | Alias for `last_7_days` |
 
-**Returns:** List of email summaries sorted by date (newest first), each with: `id`, `subject`, `sender`, `date_received`, `read`, `flagged`.
+**Returns:** List of email summaries sorted by date (newest first), each with: `id`, `message_id`, `subject`, `sender`, `date_received`, `read`, `flagged`.
+
+!!! tip
+    `message_id` is the RFC822 Message-ID header — the handle to keep if the
+    result is used in a later call. `id` is a per-mailbox ROWID and stops
+    resolving as soon as any device files the message elsewhere. It is `null`
+    for messages the search index has not seen yet.
 
 ```python
 get_emails()
@@ -155,6 +161,11 @@ Search emails with automatic FTS5 optimization. Uses the FTS5 index for fast sea
 | `attachments` | Attachment filenames | SQL (requires index) |
 
 **Returns:** List of results sorted by relevance (FTS5) or date (JXA fallback), each with: `id`, `subject`, `sender`, `date_received`, `score`, `matched_in`, and optionally `content_snippet`, `account`, `mailbox`.
+
+!!! tip
+    Each result also carries `message_id`, the RFC822 header. Prefer it over
+    `id` for anything used in a later call — `id` is a per-mailbox ROWID and
+    stops resolving as soon as any device files the message elsewhere.
 
 ```python
 search("invoice")
