@@ -343,9 +343,7 @@ async def _resolve_write_targets(
             # ambiguous id is reported instead of resolved.
             if (
                 mailbox is None
-                and manager.count_email_locations(
-                    mid, account=idx_acct_uuid
-                )
+                and manager.count_email_locations(mid, account=idx_acct_uuid)
                 > 1
             ):
                 ambiguous.append(mid)
@@ -506,9 +504,7 @@ async def _apply_write(
         # another mailbox, and picking one would write to mail the
         # caller did not ask about.
         failed.extend(ambiguous)
-        errors.append(
-            f"{len(ambiguous)} id(s) exist in more than one mailbox"
-        )
+        errors.append(f"{len(ambiguous)} id(s) exist in more than one mailbox")
         result["failed"] = failed
         result["error"] = "; ".join(dict.fromkeys(errors))[:500]
         result["hint"] = (
