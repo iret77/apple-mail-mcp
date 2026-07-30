@@ -14,7 +14,7 @@ src/apple_mail_mcp/
 ├── executor.py         # run_jxa(), execute_with_core(), execute_query()
 ├── index/              # FTS5 search index module
 │   ├── __init__.py     # Exports IndexManager
-│   ├── schema.py       # SQLite schema v5 (DLQ + attachments)
+│   ├── schema.py       # SQLite schema v6 (DLQ + attachments)
 │   ├── manager.py      # IndexManager class (singleton)
 │   ├── disk.py         # .emlx reading + get_disk_inventory()
 │   ├── sync.py         # Disk-based state reconciliation

@@ -53,7 +53,9 @@ pipx upgrade apple-mail-mcp
 
 **Symptom:** After upgrading, search returns unexpected results or `get_attachment()` doesn't work.
 
-**Cause:** Schema changes between versions (e.g., v0.1.3 added attachment metadata in schema v4; v0.3.0 added the failed-parse DLQ in schema v5). Migrations are forward-only and run automatically; a manual rebuild is only needed if existing rows lack new columns (attachments, paths).
+**Cause:** Schema changes between versions (e.g., v0.1.3 added attachment metadata in schema v4; v0.3.0 added the failed-parse DLQ in schema v5; schema v6 added the stable `rfc822_message_id`). Migrations are forward-only and run automatically; a manual rebuild is only needed if existing rows lack new columns (attachments, paths).
+
+Rows indexed before v6 keep `rfc822_message_id` as `NULL` — the migration adds the column without re-reading 70k messages. Those rows still work; they just fall back to the numeric id, which stops resolving if another device files the message elsewhere. A full rebuild backfills them.
 
 **Fix:**
 
