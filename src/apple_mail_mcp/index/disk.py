@@ -359,8 +359,12 @@ def header_text(message, name: str, default: str = "") -> str:
     raw = message.get(name)
     if raw is None:
         return default
-    if isinstance(raw, str):
-        return raw
+    # Decode unconditionally. Short-circuiting on `str` looks like an
+    # optimization and is a regression: a correctly RFC 2047-encoded
+    # header IS a str ("=?UTF-8?B?SsO2cmc=?="), and returning it
+    # unchanged indexes the encoded-word literally instead of "Jörg".
+    # That is the normal case for international mail, so the exotic
+    # crash would have been fixed by breaking the common path.
     try:
         return str(make_header(decode_header(str(raw))))
     except Exception:
@@ -415,11 +419,6 @@ def parse_emlx(path: Path) -> EmlxEmail | None:
 
         # Extract sender
         sender = header_text(msg, "From")
-        if sender:
-            try:
-                sender = str(make_header(decode_header(sender)))
-            except (UnicodeDecodeError, LookupError):
-                pass
 
         # Extract received date from Received header (delivery time)
         # Falls back to Date header if no Received header exists

@@ -1713,7 +1713,61 @@ class TestContentIdHeaderCrash:
         assert parsed is not None
         assert len(parsed.attachments or []) == 1
 
+    def test_an_encoded_subject_is_still_decoded(self, tmp_path):
+        """The regression this helper can cause if it is written as an
+        optimization: a correctly RFC 2047-encoded header IS a `str`, so
+        returning `str` values unchanged would index the encoded word
+        literally. That is the NORMAL case for international mail — the
+        exotic crash would be fixed by breaking the common path."""
+        from apple_mail_mcp.index.disk import parse_emlx
+
+        mime = (
+            b"From: a@b.com\r\n"
+            b"Subject: =?UTF-8?B?SsO2cmcgTcO8bGxlcjogUmVjaG51bmc=?=\r\n"
+            b"Date: Mon, 1 Jan 2026 10:00:00 +0100\r\n"
+            b"Content-Type: text/plain\r\n\r\nbody\r\n"
+        )
+        parsed = parse_emlx(self._emlx(tmp_path, mime))
+        assert parsed is not None
+        assert parsed.subject == "Jörg Müller: Rechnung"
+
+    def test_an_encoded_sender_is_still_decoded(self, tmp_path):
+        from apple_mail_mcp.index.disk import parse_emlx
+
+        mime = (
+            b"From: =?UTF-8?Q?J=C3=B6rg?= <j@b.com>\r\nSubject: t\r\n"
+            b"Date: Mon, 1 Jan 2026 10:00:00 +0100\r\n"
+            b"Content-Type: text/plain\r\n\r\nbody\r\n"
+        )
+        parsed = parse_emlx(self._emlx(tmp_path, mime))
+        assert parsed is not None
+        assert "Jörg" in parsed.sender
+
+    def test_a_header_object_never_escapes_as_itself(self):
+        """The actual crash: `.get()` returns a Header (not a str) when
+        the value carries bytes it cannot decode, and the first
+        `.strip()` on it raises AttributeError."""
+        import email
+
+        from apple_mail_mcp.index.disk import header_text
+
+        raw = (
+            b"From: a@b.com\r\nSubject: t\r\n"
+            b"Received: from \xe4\xf6.example ([1.2.3.4])\r\n\r\nbody"
+        )
+        msg = email.message_from_bytes(raw)
+        # Precondition — if this ever stops holding, the guard below is
+        # testing nothing and should be revisited.
+        assert not isinstance(msg.get("Received"), str)
+
+        value = header_text(msg, "Received")
+        assert isinstance(value, str)
+        value.strip()  # the operation that used to raise
+
     def test_non_ascii_attachment_filename_parses(self, tmp_path):
+        """`get_filename()` returns a `str` here, so `_filename_text()`
+        is defence in depth rather than the load-bearing fix — what this
+        asserts is that such a part is still indexed at all."""
         from apple_mail_mcp.index.disk import parse_emlx
 
         mime = (
