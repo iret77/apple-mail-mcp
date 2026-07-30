@@ -17,6 +17,7 @@ Usage:
     apple-mail-mcp rebuild    # Force rebuild index
 """
 
+import logging
 import sys
 import time
 from collections.abc import Callable
@@ -26,6 +27,8 @@ from typing import Annotated, TypeVar
 import cyclopts
 
 from .config import get_index_path
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -338,6 +341,9 @@ def index(
         print(f"  Database size: {_format_size(stats.db_size_mb)}")
 
     except PermissionError as e:
+        # Into the log as well, not only onto a terminal nobody kept:
+        # a failing build is the case this file exists for.
+        logger.error("Index build failed: %s", e, exc_info=True)
         print(f"\n✗ Permission denied: {e}", file=sys.stderr)
         print("\nTo fix this:", file=sys.stderr)
         print("  1. Open System Settings", file=sys.stderr)
@@ -347,10 +353,12 @@ def index(
         sys.exit(1)
 
     except FileNotFoundError as e:
+        logger.error("Index build failed: %s", e, exc_info=True)
         print(f"\n✗ Not found: {e}", file=sys.stderr)
         sys.exit(1)
 
     except Exception as e:
+        logger.error("Index build failed: %s", e, exc_info=True)
         print(f"\n✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -514,6 +522,7 @@ def rebuild(
         print(f"✓ Rebuilt {count:,} emails in {_format_time(elapsed)}")
 
     except Exception as e:
+        logger.error("Rebuild failed: %s", e, exc_info=True)
         print(f"\n✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
 

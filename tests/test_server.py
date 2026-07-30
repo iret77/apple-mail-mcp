@@ -1784,3 +1784,42 @@ class TestTheLogFileModeIsEnforcedNotJustRequested:
                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
             }
             assert "_setup_file_logging" in calls, name
+
+
+class TestBuildFailuresReachTheLogFile:
+    """Installing a handler is not logging.
+
+    `index` set up file logging and then reported its failure with
+    `print(..., file=sys.stderr)` only — so the command most likely to
+    fail left `server.log` empty, which is precisely the situation the
+    file exists for.
+    """
+
+    def test_the_index_command_logs_its_failure(self, tmp_path, monkeypatch):
+        import logging
+        from unittest.mock import patch
+
+        target = tmp_path / "server.log"
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", str(target))
+
+        from apple_mail_mcp import cli
+
+        root = logging.getLogger("apple_mail_mcp")
+        try:
+            with (
+                patch.object(
+                    cli,
+                    "_run_optionally_profiled",
+                    side_effect=PermissionError("no Full Disk Access"),
+                ),
+                pytest.raises(SystemExit),
+            ):
+                cli.index()
+            for h in root.handlers:
+                h.flush()
+            assert target.exists()
+            assert "no Full Disk Access" in target.read_text()
+        finally:
+            for h in list(root.handlers):
+                h.close()
+                root.removeHandler(h)
