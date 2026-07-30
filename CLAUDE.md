@@ -299,6 +299,25 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 # result.added, result.deleted, result.moved, result.errors
 ```
 
+## One bad message must never kill the run
+
+A non-ASCII `Subject`, `Received`, `Content-ID` or attachment filename makes
+Python's `email` module hand back a `Header` object instead of a `str`. The first
+`.strip()` on it raises `AttributeError` — and because that happened inside the
+sync loop, **the whole sync died** on the first such message. It ran unnoticed
+for a day here, since the traceback only ever reached stderr.
+
+Two rules follow, and both are load-bearing:
+
+- **Header access goes through `header_text()` / `_filename_text()`**, which
+  guarantee a decoded `str`. A guard test forbids raw `msg["..."]` access
+  returning to the parser, because the failure mode is invisible: it looks like
+  "the sync stopped finding new mail".
+- **The per-message guard in `sync.py` catches `Exception`, not a list of
+  types.** Narrowing it to the three types seen so far is what let the fourth one
+  through. A message that cannot be parsed is recorded in the dead-letter queue
+  and the run continues.
+
 ## Coding Standards
 
 - **Python 3.11+**, type hints required
