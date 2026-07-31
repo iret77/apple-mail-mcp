@@ -519,14 +519,23 @@ class TestAmbiguousIdsAreNeverGuessed:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
-        mgr.count_email_locations.return_value = 2
+        # The count answers the question it is ASKED: one message once
+        # both halves of the location are pinned, two when they are not.
+        mgr.count_email_locations.side_effect = (
+            lambda mid, account=None, mailbox=None: 1
+            if (account and mailbox)
+            else 2
+        )
         mgr.find_email_location.return_value = ("uuid-work", "Archive")
+
+        acct_map = _mock_acct_map()
+        acct_map.name_to_uuid.return_value = "uuid-work"
 
         with (
             patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
             patch(
                 "apple_mail_mcp.server._get_account_map",
-                return_value=_mock_acct_map(),
+                return_value=acct_map,
             ),
         ):
             groups, _, _, ambiguous = await _resolve_write_targets(
@@ -537,6 +546,36 @@ class TestAmbiguousIdsAreNeverGuessed:
         assert groups == [
             {"account": "Work", "mailbox": "Archive", "ids": [42]}
         ]
+
+    @pytest.mark.asyncio
+    async def test_a_mailbox_without_an_account_is_still_ambiguous(self):
+        """Every account has an INBOX, and the same ROWID names a
+        different message in each. Checking only when `mailbox` was
+        omitted let that through to an arbitrary pick — a write to mail
+        the caller never named."""
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        # Two accounts hold ROWID 42 in a mailbox called INBOX.
+        mgr.count_email_locations.side_effect = (
+            lambda mid, account=None, mailbox=None: 1 if account else 2
+        )
+        mgr.find_email_location.return_value = ("uuid-work", "INBOX")
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+        ):
+            groups, _, _, ambiguous = await _resolve_write_targets(
+                [42], None, "INBOX"
+            )
+
+        assert ambiguous == [42]
+        assert groups == []
 
 
 class TestAnIncompleteScanIsNotAnAbsence:
@@ -554,3 +593,49 @@ class TestAnIncompleteScanIsNotAnAbsence:
         # …and the plain not-found path still exists for the case where
         # the scan really did cover everything.
         assert "notFound.push(id)" in script
+
+
+class TestATimeoutIsAnUnknownOutcomeNotAFailedWrite:
+    """The deadline says the ANSWER never came back, not that the write
+    never happened: Mail may have applied some, all or none of the batch
+    before it expired. Reporting "never reached the message" is the same
+    false verdict as calling an unfinished search a missing message."""
+
+    @pytest.mark.asyncio
+    async def test_the_hint_says_unknown_and_not_never(self):
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_email_location.return_value = ("uuid-work", "INBOX")
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="Work"),
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=TimeoutError(),
+            ),
+        ):
+            out = await _apply_write(
+                [7], None, None, lambda g: WriteBuilder.set_read(g, True)
+            )
+
+        assert out["failed"] == [7]
+        hint = out["hint"].lower()
+        assert "unknown" in hint
+        assert "never reached" not in hint, (
+            "a timeout was reported as a write that did not happen"
+        )
+        # An empty asyncio.TimeoutError stringifies to "" — the cause
+        # must not come back blank.
+        assert out["error"].strip()

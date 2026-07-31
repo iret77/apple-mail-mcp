@@ -320,6 +320,21 @@ set_flag([1, 2, 3], color="none")   # unflag a batch
 ```
 
 !!! note
+    A Mail.app id is unique only within its mailbox. If the index finds the
+    same number in more than one place — and naming a `mailbox` without an
+    `account` still leaves every account's copy of that mailbox — the id goes
+    to `failed` with an explanation instead of being written to one of them at
+    random. Pass `account` **and** `mailbox`, or use the `message_id` header,
+    which is unique everywhere.
+
+!!! note
+    A write that times out lands in `failed` with the outcome reported as
+    **unknown**: Mail did not answer in time, so some, all or none of the batch
+    may have been applied. Read the messages back before retrying — retrying is
+    safe either way, since setting a flag or a read status twice changes
+    nothing.
+
+!!! note
     The server attaches **no meaning** to any flag colour — what a colour stands
     for is your own convention. An assistant should ask rather than assume.
 

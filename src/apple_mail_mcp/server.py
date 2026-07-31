@@ -220,6 +220,24 @@ MAX_WRITE_BATCH = 500
 # the all-mailbox scan reuses Strategy 3's budget.
 WRITE_TIMEOUT = _clamped_env_int("APPLE_MAIL_WRITE_TIMEOUT", 30, 1, 300)
 
+# A timeout carries no message of its own (asyncio.TimeoutError is
+# empty), so str(exc) would put an empty string where the cause belongs.
+# The mark is what the hint keys on.
+_TIMEOUT_MARK = "timed out"
+
+
+def _write_error_text(exc: BaseException) -> str:
+    """What to report for a write that did not come back cleanly.
+
+    A timeout is not a failed write — it is an UNKNOWN one: Mail may
+    have applied some, all or none of the batch before the deadline.
+    Reporting it as "never reached the message" is the same false
+    verdict as calling an unfinished search a missing message.
+    """
+    if isinstance(exc, TimeoutError):
+        return f"Mail {_TIMEOUT_MARK} — outcome unknown"
+    return str(exc) or f"{type(exc).__name__}"
+
 
 class WriteResult(TypedDict, total=False):
     """Per-id outcome of a batch write.
@@ -341,9 +359,16 @@ async def _resolve_write_targets(
             # the first would write to a message the caller never named
             # — for a WRITE that is the worst possible guess, so an
             # ambiguous id is reported instead of resolved.
+            # The mailbox is part of the question, not a reason to
+            # stop asking it: naming "INBOX" without an account still
+            # leaves every account's INBOX, and the same ROWID names a
+            # different message in each. Checking only when `mailbox`
+            # was omitted let exactly that case through to an arbitrary
+            # pick.
             if (
-                mailbox is None
-                and manager.count_email_locations(mid, account=idx_acct_uuid)
+                manager.count_email_locations(
+                    mid, account=idx_acct_uuid, mailbox=mailbox
+                )
                 > 1
             ):
                 ambiguous.append(mid)
@@ -466,7 +491,7 @@ async def _apply_write(
             # which writes did or did not happen.
             logger.warning("located write failed: %s", exc, exc_info=True)
             failed += [i for g in located for i in g["ids"]]
-            errors.append(str(exc))
+            errors.append(_write_error_text(exc))
 
     if scan:
         builder = make_builder(scan)
@@ -480,7 +505,7 @@ async def _apply_write(
         except Exception as exc:
             logger.warning("write scan failed: %s", exc, exc_info=True)
             failed += [i for g in scan for i in g["ids"]]
-            errors.append(str(exc))
+            errors.append(_write_error_text(exc))
 
     result: WriteResult = {
         "updated": updated,
@@ -547,6 +572,22 @@ async def _apply_write(
                 "control it (System Settings > Privacy & Security > "
                 "Automation)."
             )
+        if _TIMEOUT_MARK in blob:
+            # A timeout says the ANSWER never came back, not that the
+            # write never happened: Mail may have applied some, all or
+            # none of them before the deadline. Calling that "never
+            # reached the message" is the same false verdict as calling
+            # an unfinished search a missing message.
+            result["hint"] = (
+                f"{len(failed)} write(s) timed out: Mail did not answer "
+                f"in time, so whether it applied them is UNKNOWN — some, "
+                f"all or none may have gone through. Read the messages "
+                f"back to see the current state before retrying; "
+                f"re-running is safe, because setting a flag or a read "
+                f"status twice changes nothing. Reported: "
+                f"{result['error']}"
+            )
+            return result
         result["hint"] = (
             f"{len(failed)} write(s) never reached the message — this is "
             f"NOT a statement about the mail, which is most likely fine. "

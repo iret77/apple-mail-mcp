@@ -691,7 +691,10 @@ class IndexManager:
         return None
 
     def count_email_locations(
-        self, message_id: int, account: str | None = None
+        self,
+        message_id: int,
+        account: str | None = None,
+        mailbox: str | None = None,
     ) -> int:
         """How many indexed mailboxes hold this Mail.app id.
 
@@ -706,6 +709,12 @@ class IndexManager:
         if account:
             sql += " AND account = ?"
             params.append(account)
+        if mailbox:
+            # A mailbox narrows but does not disambiguate: two accounts
+            # both have an INBOX, and the same ROWID in each names two
+            # different messages.
+            sql += " AND mailbox = ?"
+            params.append(mailbox)
         try:
             row = self._get_conn().execute(sql, params).fetchone()
             return int(row["n"]) if row else 0
