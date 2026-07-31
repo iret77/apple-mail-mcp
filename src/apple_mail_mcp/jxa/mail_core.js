@@ -119,6 +119,24 @@ const MailCore = {
         return (parts[parts.length - 1] || n).trim();
     },
 
+    /**
+     * The same normalization, but KEEPING the hierarchy.
+     *
+     * `normalizeMailboxName` compares last segments, which is what
+     * makes "[Gmail]/Sent Mail" answer "Sent Mail". Applied to a
+     * request that is itself a path it does too much: "projects/inbox"
+     * reduces to "inbox" and the account's real INBOX answers it —
+     * whichever of the two Mail happens to list first. A nested
+     * request names one specific folder, so it is compared whole.
+     */
+    normalizeMailboxPath(name) {
+        let n = String(name == null ? "" : name).trim().toLowerCase();
+        n = n.replace(/^\[[^\]]*\][\/.]?/, "");   // "[Gmail]/…"
+        n = n.replace(/^inbox[\/.]/, "");          // "INBOX.Sent"
+        return n.split(/[\/.]/).map(part => part.trim())
+            .filter(part => part.length > 0).join("/");
+    },
+
     /** Which well-known role does this name denote, if any? */
     /**
      * True when `name` is a mailbox Mail itself would place at the top
@@ -199,8 +217,12 @@ const MailCore = {
      * has no "INBOX" but a "Posteingang"; Exchange says "Deleted
      * Items"; Gmail hides its folders under "[Gmail]/". So the exact
      * name is tried first because it is cheap, then Mail's own notion
-     * of the role, then normalized matching that ignores hierarchy and
-     * case, and only then the name table.
+     * of the role, then the localized/legacy name table, and only then
+     * normalized matching that ignores hierarchy and case.
+     *
+     * The table before the normalized match, not after: normalization
+     * drops hierarchy, so a user's own "Projects/INBOX" reduces to
+     * "inbox" and would answer a request for the real inbox.
      */
     getMailbox(account, name) {
         // 1. Exact match — cheap and correct when it hits.
@@ -222,9 +244,15 @@ const MailCore = {
             ? this.mailboxRole(name)
             : null;
         let names = [];
+        let listError = null;
         try {
             names = account.mailboxes.name();
         } catch (e) {
+            // An account whose mailboxes cannot be read is not an
+            // account without the mailbox. Reporting "no mailbox
+            // matching X. Available: " with an empty list states a
+            // verdict the lookup never established.
+            listError = e;
             names = [];
         }
 
@@ -262,7 +290,18 @@ const MailCore = {
         //    "[Gmail]/Sent Mail" answers a request for "Sent Mail" and
         //    "INBOX.Projects" answers "Projects".
         const wanted = this.normalizeMailboxName(name);
+        const wantedPath = this.normalizeMailboxPath(name);
+        const wantedIsPath = !this.isTopLevelMailbox(name);
         for (const actual of names) {
+            if (wantedIsPath) {
+                // The request is a path: it names ONE folder. Matching
+                // last segments here let the account's real INBOX
+                // answer a request for "projects/inbox" whenever Mail
+                // listed it first — upstream's case-insensitive custom
+                // mailbox lookup, returning the wrong mailbox.
+                if (this.normalizeMailboxPath(actual) !== wantedPath) continue;
+                return account.mailboxes.byName(actual);
+            }
             if (this.normalizeMailboxName(actual) !== wanted) continue;
             // When a ROLE was requested, only a top-level mailbox may
             // answer it here too. Otherwise an account whose only
@@ -276,6 +315,14 @@ const MailCore = {
 
         // 5. Nothing matched. Name what IS there: the caller can only
         //    act on this if it learns which mailboxes exist.
+        if (listError) {
+            throw new Error(
+                "Could not read the mailboxes of this account, so " +
+                JSON.stringify(String(name)) + " could not be looked " +
+                "for: " + (listError && listError.message
+                    ? listError.message : String(listError))
+            );
+        }
         throw new Error(
             "No mailbox matching " + JSON.stringify(String(name)) +
             (role ? " (role: " + role + ")" : "") +

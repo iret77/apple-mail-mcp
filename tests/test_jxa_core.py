@@ -287,6 +287,26 @@ try {{
             == "Projects/INBOX"
         )
 
+    def test_a_nested_request_still_resolves_case_insensitively(self):
+        """Upstream matched custom mailboxes case-insensitively, and a
+        path is a custom mailbox. Comparing last segments broke it in a
+        way that returns the WRONG mailbox rather than none: both
+        "projects/inbox" and the account's real "INBOX" reduce to
+        "inbox", so whichever Mail listed first answered."""
+        assert (
+            self._resolve(["INBOX", "Projects/INBOX"], "projects/inbox")
+            == "Projects/INBOX"
+        )
+        assert (
+            self._resolve(["Projects/INBOX", "INBOX"], "projects/inbox")
+            == "Projects/INBOX"
+        )
+
+    def test_a_nested_request_never_falls_back_to_the_real_inbox(self):
+        """Asking for a folder that does not exist must fail, not hand
+        back the account's inbox because the last segments agree."""
+        assert self._resolve(["INBOX"], "projects/inbox") is None
+
     def test_provider_hierarchy_is_still_hierarchy_we_may_ignore(self):
         """The distinction is provider prefix versus user folder:
         "[Gmail]/Sent Mail" and "INBOX.Sent" are the same mailbox under a
@@ -323,4 +343,50 @@ try {{
         assert (
             self._resolve(["INBOX", "INBOX.Projects"], "Projects")
             == "INBOX.Projects"
+        )
+
+
+class TestAnAccountThatCannotBeListedIsNotAnAccountWithoutTheMailbox:
+    """`account.mailboxes.name()` raising is not evidence of absence.
+
+    The catch swallowed it and left the name list empty, so the lookup
+    ended in "No mailbox matching 'INBOX'. Available: " — a verdict the
+    search never established. Apple Events denied, Mail quitting
+    mid-call and a genuinely missing mailbox then read identically.
+    """
+
+    def _error(self, wanted):
+        import json
+        import subprocess
+
+        js = f"""
+var Mail = {{}};
+const MailCore = {_mail_core_literal()};
+const mailboxes = {{}};
+Object.defineProperty(mailboxes, 'name', {{
+    value: () => {{ throw new Error('-1743 not authorised'); }}
+}});
+mailboxes.byName = (n) => {{ throw new Error('-1728'); }};
+const account = {{ mailboxes }};
+try {{
+    MailCore.getMailbox(account, {json.dumps(wanted)});
+    console.log(JSON.stringify(null));
+}} catch (e) {{ console.log(JSON.stringify(String(e.message))); }}
+"""
+        out = subprocess.run(
+            [_node_bin(), "-e", js],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    def test_the_error_names_the_failure_not_a_missing_mailbox(self):
+        message = self._error("INBOX")
+        assert message is not None
+        assert "-1743" in message, message
+        assert "No mailbox matching" not in message, (
+            "a mailbox list that could not be read was reported as a "
+            "mailbox that does not exist"
         )

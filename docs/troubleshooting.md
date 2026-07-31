@@ -124,20 +124,30 @@ Gmail nests everything under `[Gmail]/`, and dovecot-style servers prefix with
 `INBOX.`. Asking for the literal string `INBOX` matches none of them.
 
 **Fix:** Nothing, in current versions — resolution goes by *role* rather than by
-name: Mail's own `sentMailbox` / `draftsMailbox` / `trashMailbox` /
-`junkMailbox` properties first, then a normalized comparison that strips
-provider hierarchy, then a table of localized names taken from Apple's own
-localized Mail user guide.
+name: the exact name first (cheap, and right when it hits), then Mail's own
+`sentMailbox` / `draftsMailbox` / `trashMailbox` / `junkMailbox` properties,
+then a table of localized names taken from Apple's own localized Mail user
+guide, and only last a normalized comparison that strips provider hierarchy
+and case.
+
+The table before the normalized comparison, not after: normalization drops
+hierarchy, so a folder you created at `Projects/INBOX` reduces to `inbox` and
+would otherwise answer a request for the real inbox.
 
 If a mailbox still cannot be resolved, the error lists the mailboxes that
-actually exist in that account — pass one of those names verbatim. If your
-language is missing from the table, that is a bug worth reporting: include the
-exact names Mail shows and your system language.
+actually exist in that account — pass one of those names verbatim. If the
+account's mailboxes could not be read at all, the error says *that* instead of
+listing nothing: an empty list is not evidence that the mailbox is missing. If
+your language is missing from the table, that is a bug worth reporting: include
+the exact names Mail shows and your system language.
 
 !!! note
-    Only *well-known* mailboxes are resolved by role. A mailbox you created
-    yourself is matched by name, normalized (case and provider prefix), so
-    `INBOX.Projects` answers a request for `Projects`.
+    Only *well-known* mailboxes are resolved by role, and only when they are
+    named at the top level of the account. A mailbox you created yourself is
+    matched by name, normalized (case and provider prefix), so `INBOX.Projects`
+    answers a request for `Projects`. Ask for one by its path — `Projects/INBOX`
+    — and the path is matched whole, so it resolves to that folder and never to
+    the account's real inbox.
 
 ## Mail.app Not Running
 
