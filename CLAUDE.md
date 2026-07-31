@@ -328,7 +328,11 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 A Mail.app message id is a **per-mailbox ROWID**. It is exact while the message
 stays put and dead the moment it is filed elsewhere — which happens routinely,
 since most accounts are also open on a phone and a tablet. The RFC822
-`Message-ID` header survives that. Therefore **every read path hands out both**:
+`Message-ID` header survives that. Therefore **every path that returns message
+rows hands out both** — `search()`, `get_emails()` and `get_email()`. (The two
+tools that return something else, `get_email_links()` and
+`get_email_attachment()`, return neither identifier: they answer about a message
+the caller already named.)
 
 - `search()` — full text and attachment scopes — reads it from the
   `rfc822_message_id` column.
