@@ -29,6 +29,7 @@ from ..config import (
     get_index_staleness_hours,
 )
 from .schema import (
+    CLEAR_PARSE_FAILURE_SQL,
     INSERT_EMAIL_SQL,
     init_database,
     insert_attachments,
@@ -390,6 +391,14 @@ class IndexManager:
                 )
                 if attachments:
                     batch_attachments.append((len(batch) - 1, attachments))
+
+                # This file parses now. A row left from an earlier
+                # failure would otherwise outlive the problem: a full
+                # rebuild is exactly when a user expects the dead-letter
+                # queue to shrink, and it never did.
+                path_now = email_data.get("emlx_path")
+                if path_now:
+                    conn.execute(CLEAR_PARSE_FAILURE_SQL, (path_now,))
 
                 if len(batch) >= batch_size:
                     self._flush_batch(conn, batch, batch_attachments)

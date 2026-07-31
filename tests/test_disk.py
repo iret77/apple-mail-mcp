@@ -1776,3 +1776,93 @@ class TestTheBuildPathRecordsSkipsToo:
         assert [r[0] for r in rows] == ["too_large"], (
             "the oversized message vanished without a trace"
         )
+
+
+class TestTheDlqShrinksAndTheWatcherFillsIt:
+    """Two paths the size guard had not reached."""
+
+    def _mail(self, tmp_path, size_bytes):
+        mail_dir = tmp_path / "V10"
+        box = mail_dir / "ACCT" / "INBOX.mbox" / "Data" / "Messages"
+        box.mkdir(parents=True)
+        payload = b"x" * size_bytes
+        (box / "1.emlx").write_bytes(f"{len(payload)}\n".encode() + payload)
+        return mail_dir
+
+    def test_a_successful_rebuild_clears_an_old_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """A row left from an earlier failure outlived the problem: a
+        full rebuild is exactly when the dead-letter queue should
+        shrink, and it never did."""
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import IndexManager
+        from apple_mail_mcp.index.schema import (
+            RECORD_PARSE_FAILURE_SQL,
+            skip_row,
+        )
+
+        mail_dir = self._mail(tmp_path, 32)  # comfortably under any limit
+        emlx = str(
+            mail_dir / "ACCT" / "INBOX.mbox" / "Data" / "Messages" / "1.emlx"
+        )
+        mgr = IndexManager(db_path=tmp_path / "idx.db")
+        conn = mgr._get_conn()
+        conn.execute(
+            RECORD_PARSE_FAILURE_SQL,
+            skip_row(emlx, "ACCT", "INBOX", "too_large"),
+        )
+        conn.commit()
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=mail_dir,
+            ),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+        ):
+            mgr.build_from_disk()
+
+        left = (
+            mgr._get_conn()
+            .execute("SELECT COUNT(*) FROM failed_index_jobs")
+            .fetchone()[0]
+        )
+        assert left == 0, "the stale dead-letter row survived a rebuild"
+
+    def test_the_watcher_records_an_oversized_delivery(
+        self, tmp_path, monkeypatch
+    ):
+        """The watcher is the path a user notices first, and it dropped
+        oversized mail with no record at all."""
+        import threading
+
+        from apple_mail_mcp.index.schema import init_database
+        from apple_mail_mcp.index.watcher import IndexWatcher
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "1")
+        mail_dir = self._mail(tmp_path, 2 * 1024 * 1024)
+        emlx = mail_dir / "ACCT" / "INBOX.mbox" / "Data" / "Messages" / "1.emlx"
+        db_path = tmp_path / "idx.db"
+        init_database(db_path).close()
+
+        # Same construction the watcher tests use: no watch loop.
+        watcher = IndexWatcher.__new__(IndexWatcher)
+        watcher.db_path = str(db_path)
+        watcher._conn = None
+        watcher._pending_adds = {("ACCT", "INBOX", 1): emlx}
+        watcher._pending_deletes = set()
+        watcher._pending_lock = threading.Lock()
+        watcher._stop_event = threading.Event()
+        watcher._mail_dir = mail_dir
+        watcher.on_update = None
+        watcher._exclude_account_uuids = set()
+
+        watcher._process_pending()
+
+        conn = init_database(db_path)
+        rows = conn.execute(
+            "SELECT error_message FROM failed_index_jobs"
+        ).fetchall()
+        assert [r[0] for r in rows] == ["too_large"]

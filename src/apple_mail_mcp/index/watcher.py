@@ -21,15 +21,17 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .disk import find_mail_directory, parse_emlx
+from .disk import emlx_too_large, find_mail_directory, parse_emlx
 from .schema import (
     CLEAR_PARSE_FAILURE_SQL,
     INSERT_EMAIL_SQL,
     RECORD_PARSE_FAILURE_SQL,
+    SKIP_REASON_TOO_LARGE,
     create_connection,
     email_to_row,
     insert_attachments,
     parse_failure_row,
+    skip_row,
 )
 
 if TYPE_CHECKING:
@@ -306,6 +308,23 @@ class IndexWatcher:
                 # Retry logic for race condition with Mail.app writing
                 for attempt in range(MAX_FILE_RETRIES):
                     try:
+                        if emlx_too_large(path):
+                            # Same rule as the other two paths: a file
+                            # skipped on purpose still gets a record.
+                            # Without it, a newly delivered oversized
+                            # message is absent from search with nothing
+                            # to explain it — and the watcher is the
+                            # path a user notices first.
+                            conn.execute(
+                                RECORD_PARSE_FAILURE_SQL,
+                                skip_row(
+                                    str(path),
+                                    account,
+                                    mailbox,
+                                    SKIP_REASON_TOO_LARGE,
+                                ),
+                            )
+                            continue
                         email = parse_emlx(path)
                         if email:
                             break
