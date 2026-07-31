@@ -105,6 +105,11 @@ get_emails(account="all", filter="unread")
     that name, which on a localized Mail is none of them. Pass `mailbox`
     explicitly to narrow it.
 
+!!! note
+    "Every account" means every account **Mail currently has**, minus the hidden
+    ones. Apple's Envelope Index keeps rows for accounts that have since been
+    removed; those are excluded, rather than returned under a bare UUID.
+
 !!! warning
     Listing across accounts requires Apple's Envelope Index (Full Disk Access).
     The JXA fallback walks one account at a time, so it **refuses** the request

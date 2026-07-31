@@ -490,12 +490,21 @@ async def get_emails(
             excluded_names = _excluded_account_names()
             excluded_uuids = _get_account_map().names_to_uuids(excluded_names)
             account_uuid: str | None = None
+            include_uuids: set[str] | None = None
             if target_account:
                 account_uuid = _get_account_map().name_to_uuid(target_account)
             elif all_accounts:
-                # Explicitly every account: leave the scope open. Hidden
-                # accounts are still dropped below, by UUID.
+                # Every account Mail actually HAS — not every account
+                # the Envelope Index still holds rows for. Apple keeps
+                # those after an account is removed, and an unscoped
+                # query handed them back under their bare UUID as if
+                # they were a visible account.
                 account_uuid = None
+                include_uuids = {
+                    acct["id"]
+                    for acct in (_get_account_map().get_cached_accounts() or [])
+                    if acct["name"] not in excluded_names
+                }
             else:
                 # No account requested: scope to the first account,
                 # matching the documented behavior and the JXA path
@@ -524,6 +533,7 @@ async def get_emails(
                     filter_kind=filter,
                     limit=limit,
                     exclude_account_uuids=excluded_uuids,
+                    include_account_uuids=include_uuids,
                 )
                 return [
                     EmailSummary(

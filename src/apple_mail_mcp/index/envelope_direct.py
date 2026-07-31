@@ -179,6 +179,7 @@ def fetch_recent_messages(
     filter_kind: str,
     limit: int,
     exclude_account_uuids: set[str] | None = None,
+    include_account_uuids: set[str] | None = None,
 ) -> list[EnvelopeMessageRow]:
     """Read up to `limit` recent messages via direct SQL.
 
@@ -199,6 +200,11 @@ def fetch_recent_messages(
         exclude_account_uuids: Accounts to leave out of the query
             entirely. Filtering them from the result instead would let
             them consume the LIMIT.
+        include_account_uuids: When listing across accounts, the ONLY
+            accounts allowed to answer. Apple's Envelope Index keeps
+            rows for accounts Mail no longer has, so an unscoped query
+            returns mail from a deleted account under its bare UUID —
+            "every visible account" has to mean the ones that exist.
         mailbox_name: Mailbox name to restrict to (matched
             case-insensitively against the percent-decoded URL
             path or its final segment), or None for all mailboxes
@@ -227,6 +233,7 @@ def fetch_recent_messages(
             filter_kind=filter_kind,
             limit=limit,
             exclude_account_uuids=exclude_account_uuids,
+            include_account_uuids=include_account_uuids,
         )
     finally:
         conn.close()
@@ -240,6 +247,7 @@ def _fetch_recent_messages(
     filter_kind: str,
     limit: int,
     exclude_account_uuids: set[str] | None = None,
+    include_account_uuids: set[str] | None = None,
 ) -> list[EnvelopeMessageRow]:
     """Body of fetch_recent_messages, on an open connection."""
     where_clauses: list[str] = ["m.deleted = 0"]
@@ -267,6 +275,21 @@ def _fetch_recent_messages(
     elif account_uuid:
         where_clauses.append("mb.url LIKE ?")
         params.append(f"%://{account_uuid}/%")
+
+    if include_account_uuids is not None:
+        # An empty allow-list means no account qualifies. `1 = 0` says
+        # that; an empty IN () would be a syntax error, and skipping the
+        # clause would widen the query to everything — the opposite.
+        if include_account_uuids:
+            ors = " OR ".join(
+                "mb.url LIKE ?" for _ in sorted(include_account_uuids)
+            )
+            where_clauses.append(f"({ors})")
+            params.extend(
+                f"%://{uuid}/%" for uuid in sorted(include_account_uuids)
+            )
+        else:
+            where_clauses.append("1 = 0")
 
     # Excluded accounts are filtered HERE, not after the fact. Dropping
     # them from the returned rows leaves them counted against LIMIT: if
