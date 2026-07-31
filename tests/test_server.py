@@ -1857,3 +1857,15 @@ class TestHalfACursorIsRefused:
 
         with pytest.raises(ValueError, match="second half of a cursor"):
             await get_emails(before_id=123)
+
+    @pytest.mark.asyncio
+    async def test_an_empty_before_is_no_before_at_all(self):
+        """ "" and "   " parse to None, so checking the raw argument let
+        them through and returned the newest page — the same endless
+        loop, reached by the caller most likely to hit it: the one
+        building the cursor from a field that came back blank."""
+        from apple_mail_mcp.server import get_emails
+
+        for blank in ("", "   "):
+            with pytest.raises(ValueError, match="second half of a cursor"):
+                await get_emails(before=blank, before_id=123)
