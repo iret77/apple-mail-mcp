@@ -1720,6 +1720,39 @@ class TestIndexStatusTool:
         assert r["next_steps"]
 
     @pytest.mark.asyncio
+    async def test_access_revoked_after_startup_is_still_reported(
+        self, tmp_path
+    ):
+        """find_mail_directory() caches for the life of the process, so
+        answering from it reports whether access was granted AT STARTUP.
+        Access revoked while the server runs is exactly what this probe
+        exists to catch — the tool told the user everything was fine
+        while every read was failing."""
+        from unittest.mock import patch
+
+        mgr = self._mgr()
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager", return_value=mgr
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,  # the cached, still-valid path
+            ),
+            patch("os.scandir", side_effect=PermissionError("no FDA")),
+        ):
+            from apple_mail_mcp.server import get_index_status
+
+            r = await get_index_status()
+
+        assert r["mail_dir_accessible"] is False, (
+            "a cached path was reported as live access"
+        )
+        # A ready index without Full Disk Access is a supported setup,
+        # so this is a note rather than a problem — but it has to say so.
+        assert "Full Disk Access" in r["note"]
+
+    @pytest.mark.asyncio
     async def test_unreadable_mail_names_full_disk_access(self, tmp_path):
         r = await self._status(
             self._mgr(has_index=False, indexed=0), tmp_path, accessible=False

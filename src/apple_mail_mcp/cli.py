@@ -134,7 +134,13 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
                 file=sys.stderr,
             )
 
-    if manager.has_index():
+    # Rows, not the file. An interrupted or permission-denied first
+    # build leaves an initialised database with nothing in it, and a
+    # sync cannot fill it — sync reconciles what is already indexed. So
+    # `has_index()` alone sent every such server down the sync path and
+    # left it reporting state "empty" forever, with auto-build sitting
+    # right there unused.
+    if manager.has_index() and manager.indexed_email_count() > 0:
 
         def _background_sync() -> None:
             try:

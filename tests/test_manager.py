@@ -1208,3 +1208,57 @@ class TestReadingTheStatusCreatesNothing:
         assert mgr.indexed_email_count() == 0
         assert not db.exists(), "a status read created the index"
         assert mgr.has_index() is False
+
+
+class TestAFailedFinalizationStillEndsTheBuild:
+    """The heaviest writes in the program run in the build's `finally`.
+    A failure in any of them skipped the two lines that end the build,
+    so `is_building()` stayed True for the life of the process and the
+    status tool reported a build that had been dead for hours."""
+
+    def test_an_fts_rebuild_failure_does_not_leave_a_phantom_build(
+        self, temp_db_path, tmp_path
+    ):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import manager as manager_mod
+        from apple_mail_mcp.index.manager import IndexManager
+
+        manager = IndexManager(db_path=temp_db_path)
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch.object(manager, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                return_value=iter(
+                    [
+                        {
+                            "id": 1,
+                            "account": "uuid-1",
+                            "mailbox": "INBOX",
+                            "subject": "hello",
+                        }
+                    ]
+                ),
+            ),
+            # The last write of the build, and the one most likely to
+            # fail on a damaged index.
+            patch.object(
+                manager_mod,
+                "rebuild_fts_index",
+                side_effect=RuntimeError("fts is corrupt"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            manager.build_from_disk()
+
+        assert not manager.is_building(), (
+            "a failed finalization left the build reported as running"
+        )
+        assert manager.last_error, (
+            "the finalization failure was not recorded anywhere"
+        )

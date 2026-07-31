@@ -294,7 +294,7 @@ step-by-step instructions for fixing them. Reads state only.
 | `problem` / `note` | What is wrong, or why the setup is fine anyway |
 | `indexed_emails` / `disk_emails` / `progress_percent` | Build progress |
 | `build_phase` / `build_appears_stalled` / `seconds_since_progress` | Whether a running build is working or wedged |
-| `mail_dir_accessible` | `false` means Full Disk Access is missing for the app running the server — the most common cause of an empty index |
+| `mail_dir_accessible` | `false` means `~/Library/Mail` could not be read just now. Usually Full Disk Access is missing for the app running the server — the most common cause of an empty index — but it is also `false` when Mail has never been set up on this Mac, which `problem` distinguishes. Probed on every call, so access revoked while the server runs shows up here |
 | `index_command` | The exact command that builds the index |
 | `recent_events` | What the server actually did, newest first |
 | `last_error`, `failed_parse_jobs`, `last_sync`, `staleness_hours`, `db_size_mb`, `excluded_accounts` | Health details |

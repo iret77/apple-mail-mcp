@@ -594,93 +594,112 @@ class IndexManager:
             # state to restore. A conditional rather than an early
             # return — returning from `finally` would swallow the
             # exception that brought us here.
-            if conn is not None:
-                # Flush any remaining partial batch (crash-safe)
-                if batch:
-                    self._flush_batch(conn, batch, batch_attachments)
-                    total_indexed += len(batch)
+            #
+            # try/finally again: the heaviest writes in the program are
+            # below, and a failure in any of them skipped the two lines
+            # that end the build — so the server reported "building" for
+            # the rest of its life, with no error to explain it.
+            try:
+                if conn is not None:
+                    # Flush any remaining partial batch (crash-safe)
+                    if batch:
+                        self._flush_batch(conn, batch, batch_attachments)
+                        total_indexed += len(batch)
 
-                # Update sync state for whatever we managed to index
-                if mailbox_counts:
-                    now = datetime.now().isoformat()
-                    for (account, mailbox), count in mailbox_counts.items():
-                        conn.execute(
-                            """INSERT OR REPLACE INTO sync_state
-                               (account, mailbox, last_sync, message_count)
-                               VALUES (?, ?, ?, ?)""",
-                            (account, mailbox, now, count),
+                    # Update sync state for whatever we managed to index
+                    if mailbox_counts:
+                        now = datetime.now().isoformat()
+                        for (account, mailbox), count in mailbox_counts.items():
+                            conn.execute(
+                                """INSERT OR REPLACE INTO sync_state
+                                 (account, mailbox, last_sync, message_count)
+                                 VALUES (?, ?, ?, ?)""",
+                                (account, mailbox, now, count),
+                            )
+                        conn.commit()
+
+                    # Re-enable triggers BEFORE rebuilding FTS to close the
+                    # watcher race condition: if the file watcher (or any other
+                    # writer) inserts a row after the bulk loop ends but before
+                    # the FTS rebuild — or between rebuild and trigger
+                    # recreation in the original ordering — that row would land
+                    # in `emails` but never enter `emails_fts`. By recreating
+                    # triggers first, any concurrent INSERT after this point
+                    # fires the trigger normally; the subsequent FTS rebuild
+                    # then re-syncs everything in `emails`, double-covering rows
+                    # added during the rebuild call itself.
+                    conn.executescript("""
+                  CREATE TRIGGER IF NOT EXISTS emails_ai
+                  AFTER INSERT ON emails BEGIN
+                      INSERT INTO emails_fts(rowid, subject, sender, content)
+                      VALUES (new.rowid, new.subject, new.sender, new.content);
+                  END;
+
+                  CREATE TRIGGER IF NOT EXISTS emails_ad
+                  AFTER DELETE ON emails BEGIN
+                      INSERT INTO emails_fts(
+                          emails_fts, rowid, subject, sender, content
+                      ) VALUES(
+                          'delete', old.rowid, old.subject,
+                          old.sender, old.content
+                      );
+                  END;
+
+                  CREATE TRIGGER IF NOT EXISTS emails_au
+                  AFTER UPDATE ON emails BEGIN
+                      INSERT INTO emails_fts(
+                          emails_fts, rowid, subject, sender, content
+                      ) VALUES(
+                          'delete', old.rowid, old.subject,
+                          old.sender, old.content
+                      );
+                      INSERT INTO emails_fts(rowid, subject, sender, content)
+                      VALUES (new.rowid, new.subject, new.sender, new.content);
+                  END;
+              """)
+
+                    # Rebuild FTS index (must run even if scan crashed
+                    # mid-iteration, otherwise emails table has rows
+                    # but FTS5 is empty)
+                    if total_indexed > 0:
+                        if progress_callback:
+                            msg = "Building search index..."
+                            progress_callback(total_indexed, total_indexed, msg)
+
+                        rebuild_fts_index(conn)
+                        optimize_fts_index(conn)
+
+                    # Log cap warnings (aggregate summary)
+                    if capped_mailboxes:
+                        logger.warning(
+                            "%d mailbox(es) hit the per-mailbox cap "
+                            "(%d). Increase APPLE_MAIL_INDEX_MAX_EMAILS "
+                            "to index more.",
+                            len(capped_mailboxes),
+                            max_per_mailbox,
                         )
-                    conn.commit()
+                        if progress_callback:
+                            msg = (
+                                f"Warning: {len(capped_mailboxes)} mailbox(es) "
+                                f"hit cap ({max_per_mailbox})"
+                            )
+                            progress_callback(total_indexed, total_indexed, msg)
 
-                # Re-enable triggers BEFORE rebuilding FTS to close the
-                # watcher race condition: if the file watcher (or any other
-                # writer) inserts a row after the bulk loop ends but before
-                # the FTS rebuild — or between rebuild and trigger
-                # recreation in the original ordering — that row would land
-                # in `emails` but never enter `emails_fts`. By recreating
-                # triggers first, any concurrent INSERT after this point
-                # fires the trigger normally; the subsequent FTS rebuild
-                # then re-syncs everything in `emails`, double-covering rows
-                # added during the rebuild call itself.
-                conn.executescript("""
-                CREATE TRIGGER IF NOT EXISTS emails_ai
-                AFTER INSERT ON emails BEGIN
-                    INSERT INTO emails_fts(rowid, subject, sender, content)
-                    VALUES (new.rowid, new.subject, new.sender, new.content);
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS emails_ad
-                AFTER DELETE ON emails BEGIN
-                    INSERT INTO emails_fts(
-                        emails_fts, rowid, subject, sender, content
-                    ) VALUES(
-                        'delete', old.rowid, old.subject,
-                        old.sender, old.content
-                    );
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS emails_au
-                AFTER UPDATE ON emails BEGIN
-                    INSERT INTO emails_fts(
-                        emails_fts, rowid, subject, sender, content
-                    ) VALUES(
-                        'delete', old.rowid, old.subject,
-                        old.sender, old.content
-                    );
-                    INSERT INTO emails_fts(rowid, subject, sender, content)
-                    VALUES (new.rowid, new.subject, new.sender, new.content);
-                END;
-            """)
-
-                # Rebuild FTS index (must run even if scan crashed
-                # mid-iteration, otherwise emails table has rows
-                # but FTS5 is empty)
-                if total_indexed > 0:
-                    if progress_callback:
-                        msg = "Building search index..."
-                        progress_callback(total_indexed, total_indexed, msg)
-
-                    rebuild_fts_index(conn)
-                    optimize_fts_index(conn)
-
-                # Log cap warnings (aggregate summary)
-                if capped_mailboxes:
-                    logger.warning(
-                        "%d mailbox(es) hit the per-mailbox cap (%d). "
-                        "Increase APPLE_MAIL_INDEX_MAX_EMAILS to index more.",
-                        len(capped_mailboxes),
-                        max_per_mailbox,
-                    )
-                    if progress_callback:
-                        msg = (
-                            f"Warning: {len(capped_mailboxes)} mailbox(es) "
-                            f"hit cap ({max_per_mailbox})"
-                        )
-                        progress_callback(total_indexed, total_indexed, msg)
-
-            # Cleanup is complete: only now is the build really over.
-            self._building = False
-            self._build_progress = None
+            except Exception as exc:
+                # Recorded, not swallowed: a status call that says the
+                # build ended must be able to say it ended badly.
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                self.record_event(
+                    "error",
+                    "Index build finalization failed",
+                    error=self._last_error,
+                )
+                raise
+            finally:
+                # Cleanup is over, however it went: the build is not
+                # running any more.
+                self._building = False
+                self._build_progress = None
 
         # Disk inventory just changed — drop the cache so the next
         # status call reflects truth.

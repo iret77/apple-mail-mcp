@@ -70,6 +70,7 @@ class TestNonBlockingStartup:
         """mcp.run() is called immediately, not after sync."""
         mock_manager = MagicMock()
         mock_manager.has_index.return_value = True
+        mock_manager.indexed_email_count.return_value = 1
         # sync_updates sleeps to simulate slow sync
         mock_manager.sync_updates.side_effect = lambda: (time.sleep(5) or 0)
 
@@ -141,3 +142,38 @@ class TestAutoBuildOnFirstRun:
 
         manager.build_from_disk.assert_called_once()
         assert "building in the background" in err
+
+
+class TestAnEmptyIndexIsBuiltNotSynced:
+    """`has_index()` is true for a database file with no rows in it —
+    what an interrupted or permission-denied first build leaves behind.
+    A sync cannot fill that: it reconciles what is already indexed. So
+    every such server went down the sync path and reported state
+    "empty" forever, with auto-build sitting right there unused."""
+
+    def test_a_zero_row_index_takes_the_build_path(self):
+        mock_manager = MagicMock()
+        mock_manager.has_index.return_value = True
+        mock_manager.indexed_email_count.return_value = 0
+
+        with (
+            patch(
+                "apple_mail_mcp.index.IndexManager.get_instance",
+                return_value=mock_manager,
+            ),
+            patch("apple_mail_mcp.server.mcp"),
+            patch("apple_mail_mcp.server._cleanup_old_attachments"),
+            patch(
+                "apple_mail_mcp.config.get_index_auto_build", return_value=True
+            ),
+        ):
+            from apple_mail_mcp.cli import _run_serve
+
+            _run_serve(watch=False)
+
+        for _ in range(50):
+            if mock_manager.build_from_disk.called:
+                break
+            time.sleep(0.05)
+        mock_manager.build_from_disk.assert_called_once()
+        mock_manager.sync_updates.assert_not_called()

@@ -1515,10 +1515,21 @@ async def get_index_status() -> dict:
     mail_dir_accessible = True
     mail_dir_missing = False
     mail_dir: str | None = None
-    try:
+    def _probe_mail_dir() -> str:
         from .index.disk import find_mail_directory
 
-        mail_dir = str(await asyncio.to_thread(find_mail_directory))
+        path = find_mail_directory()
+        # find_mail_directory() caches for the life of the process, so
+        # on its own it answers "is Full Disk Access granted?" with what
+        # was true at startup. Access can be revoked while the server
+        # runs, and detecting that is what this probe is FOR — so read
+        # the directory for real, every time.
+        with os.scandir(path) as entries:
+            next(iter(entries), None)
+        return str(path)
+
+    try:
+        mail_dir = await asyncio.to_thread(_probe_mail_dir)
     except FileNotFoundError as exc:
         # No ~/Library/Mail at all. Diagnosing that as a missing
         # permission sends the user into System Settings to grant access
