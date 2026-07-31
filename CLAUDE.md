@@ -165,7 +165,9 @@ phone, or read in Mail without the file being touched, keeps its old bits for as
 long as the file lives. Both fields are therefore overlaid from Apple's Envelope
 Index (one read-only SELECT, `fetch_message_flags()`), with the footer as the
 fallback when that database cannot be read. The bitmask is still parsed, because
-it is the only source when Mail is unavailable.
+it is the only source left when the Envelope Index cannot be read — note that
+this is a file, not the running app: the overlay works with Mail.app closed, so
+"Mail is not running" is *not* one of the cases the footer covers.
 
 ### Design Patterns
 
