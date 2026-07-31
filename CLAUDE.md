@@ -302,10 +302,17 @@ result = sync_from_disk(conn, mail_dir, progress_callback)
 ## A failed write must not leave its transaction open
 
 Python's `sqlite3` holds an implicit transaction open until commit or rollback.
-So a sync that raised mid-run left one open on a connection the manager keeps —
-and **every later write failed with "database is locked" until the process was
-restarted.** From outside, the index looked dead while nothing was actually wrong
-with it.
+So a sync that raised mid-run left one open on a connection the manager keeps.
+Two things follow, and the second is the worse one:
+
+- Any **other** connection to the file — the second server process, the
+  watcher — fails its next write with "database is locked" for as long as the
+  transaction stays open, which is until the process restarts. From outside the
+  index looks dead while nothing is actually wrong with it.
+- The connection that owns the open transaction can still write. Its next
+  `commit()` — the next sync on that same thread — then persists whatever the
+  failed run had already written, silently, as if it had been part of that
+  later run.
 
 The sync path therefore rolls back on failure before re-raising — including on
 `KeyboardInterrupt` and `SystemExit`, which leave the same open transaction as a
