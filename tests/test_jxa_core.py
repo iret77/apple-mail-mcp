@@ -303,6 +303,20 @@ try {{
             == "[Gmail]/Sent Mail"
         )
 
+    def test_a_nested_request_is_a_folder_name_not_a_role(self):
+        """`projects/inbox` names somebody's own mailbox, even though
+        its last segment normalizes to "inbox". Treating it as a role
+        request made the top-level rule reject the very folder asked
+        for — breaking upstream's case-insensitive custom lookup."""
+        assert (
+            self._resolve(["Projects/INBOX"], "projects/inbox")
+            == "Projects/INBOX"
+        )
+        assert (
+            self._resolve(["Projects/INBOX"], "PROJECTS/inbox")
+            == "Projects/INBOX"
+        )
+
     def test_a_non_role_name_still_uses_the_normalized_match(self):
         """The reorder must not break ordinary folders: `Projects` has
         no role, so shape matching is all there is."""

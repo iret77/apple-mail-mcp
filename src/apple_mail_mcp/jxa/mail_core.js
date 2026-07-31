@@ -155,7 +155,13 @@ const MailCore = {
      * Role-based, so it holds in every language and on every provider.
      */
     isDiscardMailbox(name) {
-        const role = this.mailboxRole(name);
+        // Only a top-level mailbox plays a role. A user's own
+        // "Projects/Trash" is a folder that happens to be called Trash,
+        // not the account's trash — treating it as one would let a
+        // "never touch the trash" rule skip somebody's project folder.
+        const role = this.isTopLevelMailbox(name)
+            ? this.mailboxRole(name)
+            : null;
         return role === "trash" || role === "junk";
     },
 
@@ -206,7 +212,15 @@ const MailCore = {
             // fall through
         }
 
-        const role = this.mailboxRole(name);
+        // A REQUEST that is itself a nested path names a specific
+        // folder, not a role: "projects/inbox" is somebody's own
+        // mailbox, even though its last segment normalizes to "inbox".
+        // Treating it as a role request made the top-level rule below
+        // reject the very folder that was asked for — which broke
+        // upstream's case-insensitive lookup for custom mailboxes.
+        const role = this.isTopLevelMailbox(name)
+            ? this.mailboxRole(name)
+            : null;
         let names = [];
         try {
             names = account.mailboxes.name();
