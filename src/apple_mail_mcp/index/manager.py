@@ -105,7 +105,12 @@ class IndexManager:
         # background rebuild blocked every request that needed the
         # index, and the server looked frozen from outside.
         self._local = threading.local()
-        self._open_conns: list[sqlite3.Connection] = []
+        # Keyed by thread id so a connection can be closed when its
+        # thread ends. A plain list kept every connection ever opened
+        # alive until close(): short-lived worker threads then ran the
+        # process out of SQLite file descriptors, and each dead thread's
+        # connection also held its own open transaction.
+        self._open_conns: dict[int, sqlite3.Connection] = {}
         self._conn_lock = threading.Lock()
         self._watcher: IndexWatcher | None = None
         self._watcher_callback: Callable[[int, int], None] | None = None
@@ -280,16 +285,41 @@ class IndexManager:
             # is taken only on a thread's FIRST call — afterwards the
             # thread-local short-circuits, so there is no ongoing
             # contention, which is the whole point of this change.
+            ident = threading.get_ident()
             with self._conn_lock:
+                self._close_dead_thread_conns(reclaim=ident)
                 conn = init_database(self._db_path)
                 self._local.conn = conn
-                self._open_conns.append(conn)
+                self._open_conns[ident] = conn
         return conn
+
+    def _close_dead_thread_conns(self, reclaim: int | None = None) -> None:
+        """Close connections whose thread has ended. Call under the lock.
+
+        A dead thread's thread-local is gone with it, so nothing can
+        reach its connection any more — but sqlite3 keeps the file
+        descriptor, and the implicit transaction, until the object is
+        closed.
+
+        `reclaim` is the calling thread's own id, treated as dead here:
+        the caller has just found its thread-local EMPTY, so an entry
+        under that id belongs to a finished thread whose id the OS handed
+        out again. Leaving it alive would have overwritten the entry and
+        leaked the connection — which is what made this the one leak the
+        reap could not see.
+        """
+        alive = {t.ident for t in threading.enumerate()} - {reclaim}
+        for ident in [i for i in self._open_conns if i not in alive]:
+            conn = self._open_conns.pop(ident)
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("Closing a finished thread's connection failed")
 
     def close(self) -> None:
         """Close the database connection."""
         with self._conn_lock:
-            conns, self._open_conns = self._open_conns, []
+            conns, self._open_conns = list(self._open_conns.values()), {}
         for conn in conns:
             try:
                 conn.close()
@@ -647,10 +677,14 @@ class IndexManager:
                 END;
             """)
                 except sqlite3.Error as exc:
-                    # DROP TRIGGER autocommitted, so failing here leaves
-                    # the database FILE without its FTS triggers — every
-                    # later insert then skips the search index, and the
-                    # build must not report itself clean.
+                    # The DROP is long since permanent — not because DDL
+                    # autocommits (it does not; sqlite3 holds it in the
+                    # same implicit transaction as any DML), but because
+                    # the batch commits during the build committed it
+                    # along the way. So failing here leaves the database
+                    # FILE without its FTS triggers: every later insert
+                    # skips the search index, and the build must not
+                    # report itself clean.
                     finalize_error = f"{type(exc).__name__}: {exc}"
                     logger.exception("Could not recreate the FTS triggers")
 
@@ -777,10 +811,16 @@ class IndexManager:
             logger.warning("Cannot access mail directory for sync: %s", e)
             return 0
 
-        exclude_account_uuids = self._resolve_exclusions()
-
-        conn = self._get_conn()
+        # Inside the failure handling, not before it. Resolving the
+        # exclusions talks to Mail and opening the database runs the
+        # migrations — either can fail, and both used to fail AFTER
+        # `last_error` was cleared and OUTSIDE the block that records
+        # one. The sync then raised with the status tool reporting no
+        # error at all.
+        conn = None
         try:
+            exclude_account_uuids = self._resolve_exclusions()
+            conn = self._get_conn()
             result = sync_from_disk(
                 conn,
                 mail_dir,
@@ -795,10 +835,11 @@ class IndexManager:
             # open, and every later write then fails with "database is
             # locked" until the process restarts. The index looks dead
             # while nothing is actually wrong with it.
-            try:
-                conn.rollback()
-            except Exception:
-                logger.debug("Rollback after failed sync failed too")
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    logger.debug("Rollback after failed sync failed too")
             self._last_error = f"{type(exc).__name__}: {exc}"
             self.record_event("error", "Sync failed", error=self._last_error)
             logger.exception("Sync failed")
