@@ -1136,8 +1136,11 @@ class TestFirstConnectionsDoNotRaceOnSchema:
 
 
 class TestTriggersSurviveAFailureBeforeTheLoop:
-    """`DROP TRIGGER` is DDL: it autocommits, and a rollback does not
-    bring the triggers back.
+    """A dropped trigger outlives the failure that followed it.
+
+    Not because DDL autocommits — sqlite3 holds `DROP TRIGGER` in the
+    same implicit transaction as any DML — but because the batch commits
+    during the build make it permanent along the way.
 
     With the drop outside the `try`, a failure in any statement between
     it and the loop — a corrupt FTS table makes `'delete-all'` raise —
