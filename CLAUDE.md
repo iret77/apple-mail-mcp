@@ -306,8 +306,12 @@ messages — triage, a survey of what is flagged, summarising a thread — spend
 nearly all of its time in call overhead, not in reading mail.
 
 `get_email` therefore also takes a **list** of up to `MAX_READ_BATCH` (50) ids
-and returns one entry per id, in the order given, each either
+and returns one entry per **distinct** id, in the order first given, each either
 `{"ref", "email"}` or `{"ref", "error"}`. Rules that matter:
+
+- **Duplicates collapse.** The result is not positional: a list with the same id
+  twice yields one entry for it, so match entries by their `ref`, not by index.
+  The cap counts what was submitted, before the duplicates are dropped.
 
 - **One unreadable message never sinks the batch.** The caller asked about 50
   messages; 49 answers are worth more than one exception.
