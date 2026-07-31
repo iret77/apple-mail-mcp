@@ -131,3 +131,55 @@ Findings judged invalid are recorded as such rather than acted on: the
 80-column complaints about Markdown (upstream's own docs exceed it; the rule is
 ruff's, for Python), and "unfocused diff" on stacked units (that is the stack —
 GitHub shows only the top unit's changes once the parent merges).
+
+### Third round
+
+Same shape again, both prior rounds' findings attached for a
+FIXED / NOT FIXED / PARTIAL verdict rather than trust, and extra
+scepticism aimed at the code written during the repairs. Every
+confirmed finding is fixed, each with a test that fails without the
+fix. Two round-2 verdicts were retracted by the reviewer itself
+(Markdown line length; a `before_id` case that was in fact documented).
+
+**A wrong reason for a right fix, and a fix that broke something else:**
+
+- **A7's rationale was false.** "DROP TRIGGER is DDL and autocommits"
+  is not true of Python's `sqlite3` — DDL rides in the same implicit
+  transaction as any DML, verified empirically. The fix stands, for the
+  real reason: the batch commits during the build make the drop
+  permanent along the way. Corrected in the source comment, the PR body
+  and, one round later, the test docstring that still repeated it.
+- **A9's own repair regressed custom mailboxes.** Requiring a top-level
+  mailbox for a role fixed `Projects/INBOX` answering `INBOX`, but
+  `projects/inbox` then stopped resolving `Projects/INBOX` — the real
+  inbox answered it, because both reduce to `inbox` when only the last
+  segment is compared. A request that is itself a path is now compared
+  whole.
+
+**What round 3 found that rounds 1 and 2 did not:**
+
+| Unit | Defect |
+|---|---|
+| A8 | A lock file that could not be created returned the same `True` a real acquisition returns; every `OSError` from `flock` counted as contention, so a filesystem without locking made the index permanently unwritable |
+| A8 | The watcher and the single-row cleanup wrote outside the lock — the two writers with nobody waiting in front of them |
+| A9 | A mailbox list Mail refused to hand over was reported as "no mailbox matching X. Available: " — a verdict the lookup never established |
+| A10 | The stale-row cleanup deleted by id with the caller's hints, which are usually absent: an unrelated message with the same ROWID vanished from the index too |
+| B1 | Every thread's SQLite connection stayed open until shutdown, including the ids the OS hands out again |
+| B2 | The Full Disk Access probe answered from a process-lifetime cache, so access revoked while the server ran still read as granted |
+| B2 | A zero-row index took the sync path, which cannot fill it — state "empty" forever with auto-build unused |
+| B3 | A sync that could not read `~/Library/Mail` reported "completed / already up to date" |
+| B3 | The rebuild's start confirmation was awaited and its result discarded, so a build stuck before its first read still answered "started" |
+| C3 | Naming a mailbox without an account skipped the ambiguity check — every account has an INBOX |
+| C3 | A timed-out write was reported as one that never reached the message, with an empty cause |
+| C4 | The live fallback existed for `get_email` but not for attachments and links: a moved message could be read while its attachments reported it missing |
+| C4 | The live lookup searched every account and applied the requested one afterwards — a copy elsewhere ended the search |
+| D2 | "Every account" included accounts Mail no longer has, returned under their bare UUID |
+| D3 | `before=""` parsed to `None` and slipped past the half-cursor check |
+
+**Propagation gap closed.** The stacked units are cherry-picked copies,
+not git descendants, so a fix on a parent does not reach its children by
+itself. B2 had stopped receiving B1's corrections after round 1, and
+C4/A7/A8/A6 lagged their parents by one round. Each child now carries
+its parents' current behaviour; where the parent's commit could not
+apply (B2's finalization block was restructured here), the behaviour was
+re-implemented in this branch's shape and noted in the commit.
