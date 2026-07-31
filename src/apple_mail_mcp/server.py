@@ -732,7 +732,16 @@ async def get_email(
                         }
                         return _enrich_attachments(result)
                 else:
-                    stale_index_entry = (idx_acct, mailbox)
+                    # Scope the cleanup to the row we actually
+                    # resolved. With the caller's hints (both often
+                    # None) a Mail.app ROWID is not unique — the same
+                    # number names a different message in another
+                    # mailbox, and deleting unscoped would drop THAT
+                    # message's index row too.
+                    located = manager.find_email_location(
+                        message_id, account=idx_acct, mailbox=mailbox
+                    )
+                    stale_index_entry = located if located else None
     except _AccountHiddenError:
         raise
     except Exception:
@@ -751,6 +760,8 @@ async def get_email(
     # fail") reported a deletion that was never established.
     if stale_index_entry is not None:
         stale_acct, stale_mb = stale_index_entry
+        # Both halves are known here — an unscoped delete would remove
+        # every row carrying this ROWID, in every account.
         try:
             manager = _get_index_manager()
             deleted = manager.delete_email(

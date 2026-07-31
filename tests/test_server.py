@@ -411,6 +411,12 @@ class TestGetEmail:
             "/nonexistent/42.emlx"
         )
         mock_mgr.return_value.delete_email.return_value = 1
+        # The cleanup is scoped to the row the index actually resolved,
+        # not to the caller's hints — a ROWID alone is not unique.
+        mock_mgr.return_value.find_email_location.return_value = (
+            "uuid-work",
+            "Archive",
+        )
 
         acct_map = mock_acct_map.return_value
         acct_map.ensure_loaded = AsyncMock()
@@ -435,9 +441,12 @@ class TestGetEmail:
         with patch("pathlib.Path.exists", return_value=False):
             result = await get_email(42, account="Work", mailbox="INBOX")
 
-        # The stale entry was cleaned up with the resolved account UUID
+        # The cleanup names the row the INDEX resolved, not the hints:
+        # a Mail.app ROWID is unique only within its mailbox, so an
+        # unscoped delete would drop every row carrying that number —
+        # including an unrelated message in another account.
         mock_mgr.return_value.delete_email.assert_called_once_with(
-            42, account="uuid-1", mailbox="INBOX"
+            42, account="uuid-work", mailbox="Archive"
         )
         # ...and the live strategies ran, which is the whole point: the
         # message was reachable all along.
