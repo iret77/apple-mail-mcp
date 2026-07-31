@@ -306,15 +306,20 @@ class IndexManager:
         # Resolve excluded account names -> UUIDs (one JXA call, only
         # when exclusions are configured) so the JXA-free disk walk can
         # skip whole accounts. Excluded accounts never enter the index.
+        exclude_account_uuids = self._resolve_exclusions()
+
+        conn = self._get_conn()
+
         if on_started is not None:
             # Signals that the build really began. A caller that reports
             # "started" without this cannot tell a running build from
             # one that was refused on its first line.
+            #
+            # Deliberately AFTER the two steps that can still refuse the
+            # build — resolving exclusions talks to Mail, and _get_conn()
+            # opens and initialises SQLite. Signalling before them made
+            # "started" survive both failures.
             on_started()
-
-        exclude_account_uuids = self._resolve_exclusions()
-
-        conn = self._get_conn()
         max_per_mailbox = get_index_max_emails()
 
         # Track counts per mailbox to enforce limits

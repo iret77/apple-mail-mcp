@@ -906,3 +906,40 @@ class TestWatcher:
         assert manager.watcher_running is False
         manager.stop_watcher()  # Should not raise
         assert manager.watcher_running is False
+
+
+class TestBuildOnlySignalsStartedAfterItCanActuallyRun:
+    """`on_started` is what the rebuild tool reports "started" on. Firing
+    it before the steps that can still refuse the build — talking to
+    Mail for the account exclusions, opening and initialising SQLite —
+    made "started" survive both failures."""
+
+    def test_a_build_that_cannot_open_the_database_never_signals(
+        self, tmp_path
+    ):
+        import sqlite3
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        manager = IndexManager(db_path=tmp_path / "index.db")
+        signalled = []
+
+        with (
+            patch.object(
+                manager,
+                "_get_conn",
+                side_effect=sqlite3.OperationalError("unable to open"),
+            ),
+            patch.object(manager, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            with pytest.raises(sqlite3.OperationalError):
+                manager.build_from_disk(on_started=lambda: signalled.append(1))
+
+        assert signalled == [], (
+            "a build that never opened the database reported that it started"
+        )

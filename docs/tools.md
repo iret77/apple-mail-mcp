@@ -291,9 +291,15 @@ date: a message that arrived during the session is not in the index and
 |-----------|------|---------|-------------|
 | `full` | `bool?` | `false` | `false` syncs changes since the last run and returns when done. `true` discards the index and rebuilds from scratch — minutes on a large mailbox, so it runs in the background and returns immediately |
 
-**Returns:** `status` (`"completed"`, `"started"`, `"already_running"` or
-`"failed"`), a `message` to relay, and `changes` (added + deleted + moved) for a
-completed sync.
+**Returns:** `status` (`"completed"`, `"started"`, `"unconfirmed"`,
+`"already_running"` or `"failed"`), a `message` to relay, and `changes` (added +
+deleted + moved) for a completed sync.
+
+`"unconfirmed"` means the background rebuild was dispatched but had not begun
+reading mail within a few seconds — it may be starting slowly or it may be
+stuck. `get_index_status()` a minute later tells the two apart. A sync that
+cannot reach `~/Library/Mail` returns `"failed"`, never `"completed"`: a user
+without Full Disk Access must not be told that mail nobody read was indexed.
 
 ```python
 refresh_index()

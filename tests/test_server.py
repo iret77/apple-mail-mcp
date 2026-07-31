@@ -1667,8 +1667,9 @@ class TestRefreshIndexTool:
         mgr.has_index.return_value = True
         mgr.sync_updates.return_value = 7
 
-        with patch(
-            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.index.disk.find_mail_directory"),
         ):
             from apple_mail_mcp.server import refresh_index
 
@@ -1685,8 +1686,9 @@ class TestRefreshIndexTool:
         mgr.has_index.return_value = True
         mgr.sync_updates.side_effect = RuntimeError("disk went away")
 
-        with patch(
-            "apple_mail_mcp.server._get_index_manager", return_value=mgr
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.index.disk.find_mail_directory"),
         ):
             from apple_mail_mcp.server import refresh_index
 
@@ -1738,12 +1740,12 @@ class TestOnlyOneRebuildAtATime:
         mgr = MagicMock()
         mgr.has_index.return_value = True
 
-        srv._rebuild_in_progress.acquire()  # a rebuild is running
+        srv._index_write_in_progress.acquire()  # a rebuild is running
         try:
             with patch.object(srv, "_get_index_manager", return_value=mgr):
                 r = await srv.refresh_index(full=True)
         finally:
-            srv._rebuild_in_progress.release()
+            srv._index_write_in_progress.release()
 
         assert r["status"] == "already_running"
         mgr.build_from_disk.assert_not_called()
@@ -1761,7 +1763,7 @@ class TestOnlyOneRebuildAtATime:
         with patch.object(srv, "_get_index_manager", return_value=mgr):
             await srv.refresh_index(full=True)
 
-        assert not srv._rebuild_in_progress.locked(), (
+        assert not srv._index_write_in_progress.locked(), (
             "a failed build left the rebuild flag stuck"
         )
 
@@ -1816,12 +1818,12 @@ class TestRebuildAndSyncDoNotOverlap:
         mgr = MagicMock()
         mgr.has_index.return_value = True
 
-        srv._rebuild_in_progress.acquire()
+        srv._index_write_in_progress.acquire()
         try:
             with patch.object(srv, "_get_index_manager", return_value=mgr):
                 r = await srv.refresh_index()
         finally:
-            srv._rebuild_in_progress.release()
+            srv._index_write_in_progress.release()
 
         assert r["status"] == "already_running"
         mgr.sync_updates.assert_not_called()
@@ -1834,4 +1836,95 @@ class TestRebuildAndSyncDoNotOverlap:
         from apple_mail_mcp import server
 
         src = inspect.getsource(server.refresh_index)
-        assert "_rebuild_in_progress.acquire(blocking=False)" in src
+        assert "_index_write_in_progress.acquire(blocking=False)" in src
+
+    @pytest.mark.asyncio
+    async def test_a_sync_holds_the_lock_while_it_runs(self):
+        """Testing the flag and letting go is a race in the other
+        direction: the sync passes the check, a rebuild takes the flag
+        an instant later, and the two writers interleave anyway."""
+        from unittest.mock import MagicMock, patch
+
+        import apple_mail_mcp.server as srv
+
+        held: list[bool] = []
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.sync_updates.side_effect = lambda: (
+            held.append(srv._index_write_in_progress.locked()),
+            0,
+        )[1]
+
+        with (
+            patch.object(srv, "_get_index_manager", return_value=mgr),
+            patch("apple_mail_mcp.index.disk.find_mail_directory"),
+        ):
+            r = await srv.refresh_index()
+
+        assert r["status"] == "completed"
+        assert held == [True], "the sync ran without holding the lock"
+        assert not srv._index_write_in_progress.locked(), (
+            "the sync left the lock stuck"
+        )
+
+
+class TestASyncThatCouldNotReadMailIsNotCompleted:
+    """`sync_updates()` returns 0 both when nothing changed and when it
+    could not reach ~/Library/Mail at all. Reporting the second as
+    "already up to date" tells a user without Full Disk Access that mail
+    nobody read has been indexed."""
+
+    @pytest.mark.asyncio
+    async def test_no_full_disk_access_is_reported_as_failure(self):
+        from unittest.mock import MagicMock, patch
+
+        import apple_mail_mcp.server as srv
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.sync_updates.return_value = 0
+
+        with (
+            patch.object(srv, "_get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=PermissionError("no Full Disk Access"),
+            ),
+        ):
+            r = await srv.refresh_index()
+
+        assert r["status"] == "failed"
+        assert "full disk access" in r["message"].lower()
+        mgr.sync_updates.assert_not_called()
+
+
+class TestAnUnconfirmedStartIsNotAStart:
+    """A build that never signals it began is not a running build. The
+    five-second wait timing out used to return "started" all the same,
+    so a stuck rebuild looked exactly like a healthy one."""
+
+    @pytest.mark.asyncio
+    async def test_a_build_that_never_signals_is_not_started(self):
+        import threading
+        from unittest.mock import MagicMock, patch
+
+        import apple_mail_mcp.server as srv
+
+        release = threading.Event()
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        # Alive, but never reaches on_started() — the shape of a build
+        # wedged in Mail's Apple Events permission dialog.
+        mgr.build_from_disk.side_effect = lambda **kw: release.wait(10)
+
+        try:
+            with (
+                patch.object(srv, "_get_index_manager", return_value=mgr),
+                patch.object(srv, "BUILD_START_TIMEOUT", 0.05),
+            ):
+                r = await srv.refresh_index(full=True)
+        finally:
+            release.set()
+
+        assert r["status"] == "unconfirmed"
+        assert r["status"] != "started"

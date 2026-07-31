@@ -145,9 +145,17 @@ def _validate_date(value: str | None, param: str) -> str | None:
 # line, which reads as success.
 BUILD_START_TIMEOUT = 5.0
 
-# One full rebuild at a time within this process. Concurrent rebuilds
-# interleave DELETE and INSERT on the same database.
-_rebuild_in_progress = threading.Lock()
+# One index WRITE at a time within this process — a full rebuild and a
+# plain sync both write the same database, so the lock covers both.
+# Checking a rebuild flag from the sync path instead was a race: the
+# sync passed the check, the rebuild took the flag a moment later, and
+# the two interleaved DELETE and INSERT anyway.
+#
+# This guards THIS process only. Two server processes sharing one index
+# (Claude Desktop starts a second instance) can still collide — that
+# needs a lock in the filesystem, not in memory, and is deliberately
+# not part of this change.
+_index_write_in_progress = threading.Lock()
 
 
 # ========== Response Type Definitions ==========
@@ -1357,30 +1365,30 @@ async def refresh_index(full: bool = False) -> dict:
             to be corrupt.
 
     Returns:
-        Dict with `status` ("completed", "started", "already_running" or
-        "failed"), a `message` to relay, and `changes` (added + deleted +
-        moved) for a completed sync.
+        Dict with `status` ("completed", "started", "unconfirmed",
+        "already_running" or "failed"), a `message` to relay, and
+        `changes` (added + deleted + moved) for a completed sync.
     """
+    from .index.disk import find_mail_directory
+
     manager = _get_index_manager()
 
     # A full rebuild is far too slow to block an MCP call on, and so is
     # the first build of a large mailbox — run both detached.
     if full or not manager.has_index():
-        # One rebuild at a time. Two concurrent full=True calls would
-        # each report "started" and then interleave DELETE and INSERT on
-        # the same database — the index ends up incomplete, or SQLite
-        # fails one of them mid-transaction. A module-level flag is
-        # enough here: this guards THIS process, which is the scope a
-        # tool call has.
+        # One index write at a time. Two concurrent full=True calls
+        # would each report "started" and then interleave DELETE and
+        # INSERT on the same database — the index ends up incomplete, or
+        # SQLite fails one of them mid-transaction.
         # acquire(blocking=False), not locked(): a check followed by an
         # acquire is a race — two callers can both see it free and both
         # report "started".
-        if not _rebuild_in_progress.acquire(blocking=False):
+        if not _index_write_in_progress.acquire(blocking=False):
             return {
                 "status": "already_running",
                 "message": (
-                    "A full index rebuild is already running. Ask for "
-                    "the index status to see how far along it is."
+                    "The index is already being rebuilt or synced. Ask "
+                    "for the index status to see how far along it is."
                 ),
             }
         # Confirm the build actually begins before claiming it did.
@@ -1399,12 +1407,12 @@ async def refresh_index(full: bool = False) -> dict:
                 outcome.append(exc)
                 logger.warning("Background index build failed", exc_info=True)
             finally:
-                if _rebuild_in_progress.locked():
-                    _rebuild_in_progress.release()
+                if _index_write_in_progress.locked():
+                    _index_write_in_progress.release()
                 started.set()  # never leave the caller waiting
 
         threading.Thread(target=_build, daemon=True).start()
-        await asyncio.to_thread(started.wait, BUILD_START_TIMEOUT)
+        confirmed = await asyncio.to_thread(started.wait, BUILD_START_TIMEOUT)
 
         if outcome:
             exc = outcome[0]
@@ -1423,6 +1431,23 @@ async def refresh_index(full: bool = False) -> dict:
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
+        if not confirmed:
+            # The wait timed out and the thread has not failed either:
+            # the build may be starting slowly, or it may be stuck. Not
+            # knowing is not the same as "started" — say which one this
+            # is, or the status tool showing no progress looks like a
+            # second bug rather than the answer.
+            return {
+                "status": "unconfirmed",
+                "message": (
+                    "A rebuild was started but had not begun reading "
+                    f"mail after {BUILD_START_TIMEOUT:.0f} seconds. Ask "
+                    "for the index status in a minute: rising progress "
+                    "means it is running, an unchanged index means it "
+                    "is stuck and the server log has the reason."
+                ),
+            }
+
         return {
             "status": "started",
             "message": (
@@ -1433,27 +1458,52 @@ async def refresh_index(full: bool = False) -> dict:
         }
 
     # A plain sync during a full rebuild writes the same database the
-    # rebuild is emptying and refilling. Refuse rather than interleave.
-    if _rebuild_in_progress.locked():
+    # rebuild is emptying and refilling. Hold the lock for the whole
+    # sync rather than testing it and letting go: a rebuild that starts
+    # one instruction later would otherwise interleave with this sync.
+    if not _index_write_in_progress.acquire(blocking=False):
         return {
             "status": "already_running",
             "message": (
-                "A full index rebuild is running; a sync would write the "
-                "same database. Ask for the index status to see how far "
-                "along it is."
+                "The index is already being rebuilt or synced; a second "
+                "writer would corrupt it. Ask for the index status to "
+                "see how far along it is."
             ),
         }
 
     try:
-        changes = await asyncio.to_thread(manager.sync_updates)
-    except Exception as exc:
-        # A raw traceback is useless to the user this tool exists for.
-        logger.warning("Index sync failed", exc_info=True)
-        return {
-            "status": "failed",
-            "message": "The index could not be updated.",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+        # sync_updates() returns 0 when it cannot reach the mail
+        # directory at all — the same 0 it returns when there was
+        # genuinely nothing new. Reporting that as "already up to date"
+        # tells a user without Full Disk Access that mail which was
+        # never read has been indexed. Establish reachability first, so
+        # a 0 from here means what it says.
+        try:
+            await asyncio.to_thread(find_mail_directory)
+        except (FileNotFoundError, PermissionError) as exc:
+            logger.warning("Index sync could not reach the mail directory")
+            return {
+                "status": "failed",
+                "message": (
+                    "The index was NOT updated: this server cannot read "
+                    "~/Library/Mail. Grant Full Disk Access to the app "
+                    "that runs it, then try again."
+                ),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        try:
+            changes = await asyncio.to_thread(manager.sync_updates)
+        except Exception as exc:
+            # A raw traceback is useless to the user this tool exists for.
+            logger.warning("Index sync failed", exc_info=True)
+            return {
+                "status": "failed",
+                "message": "The index could not be updated.",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    finally:
+        _index_write_in_progress.release()
     return {
         "status": "completed",
         "changes": changes,
