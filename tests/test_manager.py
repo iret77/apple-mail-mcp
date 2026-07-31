@@ -1041,6 +1041,114 @@ class TestIndexWritesAreSerializedAcrossProcesses:
         assert b.acquire(blocking=False)
         b.release()
 
+    def test_a_real_second_process_is_refused(self, temp_db_path):
+        """Two lock objects in one process share a file lock, so they
+        cannot show that the lock crosses the process boundary — which
+        is the entire claim. This one forks a real interpreter."""
+        import subprocess
+        import sys
+        import textwrap
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent(f"""
+                    import sys, time
+                    from apple_mail_mcp.index.manager import WriteLock
+                    lock = WriteLock({str(temp_db_path)!r})
+                    print("held" if lock.acquire(blocking=False) else "no",
+                          flush=True)
+                    time.sleep(30)
+                """),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "held"
+            mine = WriteLock(temp_db_path)
+            assert not mine.acquire(blocking=False), (
+                "a second PROCESS took a lock the first one holds"
+            )
+        finally:
+            holder.kill()
+            holder.wait(timeout=10)
+
+        mine = WriteLock(temp_db_path)
+        assert mine.acquire(blocking=False), (
+            "the lock outlived the process that held it"
+        )
+        mine.release()
+
+    def test_a_lock_file_that_cannot_be_created_is_not_a_lock(
+        self, temp_db_path, caplog
+    ):
+        """Returning True there reports an exclusivity nobody took.
+        Refusing instead would wedge every write on a read-only home,
+        so it degrades — but it has to be visible when it does."""
+        import logging
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock = WriteLock(temp_db_path)
+        with (
+            patch("os.open", side_effect=PermissionError("read-only home")),
+            caplog.at_level(logging.WARNING),
+        ):
+            assert lock.acquire(blocking=False)
+        try:
+            assert lock.degraded, (
+                "the lock degraded to this process and did not say so"
+            )
+            assert "NOT prevented" in caplog.text
+        finally:
+            lock.release()
+
+    def test_a_filesystem_without_flock_does_not_wedge_the_index(
+        self, temp_db_path, caplog
+    ):
+        """ENOTSUP is not contention. Treating every OSError as "held"
+        made the index permanently unwritable on the network home
+        directories that answer it, with "already running" as the only
+        explanation the user ever saw."""
+        import errno
+        import logging
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock = WriteLock(temp_db_path)
+        with (
+            patch(
+                "fcntl.flock",
+                side_effect=OSError(errno.ENOTSUP, "not supported"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            assert lock.acquire(blocking=False)
+        try:
+            assert lock.degraded
+        finally:
+            lock.release()
+
+    def test_a_lock_someone_else_holds_is_still_a_refusal(self, temp_db_path):
+        """The errno split must not turn real contention into a pass."""
+        from apple_mail_mcp.index.manager import WriteLock
+
+        a = WriteLock(temp_db_path)
+        b = WriteLock(temp_db_path)
+        assert a.acquire(blocking=False)
+        try:
+            assert not b.acquire(blocking=False)
+            assert not b.degraded
+        finally:
+            a.release()
+
     def test_release_lets_the_next_one_in(self, temp_db_path):
         from apple_mail_mcp.index.manager import WriteLock
 
@@ -1205,3 +1313,43 @@ class TestTheLockIsNeverLeaked:
         assert not mgr._write_lock.locked(), (
             "the lock stayed held, so every later sync is refused"
         )
+
+
+class TestSingleRowCleanupTakesTheWriteLockToo:
+    """`delete_email()` is a write. Outside the lock it raced a build
+    and raised "database is locked" into a read that was otherwise
+    fine."""
+
+    def test_a_delete_during_a_build_is_skipped_not_raised(
+        self, temp_db_path, monkeypatch
+    ):
+        from apple_mail_mcp.index import manager as manager_mod
+        from apple_mail_mcp.index.manager import IndexManager, WriteLock
+
+        manager = IndexManager(db_path=temp_db_path)
+        monkeypatch.setattr(manager_mod, "WRITE_LOCK_WAIT", 0.05)
+
+        builder = WriteLock(Path(temp_db_path).with_suffix(".lock"))
+        assert builder.acquire(blocking=False)
+        try:
+            assert manager.delete_email(42) == 0
+        finally:
+            builder.release()
+
+    def test_it_deletes_when_the_index_is_free(self, temp_db_path):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        manager = IndexManager(db_path=temp_db_path)
+        conn = manager._get_conn()
+        conn.execute(
+            "INSERT INTO emails (message_id, account, mailbox, subject) "
+            "VALUES (?, ?, ?, ?)",
+            (42, "uuid-1", "INBOX", "hello"),
+        )
+        conn.commit()
+
+        assert manager.delete_email(42, account="uuid-1", mailbox="INBOX") == 1
+        assert manager._write_lock.acquire(blocking=False), (
+            "the cleanup left the write lock held"
+        )
+        manager._write_lock.release()

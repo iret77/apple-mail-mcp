@@ -46,6 +46,11 @@ PATH_PATTERN = re.compile(
 # Constants for safety limits
 MAX_PENDING_CHANGES = 10000  # Prevent unbounded memory growth
 DELETE_BATCH_SIZE = 500  # SQLite variable limit safety
+
+# How long the watcher waits for the index write lock before deferring
+# its batch. Short: new mail is not urgent, and a build holds the lock
+# for minutes — the batch is put back, not dropped.
+WATCHER_LOCK_WAIT = 2.0
 FILE_RETRY_DELAY_MS = 200  # Wait for Mail.app to finish writing
 MAX_FILE_RETRIES = 3
 
@@ -100,6 +105,15 @@ class IndexWatcher:
 
         # Persistent connection for the watcher thread
         self._conn: sqlite3.Connection | None = None
+
+        # The watcher is a writer like any other. Left outside the
+        # index write lock it wrote into a running build or sync —
+        # which is the "database is locked" storm the lock exists to
+        # end, and the one writer nobody thinks of because it has no
+        # user waiting in front of it.
+        from .manager import WriteLock
+
+        self._write_lock = WriteLock(Path(db_path).with_suffix(".lock"))
 
     def start(self) -> bool:
         """
@@ -259,6 +273,36 @@ class IndexWatcher:
         if not adds and not deletes:
             return
 
+        if not self._write_lock.acquire(timeout=WATCHER_LOCK_WAIT):
+            # A build or a sync holds the index. Put the batch back
+            # rather than drop it: these are real messages, and until
+            # the next startup the watcher is the only thing that will
+            # index them.
+            with self._pending_lock:
+                for key, path in adds.items():
+                    self._pending_adds.setdefault(key, path)
+                self._pending_deletes.update(deletes)
+            logger.debug(
+                "Index busy — %d add(s) and %d delete(s) deferred",
+                len(adds),
+                len(deletes),
+            )
+            return
+
+        try:
+            self._write_pending(adds, deletes)
+        finally:
+            # try/finally, not a release at the end: an error anywhere
+            # in the batch used to leak the lock and wedge every later
+            # build and sync with "already running".
+            self._write_lock.release()
+
+    def _write_pending(
+        self,
+        adds: dict[tuple[str, str, int], Path],
+        deletes: set[tuple[str, str, int]],
+    ) -> None:
+        """Write one debounced batch. Called holding the write lock."""
         added_count = 0
         deleted_count = 0
 

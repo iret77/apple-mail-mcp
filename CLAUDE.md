@@ -203,6 +203,22 @@ instead of queueing behind a multi-minute rebuild, and it is released **last** �
 after the final flush and the FTS rebuild, which are the heaviest writes in the
 program.
 
+**Every writer takes it, including the ones with nobody waiting.** The file
+watcher writes on its own thread whenever mail arrives, and the single-row
+stale-entry cleanup writes from inside a read — both produced the same
+"database is locked" they were supposed to be protected from. The watcher
+defers its batch (put back, not dropped) and the cleanup skips, because
+removing a row whose file is already gone can wait for the next sync.
+
+**When the lock cannot be taken it says so.** A lock file that cannot be
+created (read-only home) and a filesystem without `flock` (some network home
+directories answer `ENOTSUP`) both degrade to thread-only, log at WARNING and
+set `WriteLock.degraded` — they do not return the same `True` a real
+acquisition returns. Only genuine contention (`EWOULDBLOCK`/`EAGAIN`/`EACCES`)
+refuses; treating every `OSError` as "held" made the index permanently
+unwritable on those filesystems, with "already running" as the only
+explanation the user ever got.
+
 ## FTS5 Search Index
 
 ### Database Schema (v5)

@@ -45,6 +45,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# How long a single-row cleanup waits for the index write lock before
+# giving up. Long enough to ride out a batch commit, short enough not to
+# stall the read it is attached to behind a full rebuild.
+WRITE_LOCK_WAIT = 2.0
+
 
 @dataclass
 class IndexStats:
@@ -89,10 +94,14 @@ class WriteLock:
     process, where flock would not: the same file description is shared.
     """
 
-    def __init__(self, path: Path):
-        self._path = path
+    def __init__(self, path: Path | str):
+        self._path = Path(path)
         self._thread_lock = threading.Lock()
         self._fd: int | None = None
+        # True once the file lock could not actually be taken and the
+        # lock degraded to this process only. Callers that promise
+        # cross-process exclusivity have to be able to see that.
+        self.degraded = False
 
     def acquire(self, blocking: bool = False, timeout: float = 0.0) -> bool:
         """Take both locks, or neither. Returns False if unavailable."""
@@ -115,21 +124,50 @@ class WriteLock:
             raise
 
     def _acquire_file_lock(self) -> bool:
+        import errno
         import fcntl
 
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
-        except OSError:
-            # Cannot create a lock file (read-only home?). Degrade to
-            # thread-only rather than blocking all writes forever.
-            logger.debug("Lock file unavailable at %s", self._path)
+        except OSError as exc:
+            # No lock file, so no cross-process guarantee. Refusing here
+            # would wedge every write forever on a read-only home, so
+            # the lock degrades to this process — but it says so, at
+            # WARNING, instead of returning the same True a real
+            # acquisition returns. The lock file sits beside the
+            # database, so in practice the write that follows is about
+            # to fail on its own and will say why.
+            self.degraded = True
+            logger.warning(
+                "Cannot create the index lock file at %s (%s). Writes "
+                "from a second process are NOT prevented.",
+                self._path,
+                exc,
+            )
             return True
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
-            return False
+        except OSError as exc:
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                # Genuinely held by someone else — the case this lock
+                # exists for.
+                os.close(fd)
+                return False
+            # Anything else means flock does not work here (some
+            # network home directories answer ENOTSUP or ENOLCK).
+            # Treating that as "held" made the index permanently
+            # unwritable on those filesystems, with "already running"
+            # as the only explanation.
+            self.degraded = True
+            logger.warning(
+                "The filesystem holding %s does not support locking "
+                "(%s). Writes from a second process are NOT prevented.",
+                self._path,
+                exc,
+            )
+            self._fd = fd
+            return True
         self._fd = fd
         return True
 
@@ -928,8 +966,34 @@ class IndexManager:
             mailbox: Optional mailbox filter
 
         Returns:
-            Number of rows deleted (typically 0 or 1).
+            Number of rows deleted (typically 0 or 1), or 0 when the
+            index was busy — see below.
+
+        This takes the same write lock a build or a sync holds. Removing
+        a row that no longer has a file is housekeeping, not the
+        caller's answer: rather than raise "database is locked" into a
+        read that was otherwise fine, a delete that cannot get the lock
+        is skipped and logged. The stale row survives until the next
+        read or sync, which is what it did before this cleanup existed.
         """
+        if not self._write_lock.acquire(timeout=WRITE_LOCK_WAIT):
+            logger.info(
+                "Index busy — leaving the stale row for message %s in "
+                "place; the next read or sync removes it.",
+                message_id,
+            )
+            return 0
+        try:
+            return self._delete_email_locked(message_id, account, mailbox)
+        finally:
+            self._write_lock.release()
+
+    def _delete_email_locked(
+        self,
+        message_id: int,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> int:
         conn = self._get_conn()
         where = ["message_id = ?"]
         params: list = [message_id]
