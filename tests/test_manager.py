@@ -240,10 +240,10 @@ class TestClose:
         manager._get_conn()
 
         manager.close()
-        assert manager._open_conns == []
+        assert not manager._open_conns
 
         manager.close()  # Should not raise
-        assert manager._open_conns == []
+        assert not manager._open_conns
 
         # A connection is handed out again afterwards.
         assert manager._get_conn() is not None
@@ -1016,7 +1016,7 @@ class TestConnectionsArePerThread:
 
         assert len(mgr._open_conns) == 2
         mgr.close()
-        assert mgr._open_conns == []
+        assert not mgr._open_conns
 
 
 class TestUsableIndexAndErrorTracking:
@@ -1262,3 +1262,95 @@ class TestAFailedFinalizationStillEndsTheBuild:
         assert manager.last_error, (
             "the finalization failure was not recorded anywhere"
         )
+
+
+class TestAnInterruptRollsBackToo:
+    """Ctrl-C lands mid-sync as easily as a bug does, and leaves exactly
+    the same open transaction — which then blocks every later write.
+    `except Exception` does not catch it."""
+
+    def test_an_interrupt_also_rolls_back(self, temp_db_path):
+        from unittest.mock import MagicMock, patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        conn = MagicMock()
+        with (
+            patch.object(mgr, "_get_conn", return_value=conn),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch(
+                "apple_mail_mcp.index.sync.sync_from_disk",
+                side_effect=KeyboardInterrupt(),
+            ),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            mgr.sync_updates()
+
+        conn.rollback.assert_called_once()
+
+
+class TestConnectionsDoNotOutliveTheirThreads:
+    """One connection per thread is right; keeping every one of them
+    alive until close() is not. A server that runs short-lived worker
+    threads accumulated a SQLite file descriptor — and an open implicit
+    transaction — per thread that had ever touched the index."""
+
+    def test_a_finished_thread_s_connection_is_closed(self, temp_db_path):
+        import sqlite3
+        import threading
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        mgr._get_conn()  # the main thread's own connection
+
+        captured: list[sqlite3.Connection] = []
+        worker = threading.Thread(
+            target=lambda: captured.append(mgr._get_conn())
+        )
+        worker.start()
+        worker.join()
+
+        # The reap runs on the next connection request.
+        threading.Thread(target=mgr._get_conn).start()
+        time.sleep(0.2)
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            captured[0].execute("SELECT 1")
+
+
+class TestASyncThatFailsBeforeItStartsIsStillRecorded:
+    """`last_error` is cleared at the top of the sync. Anything that
+    fails after that but outside the try — resolving the account
+    exclusions talks to Mail, opening the database runs migrations —
+    raised while the status tool reported no error at all."""
+
+    def test_a_failure_resolving_exclusions_is_recorded(
+        self, temp_db_path, tmp_path
+    ):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch.object(
+                mgr,
+                "_resolve_exclusions",
+                side_effect=RuntimeError("Mail refused the Apple Event"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            mgr.sync_updates()
+
+        assert mgr.last_error, "the sync failed and recorded nothing"
+        assert "Apple Event" in mgr.last_error
