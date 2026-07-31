@@ -392,10 +392,8 @@ since most accounts are also open on a phone and a tablet. The RFC822
 
 The docstrings say which one to keep, because a model handed two identifiers will
 otherwise use the shorter one. **Handing the header out is not the same as
-accepting it back**: the tools still take the numeric id as their parameter.
-Making the header a usable *reference* is a separate change, and until it lands
-the header is a durable record of which message a result was, not something to
-pass to `get_email`.
+accepting it back** — that is what this change adds: every tool that takes a
+message now accepts the header in its place, under the rule below.
 
 ### A header is never translated back into a ROWID and then trusted
 
@@ -411,7 +409,9 @@ be stale, and by then its ROWID may belong to a *different* message.
 - **Reads** (`_get_email_by_header`, `_resolve_emlx_path_by_header`) fetch each
   candidate the index offers and **verify** the header on what came back, moving
   to the next candidate on a mismatch and raising rather than returning a
-  stranger's mail.
+  stranger's mail. Once every indexed candidate is stale, BOTH ask Mail: the
+  path resolver used to stop there, so between two syncs a moved message could
+  be read while its attachments and links reported that it did not exist.
 - **The index orders the search; it never limits it.** A header is looked for in
   the account the index points at FIRST, then in every other visible account.
   Group order is insertion order — sorting the groups by name throws that

@@ -951,3 +951,194 @@ class TestBracketsAreNotPartOfDeduplication:
         from apple_mail_mcp.server import _normalize_message_ids
 
         assert len(_normalize_message_ids(["<a@b>", "<c@d>"])) == 2
+
+
+class TestALiveLookupSearchesTheAccountThatWasAsked:
+    """The scan stops at its first hit, and the requested account was
+    applied AFTERWARDS. A copy of the same message in another account
+    therefore ended the search, was dropped by the filter, and the
+    account the caller named — never looked at — was reported missing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_requested_account_is_the_search_scope(self):
+        import apple_mail_mcp.server as srv
+
+        seen: list[list[str]] = []
+
+        async def fake_exec(script, timeout=None):
+            # The account list is the `targets` array in the script.
+            start = script.index("const targets = ") + len("const targets = ")
+            seen.append(json.loads(script[start : script.index(";", start)]))
+            return {"account": "Work", "mailbox": "INBOX", "id": 7}
+
+        with (
+            patch.object(srv, "execute_with_core_async", side_effect=fake_exec),
+            patch.object(
+                srv,
+                "_visible_account_names",
+                AsyncMock(return_value=["Other", "Work"]),
+            ),
+        ):
+            await srv._locate_header_via_jxa("<a@b>", "Work")
+
+        assert seen == [["Work"]], (
+            "the live search covered accounts the caller did not ask for, "
+            "and would have stopped at the first of them"
+        )
+
+    @pytest.mark.asyncio
+    async def test_without_an_account_every_visible_one_is_searched(self):
+        import apple_mail_mcp.server as srv
+
+        seen: list[list[str]] = []
+
+        async def fake_exec(script, timeout=None):
+            start = script.index("const targets = ") + len("const targets = ")
+            seen.append(json.loads(script[start : script.index(";", start)]))
+            return {"found": False, "capped": 0, "unreadable": 0}
+
+        with (
+            patch.object(srv, "execute_with_core_async", side_effect=fake_exec),
+            patch.object(
+                srv,
+                "_visible_account_names",
+                AsyncMock(return_value=["Other", "Work"]),
+            ),
+        ):
+            await srv._locate_header_via_jxa("<a@b>")
+
+        assert seen == [["Other", "Work"]]
+
+
+class TestAWriteThatWasRefusedIsNotAMissingMessage:
+    """`applyByHeader` returning "failed" left the header in `remaining`,
+    which then became `notFound` — an existing message reported as
+    absent because Mail refused the write or it moved between reading
+    the headers and mutating it."""
+
+    def test_the_script_routes_a_refused_write_to_failures(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        js = WriteBuilder.set_read(
+            [{"account": "Work", "headers": ["<a@b>"]}], True
+        ).build()
+
+        assert "writeFailed" in js
+        # The bucket decision has to consult it, not push straight to
+        # notFound.
+        assert "if (writeFailed.has(h))" in js
+        assert "found, but the write did not take" in js
+
+
+class TestAMovedMessageStillHasItsAttachments:
+    """`get_email(header)` asks Mail once every indexed location turns
+    out stale. The attachment and link readers stopped there instead —
+    so between two syncs a moved message could be read while its
+    attachments and links reported that it did not exist."""
+
+    @pytest.mark.asyncio
+    async def test_the_path_resolver_falls_back_to_a_live_lookup(
+        self, tmp_path
+    ):
+        import apple_mail_mcp.server as srv
+
+        # Mail's account directory, with the message under its new
+        # mailbox and the ROWID Mail reports.
+        acct_dir = tmp_path / "UUID-WORK"
+        moved = acct_dir / "Archive.mbox" / "Data" / "Messages"
+        moved.mkdir(parents=True)
+        emlx = moved / "77.emlx"
+        emlx.write_text("stub")
+
+        parsed = MagicMock()
+        parsed.message_id_header = "<a@b>"
+
+        acct_map = _mock_acct_map()
+        acct_map.name_to_uuid.return_value = "UUID-WORK"
+
+        mgr = MagicMock()
+        # The index still points at the OLD location, and that file is
+        # gone — every recorded candidate is stale.
+        mgr.find_email_path.return_value = str(
+            acct_dir / "INBOX.mbox" / "Data" / "Messages" / "12.emlx"
+        )
+
+        with (
+            patch.object(srv, "_get_index_manager", return_value=mgr),
+            patch.object(srv, "_get_account_map", return_value=acct_map),
+            patch.object(
+                srv,
+                "_resolve_header_to_location",
+                AsyncMock(return_value=[("Work", "INBOX", 12)]),
+            ),
+            patch.object(
+                srv,
+                "_excluded_account_uuids",
+                AsyncMock(return_value=set()),
+            ),
+            patch.object(srv, "_excluded_account_names", return_value=set()),
+            patch.object(
+                srv,
+                "_live_header_candidates",
+                AsyncMock(return_value=[("Work", "Archive", 77)]),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch("apple_mail_mcp.index.disk.parse_emlx", return_value=parsed),
+        ):
+            found = await srv._resolve_emlx_path_by_header("<a@b>")
+
+        assert found == emlx
+
+    @pytest.mark.asyncio
+    async def test_a_live_hit_with_the_wrong_header_is_refused(self, tmp_path):
+        """The same rule as the indexed candidates: a ROWID is a
+        hypothesis, and the file has to prove it is the right message."""
+        import apple_mail_mcp.server as srv
+
+        acct_dir = tmp_path / "UUID-WORK"
+        moved = acct_dir / "Archive.mbox" / "Data" / "Messages"
+        moved.mkdir(parents=True)
+        (moved / "77.emlx").write_text("stub")
+
+        stranger = MagicMock()
+        stranger.message_id_header = "<someone-else@b>"
+
+        acct_map = _mock_acct_map()
+        acct_map.name_to_uuid.return_value = "UUID-WORK"
+
+        mgr = MagicMock()
+        mgr.find_email_path.return_value = None
+
+        with (
+            patch.object(srv, "_get_index_manager", return_value=mgr),
+            patch.object(srv, "_get_account_map", return_value=acct_map),
+            patch.object(
+                srv,
+                "_resolve_header_to_location",
+                AsyncMock(return_value=[("Work", "INBOX", 12)]),
+            ),
+            patch.object(
+                srv,
+                "_excluded_account_uuids",
+                AsyncMock(return_value=set()),
+            ),
+            patch.object(srv, "_excluded_account_names", return_value=set()),
+            patch.object(
+                srv,
+                "_live_header_candidates",
+                AsyncMock(return_value=[("Work", "Archive", 77)]),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.parse_emlx", return_value=stranger
+            ),
+            pytest.raises(ValueError, match="could not be read"),
+        ):
+            await srv._resolve_emlx_path_by_header("<a@b>")

@@ -176,9 +176,11 @@ Search emails with automatic FTS5 optimization. Uses the FTS5 index for fast sea
 !!! tip
     Each result also carries `message_id`, the RFC822 header. Store *that* if
     you keep a reference to the message: `id` is a per-mailbox ROWID and stops
-    identifying the message as soon as any device files it elsewhere. (The
-    tools still take the numeric `id` as their parameter; the header is the
-    durable record of *which* message a result was.)
+    identifying the message as soon as any device files it elsewhere. Every
+    tool that takes a message accepts the header in place of the number —
+    `get_email`, `get_email_links`, `get_email_attachment`, `set_flag`,
+    `set_read_status` — so pass the header and the reference keeps working
+    after a move.
 
 ```python
 search("invoice")

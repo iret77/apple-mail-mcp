@@ -1646,21 +1646,32 @@ class _LiveLookupIncomplete(RuntimeError):
     """
 
 
-async def _locate_header_via_jxa(header: str) -> tuple[str, str, int] | None:
+async def _locate_header_via_jxa(
+    header: str, account: str | None = None
+) -> tuple[str, str, int] | None:
     """Find a message by its RFC822 header without using the index.
 
     Returns ``(account, mailbox, id)``, or None when every mailbox of
-    every visible account was searched and the header was genuinely
+    every searched account was covered and the header was genuinely
     absent.
+
+    `account` narrows the SEARCH, not the result. Filtering afterwards
+    instead was a silent miss: the scan stops at its first hit, so a
+    copy of the same message in another account ended the search, was
+    then dropped by the filter, and the requested account's copy — which
+    was never looked at — was reported missing.
 
     Raises:
         _LiveLookupIncomplete: when the search could not be completed —
             which is NOT the same answer as "not found".
     """
-    accounts = await _visible_account_names()
-    if not accounts:
-        one = await _resolve_visible_account(None)
-        accounts = [one] if one else []
+    if account:
+        accounts = [account]
+    else:
+        accounts = await _visible_account_names()
+        if not accounts:
+            one = await _resolve_visible_account(None)
+            accounts = [one] if one else []
     if not accounts:
         raise _LiveLookupIncomplete("no visible account could be resolved")
     script = f"""
@@ -1767,7 +1778,7 @@ async def _live_header_candidates(
     otherwise a message the index misplaces is reported missing while it
     sits in another account, which is exactly what "the index orders the
     search, it never limits it" forbids."""
-    live = await _locate_header_via_jxa(header)
+    live = await _locate_header_via_jxa(header, account)
     if live is None:
         return []
     acct_name, mbox, rowid = live
@@ -1947,10 +1958,70 @@ async def _resolve_emlx_path_by_header(
             candidate,
             parsed.message_id_header,
         )
+    # Every indexed location was stale — which says the INDEX is out of
+    # date, not that the message is gone. `get_email` already asks Mail
+    # at this point; stopping here meant a moved message could be read
+    # but its attachments and links could not.
+    try:
+        live = await _live_header_candidates(
+            header, account, _excluded_account_names()
+        )
+    except _LiveLookupIncomplete as exc:
+        raise ValueError(
+            f"Email {header!r} was not where the index expected it, and "
+            f"the live search could not be completed: {exc}. This says "
+            f"nothing about whether the message exists."
+        ) from None
+    for acct_name, mbox, rowid in live:
+        found = await _emlx_path_for_live_location(
+            acct_name, mbox, rowid, header, excluded_uuids
+        )
+        if found is not None:
+            return found
+
     raise ValueError(
         f"Email {header!r} could not be read: every location on record "
-        f"is stale. Re-index and try again."
+        f"is stale, and Mail does not have it either. Re-index and try "
+        f"again."
     )
+
+
+async def _emlx_path_for_live_location(
+    account: str,
+    mailbox: str,
+    rowid: int,
+    header: str,
+    excluded_uuids: set[str],
+) -> _Path | None:
+    """The `.emlx` file for a message Mail just located, or None.
+
+    Mail hands back an account, a mailbox and a ROWID; the file is named
+    after that ROWID, so the search is a filename match inside the one
+    account — bounded, and only reached once every indexed location has
+    already turned out stale. The header is verified on what is found,
+    for the same reason the indexed candidates are: the file must be the
+    message that was asked for, not whatever now owns that number.
+    """
+    from .index.disk import find_mail_directory, parse_emlx
+
+    acct_uuid = _get_account_map().name_to_uuid(account) or account
+    try:
+        mail_dir = await asyncio.to_thread(find_mail_directory)
+    except (FileNotFoundError, PermissionError):
+        return None
+    base = mail_dir / acct_uuid
+    if not base.is_dir():
+        return None
+    for pattern in (f"{rowid}.emlx", f"{rowid}.partial.emlx"):
+        for candidate in sorted(base.rglob(pattern)):
+            if _path_in_excluded_account(str(candidate), excluded_uuids):
+                continue
+            parsed = await asyncio.to_thread(parse_emlx, candidate)
+            if parsed is None:
+                continue
+            if _header_key(parsed.message_id_header) == _header_key(header):
+                return candidate
+    return None
 
 
 @mcp.tool

@@ -506,6 +506,10 @@ for (const g of groups) {{
             if (isPreferred) ordered.push(mailboxes[m]);
             else rest.push(mailboxes[m]);
         }}
+        // header -> why the write did not take. Kept rather than
+        // retired: another mailbox may still hold a good copy, and only
+        // if none does is this the answer.
+        const writeFailed = new Map();
         const candidates = ordered.concat(rest);
         const limit = Math.min(candidates.length, MAX_SCAN);
         cappedBoxes += Math.max(0, candidates.length - limit);
@@ -526,6 +530,14 @@ for (const g of groups) {{
                     r = applyByHeader(candidates[m].messages, idx, target);
                 }} catch (e) {{
                     r = "failed";
+                    writeFailed.set(target, String(e));
+                }}
+                if (r === "failed" && !writeFailed.has(target)) {{
+                    // FOUND, and the write did not take — a refusal, or
+                    // the message moved between reading the headers and
+                    // mutating it. Letting it fall through to notFound
+                    // reports an existing message as missing.
+                    writeFailed.set(target, "Mail refused the write");
                 }}
                 // Only retire the header once it actually landed;
                 // otherwise a later mailbox may still hold a good copy.
@@ -540,7 +552,14 @@ for (const g of groups) {{
                 }}
             }}
         }}
-        for (const h of remaining) notFound.push(h);
+        for (const h of remaining) {{
+            if (writeFailed.has(h)) {{
+                fail([h], "found, but the write did not take: " +
+                     writeFailed.get(h));
+            }} else {{
+                notFound.push(h);
+            }}
+        }}
         continue;
     }}
 
