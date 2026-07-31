@@ -341,9 +341,10 @@ class IndexManager:
         batch_attachments: list[tuple[int, list]] = []
         batch_size = 500
 
-        # NOTE: dropping the triggers happens INSIDE the try. DROP
-        # TRIGGER is DDL and autocommits, so a rollback does not bring
-        # them back — if anything between the drop and the `finally`
+        # NOTE: dropping the triggers happens INSIDE the try. SQLite
+        # DDL is transactional, but nothing here rolls back —
+        # _flush_batch() commits every batch — so if anything between
+        # the drop and the `finally`
         # raises, the triggers are gone from the database FILE, survive
         # restarts, and every later insert lands in `emails` but never
         # in `emails_fts`. Body search then silently stops seeing new
@@ -409,10 +410,12 @@ class IndexManager:
                     batch_attachments = []
 
         finally:
-            # FIRST, before anything else in this block. DROP TRIGGER
-            # autocommits, so this is the only thing that brings them
-            # back; if a statement below throws before it runs, the
-            # database file keeps a schema with no FTS triggers.
+            # FIRST, before anything else in this block. By now
+            # _flush_batch() has committed at least once, so the drop
+            # has outlived any rollback that could have undone it —
+            # this call is what brings the triggers back. If a statement
+            # below throws before it runs, the database file keeps a
+            # schema with no FTS triggers.
             try:
                 self._recreate_fts_triggers(conn)
             except sqlite3.Error:
@@ -474,11 +477,14 @@ class IndexManager:
     def _recreate_fts_triggers(conn: sqlite3.Connection) -> None:
         """Restore the FTS sync triggers.
 
-        `DROP TRIGGER` is DDL and autocommits, so a rollback never brings
-        them back. If a build ends without running this, the triggers are
-        gone from the database FILE — surviving restarts — and every
-        later insert lands in `emails` but never in `emails_fts`: body
-        search silently stops seeing new mail.
+        SQLite DDL is transactional, so an immediate rollback would
+        bring the dropped triggers back — but a rollback is not what a
+        build does: `_flush_batch()` commits every batch and
+        `executescript()` commits before it runs. After the first such
+        commit the drop is permanent, so if a build ends without running
+        this, the triggers are gone from the database FILE — surviving
+        restarts — and every later insert lands in `emails` but never in
+        `emails_fts`: body search silently stops seeing new mail.
 
         Recreated BEFORE the FTS rebuild, which closes the watcher race:
         a row inserted by the watcher after the bulk loop but before the
