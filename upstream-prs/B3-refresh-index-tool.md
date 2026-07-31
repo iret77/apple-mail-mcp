@@ -24,7 +24,20 @@ Two details are the point of the tool rather than incidental to it:
   was building, the status said "ready" forever with no explanation. `on_started`
   fires once the build is really under way and the tool waits up to
   `BUILD_START_TIMEOUT` for it; no signal plus an exception in hand means
-  `failed`, with the reason.
+  `failed`, with the reason, and no signal *without* an exception means
+  `unconfirmed` — the build may be starting slowly or may be stuck, and saying
+  which is not known beats saying "started".
+- **A sync that could not read `~/Library/Mail` is not a completed sync.**
+  `sync_updates()` returns 0 both when nothing changed and when it never
+  reached the mail directory, so a user without Full Disk Access was told
+  "already up to date" about mail nobody had read. Reachability is established
+  first, and failing it is a `failed` with the permission hint.
+- **One index write at a time within the process.** A rebuild and a sync write
+  the same database; the sync used to test the rebuild flag and let go of it,
+  so a rebuild starting an instruction later interleaved with the sync it had
+  just been waved past. Both hold the same lock now. It is process-local, and
+  the comment says so: two server processes sharing one index need a lock in
+  the filesystem, which is a separate change.
 - **The docstring deliberately claims the vocabulary users actually use** —
   "rebuild", "re-index", "from scratch", "recreate" — *and* states that this is
   the server's own FTS5 index, not Apple Mail's envelope index, and nothing to do
@@ -48,10 +61,11 @@ nothing at all", that is a one-line change.
   synced only at startup, so a long-running client drifted: a message that
   arrived during the session could not be found and the only remedy was a
   restart. `full=True` discards and rebuilds in the background. The tool reports
-  `already_running` / `failed` rather than a blind "started" — it waits for
-  confirmation that the detached build actually began, because a build refused on
-  its first line otherwise looked identical to a running one. Touches only the
-  local index, so it is permitted in read-only mode.
+  `already_running` / `failed` / `unconfirmed` rather than a blind "started" — it
+  waits for confirmation that the detached build actually began, because a build
+  refused on its first line otherwise looked identical to a running one. A sync
+  that cannot read `~/Library/Mail` reports `failed`, never "already up to date".
+  Touches only the local index, so it is permitted in read-only mode.
 ```
 
 

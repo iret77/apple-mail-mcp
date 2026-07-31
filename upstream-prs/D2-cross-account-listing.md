@@ -49,6 +49,9 @@ one that was asked, and the caller would have no way to notice.
 ### Added
 
 - **`get_emails(account="all")` lists across every visible account in one call.**
+  "Every visible account" means the accounts Mail currently has, minus the
+  hidden ones: Apple's Envelope Index keeps rows for accounts that have since
+  been removed, and an unscoped query handed those back under their bare UUID.
   Answering "what's unread?" previously took one call per account, after first
   discovering the account names. The Envelope Index query already meant "every
   account" when given no UUID; only the tool's own defaulting stood in the way —

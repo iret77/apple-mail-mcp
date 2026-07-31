@@ -53,6 +53,18 @@ and `mailbox` (addressing by header makes the location the one thing the caller
 cannot derive), and a stringified list or HTML-escaped brackets are unwrapped —
 `'["<a@b>"]'` taken literally is a Message-ID nothing will ever match.
 
+- **The live fallback covers the attachment and link readers too.** `get_email`
+  asks Mail once every indexed location turns out stale; the path resolver used
+  to stop there, so between two syncs a moved message could be read while
+  `get_email_attachment` and `get_email_links` reported it missing.
+- **A named account scopes the live SEARCH, not just its result.** The scan
+  stops at its first hit, so filtering afterwards let a copy in another account
+  end the search and the requested account's copy — never looked at — be
+  reported missing.
+- **A write Mail refused is a failure, not a missing message.** A header whose
+  `applyByHeader` returned "failed" used to fall through to `not_found` once
+  every mailbox had been tried.
+
 ### Worth pushing back on
 
 - **`&amp;` is deliberately NOT decoded** while `&lt;`, `&gt;` and `&quot;` are.

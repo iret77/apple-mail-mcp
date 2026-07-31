@@ -49,6 +49,15 @@ not.
 Your existing regression test for write-implying tool names already covers both
 new tools, since they start with `set_`.
 
+- **An id the index cannot pin down is never guessed at.** A Mail.app id is
+  unique only within its mailbox, and naming a `mailbox` without an `account`
+  still leaves every account's copy of it — so that id goes to `failed` with an
+  explanation rather than to whichever row the index returned first.
+- **A timed-out write is an unknown outcome, not a refused one.** The deadline
+  says the answer never came back; Mail may have applied some, all or none of
+  the batch. The hint says so and says what to do — reading the messages back —
+  because retrying is harmless either way.
+
 ### Worth pushing back on
 
 - **The batch ceiling is 500.** That is a lot of Apple Events in one call; the cost

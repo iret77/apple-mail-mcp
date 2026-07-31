@@ -50,13 +50,23 @@ SQLite file — and removes the "database is locked" failure and the concurrent
 writers behind the WAL storm, because a second caller is told the work is already
 running instead of queueing.
 
-**But it does not cover the watcher path.** `WriteLock` is taken by
-`build_from_disk()` and `sync_updates()`; `watcher.py` writes without it, so two
-watchers can still duplicate each other's work. Making the watcher take the lock
-needs its own decision — a non-blocking acquire there would *drop* a batch of file
-events rather than defer it, so the queue would have to survive the skip — and I
-did not want to improvise that into this PR. Happy to do it as a follow-up if you
-want it, in whichever shape you prefer.
+**The watcher takes the lock too, and defers rather than drops.** It writes
+whenever mail arrives, on its own thread, with no user waiting in front of it —
+the one writer that is easy to forget, and the one #106 is actually about. A
+non-blocking acquire there would throw away a batch of file events, so the batch
+goes back into the pending sets and the next debounce round writes it. The
+single-row stale-entry cleanup (`delete_email`) is a writer as well and now
+skips when the index is busy: removing a row whose file is already gone can wait
+for the next sync, and raising "database is locked" into a read that was
+otherwise fine cannot.
+
+**What the lock does not promise.** Where it cannot be taken it says so instead
+of pretending: a lock file that cannot be created (read-only home) and a
+filesystem whose `flock` answers `ENOTSUP` (some network home directories) both
+degrade to this process, log at WARNING and set `WriteLock.degraded`. Only real
+contention (`EWOULDBLOCK`/`EAGAIN`/`EACCES`) refuses — reading every `OSError` as
+"held" made the index permanently unwritable on those filesystems, with "already
+running" as the only explanation the user ever saw.
 
 ### Worth pushing back on
 
