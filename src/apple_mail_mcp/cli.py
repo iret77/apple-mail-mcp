@@ -196,6 +196,12 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
                         file=sys.stderr,
                     )
             except Exception as e:
+                # Under a desktop client stderr goes nowhere the user
+                # will ever look — the log file this unit adds exists
+                # precisely for failures like this one. Printing only
+                # left an empty server.log next to an index that had
+                # silently stopped updating.
+                logger.error("Background sync failed: %s", e, exc_info=True)
                 print(
                     f"Warning: Background sync failed: {e}",
                     file=sys.stderr,
@@ -215,6 +221,9 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
                     if manager.start_watcher(on_update=on_update):
                         print("File watcher started", file=sys.stderr)
                 except Exception as e:
+                    logger.error(
+                        "File watcher failed to start: %s", e, exc_info=True
+                    )
                     print(
                         f"Warning: File watcher failed: {e}",
                         file=sys.stderr,

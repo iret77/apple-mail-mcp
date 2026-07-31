@@ -1823,3 +1823,49 @@ class TestBuildFailuresReachTheLogFile:
             for h in list(root.handlers):
                 h.close()
                 root.removeHandler(h)
+
+    def test_a_failed_startup_sync_logs_its_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """The failure most likely to go unnoticed. `serve` runs under a
+        desktop client, where stderr goes nowhere the user will look —
+        so a corrupt or unreadable index stopped the sync and left the
+        log file empty, which reads as a healthy server."""
+        import logging
+        import threading
+        from unittest.mock import MagicMock, patch
+
+        target = tmp_path / "server.log"
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", str(target))
+
+        from apple_mail_mcp import cli
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.sync_updates.side_effect = RuntimeError("index is corrupt")
+
+        class _RunInline(threading.Thread):
+            def start(self) -> None:  # run the sync body synchronously
+                self.run()
+
+        root = logging.getLogger("apple_mail_mcp")
+        try:
+            with (
+                patch(
+                    "apple_mail_mcp.index.IndexManager.get_instance",
+                    return_value=mgr,
+                ),
+                patch("threading.Thread", _RunInline),
+                patch("apple_mail_mcp.server.mcp.run"),
+            ):
+                cli._run_serve(watch=False)
+            for h in root.handlers:
+                h.flush()
+            assert target.exists()
+            assert "index is corrupt" in target.read_text(), (
+                "the startup sync failed and server.log never said so"
+            )
+        finally:
+            for h in list(root.handlers):
+                h.close()
+                root.removeHandler(h)
