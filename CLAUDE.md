@@ -235,6 +235,16 @@ get_emails(filter="unread")       # Unread only
 get_emails(filter="flagged")      # Flagged only
 get_emails(filter="today")        # Received today
 get_emails(filter="last_7_days")  # Last 7 days
+
+# Walking backwards into the backlog: `before` + `before_id` are ONE
+# cursor. Mail stores whole seconds, so a timestamp alone is not a
+# position — every message sharing the oldest second of a page would
+# become unreachable. Pass the date_received AND the id of the last row
+# you saw. `before_id` without `before` raises rather than silently
+# returning the newest page (an endless loop for a backwards walk).
+page = get_emails(limit=50)
+last = page[-1]
+get_emails(limit=50, before=last["date_received"], before_id=last["id"])
 ```
 
 ### search() Scopes

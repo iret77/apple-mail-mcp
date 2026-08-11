@@ -8,7 +8,7 @@ Apple Mail MCP provides **12 MCP tools** — a consolidated API designed for AI 
 |------|---------|------------|
 | `list_accounts()` | List email accounts | — |
 | `list_mailboxes()` | List mailboxes | `account?` |
-| `get_emails()` | Get emails with filtering | `account?`, `mailbox?`, `filter?`, `limit?` |
+| `get_emails()` | Get emails with filtering | `account?`, `mailbox?`, `filter?`, `limit?`, `before?`, `before_id?`, `after?`, `offset?` |
 | `get_email()` | Get single email with content + attachments | `message_id`, `account?`, `mailbox?` |
 | `search()` | Search emails | `query`, `account?`, `mailbox?`, `scope?`, `limit?`, `exclude_mailboxes?`, `before?`, `after?`, `highlight?` |
 | `get_email_links()` | Extract links from an email | `message_id`, `account?`, `mailbox?` |
@@ -66,6 +66,26 @@ Get emails from a mailbox with optional filtering. This is the primary tool for 
 | `mailbox` | `string?` | `INBOX` | Mailbox name |
 | `filter` | `string?` | `all` | Filter type (see below) |
 | `limit` | `int?` | `50` | Max emails to return |
+| `before` | `string?` | — | Only messages older than this ISO date/datetime. Naive input is read as local time |
+| `before_id` | `int?` | — | The `id` of the oldest row you have already seen. The second half of a cursor — see the note below |
+| `after` | `string?` | — | Only messages newer than this ISO date/datetime |
+| `offset` | `int?` | `0` | Skip this many rows. Fine for a second page, but see the note |
+
+!!! note "Walking a mailbox backwards"
+    `before` + `before_id` together are a **keyset cursor**, and that pair is
+    the reliable way to page into a backlog. Pass the `date_received` and the
+    `id` of the last row you received; the next call resumes exactly after it.
+
+    A timestamp alone is not a position — Mail stores whole seconds, so several
+    messages can share one. Paging on `before` by itself makes every message
+    that shares the oldest second of a page permanently unreachable.
+
+    `before_id` without `before` is rejected rather than ignored: silently
+    dropping it returns the newest page, which a backwards walk reads as "start
+    again" and loops forever. An empty or blank `before` counts as no `before`.
+
+    `offset` re-reads the rows it skips and shifts when new mail arrives
+    mid-walk. Prefer the cursor for anything longer than one extra page.
 
 **Filters:**
 

@@ -7,12 +7,12 @@
     "url": "https://github.com/imdinu/apple-mail-mcp",
     "source": "github"
   },
-  "version": "0.19.0",
+  "version": "0.20.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "apple-mail-mcp",
-      "version": "0.19.0",
+      "version": "0.20.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

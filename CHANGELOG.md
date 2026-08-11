@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-08-11
+
+Three rounds of adversarial review over the 22 units prepared for
+upstream found defects that had only ever been fixed on those branches.
+This release brings all of them back into the shipped code.
+
+### Added
+- `get_emails(before_id=)` — the second half of a keyset cursor. Mail
+  stores whole seconds, so a timestamp alone is not a position: every
+  message sharing the oldest second of a page was unreachable. Pass the
+  `date_received` **and** the `id` of the last row you saw. `before_id`
+  without `before` is rejected rather than ignored, because silently
+  dropping it returns the newest page — an endless loop for a
+  backwards walk. An empty or blank `before` counts as no `before`.
+- `refresh_index(full=True)` answers `"unconfirmed"` when the rebuild
+  has not begun reading mail within a few seconds. Not knowing is not
+  the same as "started", and a stuck build used to look identical to a
+  healthy one.
+
+### Fixed
+- **A mailbox path is matched whole.** `projects/inbox` resolved the
+  account's real INBOX whenever Mail listed it first, because only the
+  last segment was compared. Asking for a nested folder now finds that
+  folder or nothing.
+- **An account whose mailboxes Mail refuses to list says so**, instead
+  of "no mailbox matching X. Available: " — a verdict the lookup never
+  established.
+- **Every index writer takes the write lock**: the file watcher (it
+  defers its batch rather than dropping it) and the single-row stale
+  entry cleanup (it skips when the index is busy). `rebuild()` takes it
+  before its DELETE.
+- **A lock that could not be taken says so.** A lock file that cannot be
+  created, or a filesystem whose `flock` answers `ENOTSUP`, now degrades
+  loudly instead of returning what a real acquisition returns — and
+  only genuine contention refuses, so a network home directory no
+  longer makes the index permanently unwritable.
+- **Attachments and links follow a moved message.** Both header read
+  paths now ask Mail once every indexed location has turned out stale,
+  so between two syncs a message could be read while
+  `get_email_attachment()` reported it missing.
+- **A live lookup searches the account that was asked for**, rather than
+  stopping at the first hit anywhere and then filtering it out.
+- **An id that exists in more than one mailbox is refused, not guessed.**
+  Naming a `mailbox` without an `account` does not disambiguate it —
+  every account has an INBOX.
+- **A timed-out write reports an UNKNOWN outcome**, not one that never
+  reached the message, and no longer reports a blank cause.
+- **`account="all"` means the accounts Mail still has.** Apple's
+  Envelope Index keeps rows for removed accounts; those came back under
+  their bare UUID. Hidden accounts are now excluded in SQL rather than
+  after `LIMIT`, so they no longer consume the page.
+- **Full Disk Access is probed on every status call.** The answer came
+  from a process-lifetime cache, so access revoked while the server ran
+  still read as granted. A Mac where Mail was never set up is now
+  diagnosed as that, not as a missing permission.
+- **A zero-row index is built, not synced** — a sync reconciles what is
+  already indexed and can never fill an empty database, so an
+  interrupted first build left `state: "empty"` forever.
+- **A failing finalization is recorded and still ends the build**, and
+  the build flag now outlives the final flush, so a status call during
+  the heaviest writes no longer answers "ready".
+- **Connections die with their thread**, including when the OS hands a
+  finished thread's id to a new one. Short-lived worker threads used to
+  leak a SQLite file descriptor and an open transaction each.
+- **`index`, `rebuild`, the startup sync and the watcher write their
+  failures to the log file.** Installing a handler is not logging: under
+  a desktop client stderr reaches nobody, so `server.log` stayed empty
+  next to an index that had silently stopped updating. An existing
+  world-readable log is tightened when it is opened.
+- **Oversized messages are checked before the mailbox cap**, so a capped
+  mailbox no longer swallows them without a dead-letter row; a parse
+  returning nothing is recorded too; a failure after the insert removes
+  the partial row so the next sync retries it; and a rebuild clears
+  dead-letter rows whose file parses again.
+- **A failing rollback no longer masks the error that caused it.**
+- Attachment search returns the `rfc822_message_id` it selects — every
+  hit used to raise `KeyError` in the caller.
+
+### Changed
+- The shipped documentation said the server has 8 tools in seven
+  places. It has 12.
+
 ## [0.19.0] - 2026-07-28
 
 ### Added
