@@ -499,6 +499,29 @@ def get_index_auto_build_flag() -> bool:
     return get_index_auto_build()
 
 
+def _log_file_facts() -> dict:
+    """Does the log exist, and when was it last written?
+
+    Enough to tell "logging works" from "logging is configured and
+    silent" without shipping any log CONTENT: the lines carry mail
+    subjects and file paths.
+    """
+    from pathlib import Path as _P
+
+    try:
+        path = _P(str(_log_file_path()))
+        st = path.stat()
+    except (OSError, ValueError):
+        return {"log_file_exists": False}
+    return {
+        "log_file_exists": True,
+        "log_file_bytes": st.st_size,
+        "log_file_modified": datetime.fromtimestamp(st.st_mtime).isoformat(
+            timespec="seconds"
+        ),
+    }
+
+
 def _log_file_path() -> str:
     """Where this process writes its log, for the status report."""
     try:
@@ -3740,6 +3763,12 @@ async def get_index_status() -> dict:
         # fork-only:end
         "server_version": _server_version(),
         "log_file": str(_log_file_path()),
+        # Whether the log is actually being WRITTEN — a client with no
+        # filesystem access could see the path and nothing else, so
+        # "logging is configured" and "logging works" looked the same.
+        # The path and these two facts only; the contents stay on disk,
+        # because log lines carry subjects and file paths.
+        **_log_file_facts(),
         "read_only": get_read_only_mode(),
         "write_tools_enabled": not get_read_only_mode(),
         "index_command": _index_command(),

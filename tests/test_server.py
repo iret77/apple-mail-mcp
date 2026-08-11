@@ -5185,3 +5185,46 @@ class TestAColdAccountCacheDoesNotWidenTheQuery:
                 "a cold cache ran an unscoped query — the listing "
                 "silently covered every account"
             )
+
+
+class TestTheStatusSaysWhetherTheLogIsBeingWritten:
+    """A client with no filesystem access saw the log PATH and nothing
+    else, so "logging is configured" and "logging works" looked the
+    same. Reported from the field. The contents stay on disk — log
+    lines carry mail subjects and file paths."""
+
+    def test_a_written_log_reports_its_size_and_mtime(
+        self, tmp_path, monkeypatch
+    ):
+        from apple_mail_mcp.server import _log_file_facts
+
+        target = tmp_path / "server.log"
+        target.write_text("2026-08-11 INFO apple_mail_mcp: hello\n")
+        monkeypatch.setenv("APPLE_MAIL_LOG_PATH", str(target))
+
+        facts = _log_file_facts()
+        assert facts["log_file_exists"] is True
+        assert facts["log_file_bytes"] > 0
+        assert facts["log_file_modified"]
+
+    def test_a_missing_log_says_so_instead_of_raising(
+        self, tmp_path, monkeypatch
+    ):
+        from apple_mail_mcp.server import _log_file_facts
+
+        monkeypatch.setenv(
+            "APPLE_MAIL_LOG_PATH", str(tmp_path / "nope" / "server.log")
+        )
+        assert _log_file_facts() == {"log_file_exists": False}
+
+    def test_no_log_content_is_exposed(self):
+        import inspect
+
+        from apple_mail_mcp import server
+
+        src = inspect.getsource(server._log_file_facts)
+        for leak in ("read_text", "read_bytes", "readlines", "open("):
+            assert leak not in src, (
+                f"{leak} in the status path would ship log CONTENT — "
+                f"subjects and file paths — to the caller"
+            )

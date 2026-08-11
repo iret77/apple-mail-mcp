@@ -1342,13 +1342,34 @@ def _infer_account_mailbox(emlx_path: Path, mail_dir: Path) -> tuple[str, str]:
 
         # Find the part ending with .mbox — may span multiple components
         # e.g. parts = ("UUID", "Work", "Projects", "Q1.mbox", "Data", ...)
+        # Every component between the account and `Data`, not just the
+        # first `.mbox`. Apple nests a submailbox as its parent's
+        # child directory — `Archiv.mbox/2026.mbox/Data/…` — so
+        # stopping at the first one recorded every message of
+        # `Archiv/2026` as living in `Archiv`.
+        #
+        # That is the same name the Envelope Index derives from the
+        # mailbox URL (`imap://UUID/Archiv/2026`), and the two have to
+        # agree: the listing path looks a row up by
+        # (account, mailbox, id), so a mismatch loses the stable
+        # Message-ID for every message in a nested mailbox — and no
+        # sync repairs it, because the row is indexed, just under a
+        # name nothing asks for.
         mailbox = "Unknown"
-        for i, part in enumerate(parts[1:], start=1):
-            if part.endswith(".mbox"):
-                # Join components from parts[1] to parts[i], strip .mbox
-                components = (*parts[1:i], part[:-5])
-                mailbox = "/".join(components)
+        components: list[str] = []
+        saw_mbox = False
+        for part in parts[1:]:
+            if part == "Data":
                 break
+            if part.endswith(".mbox"):
+                saw_mbox = True
+                components.append(part[:-5])
+            else:
+                components.append(part)
+        # Without a single `.mbox` this is not a mailbox path at all —
+        # naming it after some directory would invent a location.
+        if saw_mbox and components:
+            mailbox = "/".join(components)
 
         return (account, mailbox)
     except ValueError:

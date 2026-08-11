@@ -1964,3 +1964,68 @@ class TestTheDlqShrinksAndTheWatcherFillsIt:
             "SELECT error_message FROM failed_index_jobs"
         ).fetchall()
         assert [r[0] for r in rows] == ["too_large"]
+
+
+class TestANestedMailboxKeepsItsFullName:
+    """The Envelope Index and the disk walk must derive the SAME name.
+
+    Apple nests a submailbox as its parent's child directory —
+    `Archiv.mbox/2026.mbox/Data/…` — and the old walk stopped at the
+    first `.mbox`, recording every message of `Archiv/2026` as living in
+    `Archiv`. The Envelope Index derives `Archiv/2026` from the mailbox
+    URL, so the listing path's (account, mailbox, id) lookup missed and
+    every such message lost its stable Message-ID. No sync repaired it:
+    the row was indexed, just under a name nothing asks for.
+
+    Reported from the field as "message_id: null for some rows, and
+    refresh_index() does not lower the count".
+    """
+
+    def _both(self, url: str, rel: str) -> tuple[str, str]:
+        from pathlib import Path
+
+        from apple_mail_mcp.index.disk import _infer_account_mailbox
+        from apple_mail_mcp.index.envelope_direct import _parse_mailbox_url
+
+        mail_dir = Path("/Users/x/Library/Mail/V10")
+        _, from_url = _parse_mailbox_url(url)
+        _, from_disk = _infer_account_mailbox(mail_dir / rel, mail_dir)
+        return from_url, from_disk
+
+    @pytest.mark.parametrize(
+        ("url", "rel", "expected"),
+        [
+            (
+                "imap://U/INBOX",
+                "U/INBOX.mbox/Data/1/Messages/1.emlx",
+                "INBOX",
+            ),
+            (
+                "imap://U/Archiv/2026",
+                "U/Archiv.mbox/2026.mbox/Data/1/Messages/1.emlx",
+                "Archiv/2026",
+            ),
+            (
+                "imap://U/%5BGmail%5D/Trash",
+                "U/[Gmail].mbox/Trash.mbox/Data/1/Messages/1.emlx",
+                "[Gmail]/Trash",
+            ),
+            (
+                "ews://U/Posteingang/Kunden",
+                "U/Posteingang.mbox/Kunden.mbox/Data/1/Messages/1.emlx",
+                "Posteingang/Kunden",
+            ),
+            (
+                "imap://U/Sent%20Mail",
+                "U/Sent Mail.mbox/Data/1/Messages/1.emlx",
+                "Sent Mail",
+            ),
+        ],
+    )
+    def test_both_sides_agree(self, url, rel, expected):
+        from_url, from_disk = self._both(url, rel)
+        assert from_url == expected
+        assert from_disk == expected, (
+            "the disk walk and the Envelope Index disagree on the "
+            "mailbox name — the stable-id lookup keys on it"
+        )

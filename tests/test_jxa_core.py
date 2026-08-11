@@ -595,3 +595,48 @@ class TestTheGeneratedWriteScriptActuallyRuns:
             "0: { id: () => 1, flagIndex: () => -1 } }",
         )
         assert out.strip()
+
+
+class TestAMissingParameterIsNamedNotPrintedAsNull:
+    """A group without an explicit account or mailbox is the DEFAULT
+    one, not one called "null". Interpolating the missing value gave
+    "no such account: null" and "cannot list mailboxes of account null",
+    which reads like a corrupted request rather than an unnamed default.
+    Reported from the field."""
+
+    def _script(self, group: dict) -> str:
+        from apple_mail_mcp.builders import WriteBuilder
+
+        return WriteBuilder.set_flag([group], "red").build()
+
+    def test_no_raw_interpolation_of_the_group_fields_survives(self):
+        js = self._script({"account": None, "ids": [1], "scan": True})
+        assert "String(g.account)" not in js
+        assert "String(g.mailbox)" not in js
+        assert "function label(" in js
+
+    def test_the_label_helper_names_the_default(self):
+        import json
+        import subprocess
+
+        js = self._script({"account": None, "ids": [1], "scan": True})
+        start = js.index("function label(")
+        end = js.index("\n}", start) + 2
+        probe = (
+            js[start:end]
+            + "\nconsole.log(JSON.stringify(["
+            + 'label(null, "account"), label("", "mailbox"), '
+            + 'label("Work", "account")]));'
+        )
+        out = subprocess.run(
+            [_node_bin(), "-e", probe],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert out.returncode == 0, out.stderr
+        assert json.loads(out.stdout) == [
+            "the default account",
+            "the default mailbox",
+            "Work",
+        ]

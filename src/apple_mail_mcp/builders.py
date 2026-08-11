@@ -407,6 +407,15 @@ function normHeader(v) {{
     if (s.charAt(s.length - 1) === ">") s = s.slice(0, -1);
     return s;
 }}
+// A group without an explicit account or mailbox is the DEFAULT one,
+// not one called "null". Interpolating the missing value produced
+// "no such account: null" and "cannot list mailboxes of account null",
+// which reads like a corrupted request rather than an unnamed default.
+function label(value, what) {{
+    return (value === null || value === undefined || value === "")
+        ? "the default " + what
+        : String(value);
+}}
 function fail(targets, reason) {{
     for (const t of targets) failures.push({{target: t, reason: reason}});
 }}
@@ -470,7 +479,7 @@ for (const g of groups) {{
         // catch, which escapes and kills the whole batch.
         fail(
             g.ids || g.headers || [],
-            "no such account: " + String(g.account) + " (" + e + ")"
+            "no such account: " + label(g.account, "account") + " (" + e + ")"
         );
         continue;
     }}
@@ -485,7 +494,7 @@ for (const g of groups) {{
             mailboxes = account.mailboxes();
         }} catch (e) {{
             fail(g.headers, "cannot list mailboxes of account " +
-                 String(g.account) + " (" + e + ")");
+                 label(g.account, "account") + " (" + e + ")");
             continue;
         }}
         const remaining = new Set(
@@ -584,7 +593,7 @@ for (const g of groups) {{
             mailboxes = account.mailboxes();
         }} catch (e) {{
             fail(g.ids, "cannot list mailboxes of account " +
-                 String(g.account) + " (" + e + ")");
+                 label(g.account, "account") + " (" + e + ")");
             continue;
         }}
         const remaining = new Set(g.ids);
@@ -617,9 +626,9 @@ for (const g of groups) {{
             if (cappedBoxes > 0 || unreadableBoxes > 0) {{
                 // The scan could not cover every mailbox of this
                 // account, so "not there" was never established.
-                fail([id], "the scan could not cover every mailbox of " +
-                     String(g.account) + ", so this id was not looked " +
-                     "for everywhere");
+                fail([id], "the scan could not cover every mailbox " +
+                     "of " + label(g.account, "account") + ", so this " +
+                     "id was not looked for everywhere");
             }} else {{
                 notFound.push(id);
             }}
@@ -634,8 +643,8 @@ for (const g of groups) {{
     }} catch (e) {{
         fail(
             g.ids,
-            "cannot open mailbox " + String(g.mailbox) + " in account " +
-            String(g.account) + " (" + e + ")"
+            "cannot open mailbox " + label(g.mailbox, "mailbox") +
+            " in " + label(g.account, "account") + " (" + e + ")"
         );
         continue;
     }}
@@ -644,7 +653,7 @@ for (const g of groups) {{
     try {{
         ids = mailbox.messages.id();
     }} catch (e) {{
-        fail(g.ids, "cannot read messages of " + String(g.mailbox) +
+        fail(g.ids, "cannot read messages of " + label(g.mailbox, "mailbox") +
              " (" + e + ")");
         continue;
     }}

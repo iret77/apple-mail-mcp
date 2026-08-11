@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.2] - 2026-08-11
+
+Aus dem zweiten Health-Check. Der Check selbst lief durch (PASS,
+freigegeben) — die drei gemeldeten Randnotizen führten aber auf einen
+Fehler, der größer war als die Meldung.
+
+### Fixed
+- **Verschachtelte Mailboxen verloren ihren Pfad.** Apple legt eine
+  Untermailbox als Kindverzeichnis ihrer Elternmailbox ab
+  (`Archiv.mbox/2026.mbox/Data/…`); der Disk-Walk hörte beim ERSTEN
+  `.mbox` auf und schrieb jede Nachricht aus `Archiv/2026` als in
+  `Archiv` liegend in den Index. Apples Envelope Index leitet aus der
+  Mailbox-URL dagegen `Archiv/2026` ab — und die Auflistung schlägt den
+  stabilen Message-ID-Header über `(account, mailbox, id)` nach. Für
+  jede Nachricht in einer Untermailbox ging er deshalb verloren, und
+  kein Sync reparierte das: die Zeile war indiziert, nur unter einem
+  Namen, nach dem niemand fragt. Das war die Ursache des gemeldeten
+  `message_id: null`, nicht "zu frische Mail".
+  Betroffen war außerdem alles, was den Mailbox-Namen als Handle nutzt:
+  Schreibziele, die Mehrdeutigkeitsprüfung und die Mailbox-Filterung
+  der Suche.
+  **Nach dem Update einmal `refresh_index()` laufen lassen** — die
+  falsch benannten Zeilen heilen sich beim nächsten Sync selbst.
+- Ein fehlender `account`- oder `mailbox`-Parameter wird in
+  Fehlermeldungen **benannt** statt interpoliert: "the default account"
+  statt "no such account: null".
+
+### Added
+- `get_index_status()` meldet `log_file_exists`, `log_file_bytes` und
+  `log_file_modified`. Ein Client ohne Dateizugriff sah bisher nur den
+  Pfad — "Logging ist konfiguriert" und "Logging funktioniert" sahen
+  gleich aus. Der Inhalt bleibt auf der Platte: Log-Zeilen enthalten
+  Betreffs und Dateipfade.
+
 ## [0.20.1] - 2026-08-11
 
 Hotfix. Ein Health-Check auf echtem macOS hat zwei Fehler derselben
