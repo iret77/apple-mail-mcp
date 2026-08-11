@@ -21,8 +21,14 @@ Fehler, der größer war als die Meldung.
   stabilen Message-ID-Header über `(account, mailbox, id)` nach. Für
   jede Nachricht in einer Untermailbox ging er deshalb verloren, und
   kein Sync reparierte das: die Zeile war indiziert, nur unter einem
-  Namen, nach dem niemand fragt. Das war die Ursache des gemeldeten
-  `message_id: null`, nicht "zu frische Mail".
+  Namen, nach dem niemand fragt.
+
+  Aufgefallen ist das bei der Suche nach der Ursache eines gemeldeten
+  `message_id: null`. Ob es DIESE Meldung erklärt, ist offen: der
+  Melder hat keine verschachtelten Mailboxen. Der Fehler ist unabhängig
+  davon reproduziert und behoben — die Ursache jener Beobachtung wird
+  weiter gesucht.
+
   Betroffen war außerdem alles, was den Mailbox-Namen als Handle nutzt:
   Schreibziele, die Mehrdeutigkeitsprüfung und die Mailbox-Filterung
   der Suche.
