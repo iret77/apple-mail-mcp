@@ -517,6 +517,13 @@ for (const g of groups) {{
             if (isPreferred) ordered.push(mailboxes[m]);
             else rest.push(mailboxes[m]);
         }}
+        // header -> why the write did not take. Kept rather than
+        // retired: another mailbox may still hold a good copy, and only
+        // if none does is this the answer.
+        // header -> why the write did not take. Kept rather than
+        // retired: another mailbox may still hold a good copy, and only
+        // if none does is this the answer.
+        const writeFailed = new Map();
         const candidates = ordered.concat(rest);
         const limit = Math.min(candidates.length, MAX_SCAN);
         cappedBoxes += Math.max(0, candidates.length - limit);

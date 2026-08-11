@@ -1265,6 +1265,60 @@ class IndexManager:
     # Public Query Methods (used by server.py instead of raw SQL)
     # ─────────────────────────────────────────────────────────────────
 
+    def failed_jobs(self, limit: int = 5) -> list[dict]:
+        """The most recent dead-letter rows, newest first.
+
+        A bare count tells an operator that three messages are missing
+        from the index and nothing about WHICH — so the count is a dead
+        end, and the file that caused it can only be found by reading
+        the log. The reason and the path are what make it actionable.
+        """
+        try:
+            rows = (
+                self._get_conn()
+                .execute(
+                    "SELECT emlx_path, account, mailbox, error_type, "
+                    "error_message, attempt_count, last_seen "
+                    "FROM failed_index_jobs ORDER BY last_seen DESC LIMIT ?",
+                    (max(1, int(limit)),),
+                )
+                .fetchall()
+            )
+        except sqlite3.Error:
+            return []
+        return [dict(r) for r in rows]
+
+    def count_email_locations(
+        self,
+        message_id: int,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> int:
+        """How many indexed mailboxes hold this Mail.app id.
+
+        A Mail.app id is a per-mailbox ROWID — the schema's UNIQUE is
+        ``(account, mailbox, message_id)``, so the same number can name
+        a different message in another mailbox. A caller that resolves
+        such an id to ONE location silently picks one of them; for a
+        write that means flagging a message the caller never named.
+        """
+        sql = "SELECT COUNT(*) AS n FROM emails WHERE message_id = ?"
+        params: list = [message_id]
+        if account:
+            sql += " AND account = ?"
+            params.append(account)
+        if mailbox:
+            # A mailbox narrows but does not disambiguate: two accounts
+            # both have an INBOX, and the same ROWID in each names two
+            # different messages.
+            sql += " AND mailbox = ?"
+            params.append(mailbox)
+        try:
+            row = self._get_conn().execute(sql, params).fetchone()
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
     def find_email_location(
         self,
         message_id: int,

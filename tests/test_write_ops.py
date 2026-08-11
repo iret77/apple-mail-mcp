@@ -2900,9 +2900,13 @@ class TestExcludedAccountBoundary:
                 return_value=_mock_acct_map(excluded_uuids={"uuid-secret"}),
             ),
         ):
-            groups, not_found, hidden, _amb, _amb2 = await _resolve_write_targets(
-                [7], None, None
-            )
+            (
+                groups,
+                not_found,
+                hidden,
+                _amb,
+                _amb2,
+            ) = await _resolve_write_targets([7], None, None)
 
         assert groups == []
         assert hidden == [7]
@@ -2915,9 +2919,13 @@ class TestExcludedAccountBoundary:
             "apple_mail_mcp.server._excluded_account_names",
             return_value={"Secret"},
         ):
-            groups, not_found, hidden, _amb, _amb2 = await _resolve_write_targets(
-                [1, 2], "Secret", None
-            )
+            (
+                groups,
+                not_found,
+                hidden,
+                _amb,
+                _amb2,
+            ) = await _resolve_write_targets([1, 2], "Secret", None)
 
         assert groups == []
         assert hidden == [1, 2]
@@ -2950,9 +2958,13 @@ class TestHeaderIsAFirstClassReference:
                 AsyncMock(return_value=["Work"]),
             ),
         ):
-            groups, not_found, hidden, _amb, _amb2 = await _resolve_write_targets(
-                ["<a@x>"], None, None
-            )
+            (
+                groups,
+                not_found,
+                hidden,
+                _amb,
+                _amb2,
+            ) = await _resolve_write_targets(["<a@x>"], None, None)
 
         assert groups[0]["by_header"] is True
         assert groups[0]["headers"] == ["<a@x>"]
@@ -3383,9 +3395,13 @@ class TestTargetResolution:
                 return_value=_mock_acct_map(),
             ),
         ):
-            groups, not_found, hidden, _amb, _amb2 = await _resolve_write_targets(
-                [7], None, None
-            )
+            (
+                groups,
+                not_found,
+                hidden,
+                _amb,
+                _amb2,
+            ) = await _resolve_write_targets([7], None, None)
 
         assert groups == [{"account": "Work", "mailbox": "Archive", "ids": [7]}]
         assert not not_found and not hidden
@@ -3462,3 +3478,29 @@ class TestTargetResolution:
             )
 
         assert sorted(len(g["ids"]) for g in groups) == [1, 2]
+
+
+class TestANumericStringIsAnIdNotAHeader:
+    """MCP clients stringify numbers routinely. Read as a Message-ID,
+    "150540" became a header nothing can hold — and a header the index
+    cannot place is searched in EVERY visible account, so one mistyped
+    reference turned into a full scan per account. Reported from the
+    field: `set_flag(999999999)` arrived as `["999999999"]` and produced
+    six failures, one per account."""
+
+    def test_digits_become_an_int(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids("999999999") == [999999999]
+        assert isinstance(_normalize_message_ids("999999999")[0], int)
+
+    def test_a_real_header_is_untouched(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids("<a@b>") == ["<a@b>"]
+        assert _normalize_message_ids("a@b") == ["a@b"]
+
+    def test_the_two_spellings_of_one_id_collapse(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids([150540, "150540"]) == [150540]

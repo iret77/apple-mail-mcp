@@ -1223,7 +1223,7 @@ class TestBuildFinallyIsRobust:
         # cleared at the END of it (a status call during the final flush
         # must not read "ready"), so the phase marker is what opens the
         # block.
-        tail = src[src.index('self._mark_progress("finalizing")'):]
+        tail = src[src.index('self._mark_progress("finalizing")') :]
         assert tail.index("_recreate_fts_triggers") < tail.index("_flush_batch")
 
 
@@ -2780,3 +2780,47 @@ class TestTriggersSurviveAFailureBeforeTheLoop:
             "emails_ad",
             "emails_au",
         }, "the database file lost its FTS triggers permanently"
+
+
+class TestEveryManagerCallInTheServerExists:
+    """The tests mock the IndexManager, so a call to a method that does
+    not exist is green here and an AttributeError in front of a user.
+
+    0.20.0 shipped `manager.count_email_locations(...)` in the write
+    path while the real class had no such method: the ambiguity guard
+    raised on every numeric-id write the index could place. The call
+    site was ported from its branch, the method was not, and every test
+    that touched it used a MagicMock. This walks the AST instead.
+    """
+
+    def test_no_call_site_names_a_method_the_class_lacks(self):
+        import ast
+        import inspect
+        from pathlib import Path
+
+        from apple_mail_mcp.index import IndexManager
+
+        src = Path(
+            inspect.getsourcefile(  # the shipped file, not a copy
+                __import__("apple_mail_mcp.server", fromlist=["server"])
+            )
+        ).read_text()
+
+        # Names bound to an IndexManager in server.py. `manager` is the
+        # convention; `mgr` appears in a few helpers.
+        holders = {"manager", "mgr", "index_manager"}
+        wanted: set[str] = set()
+        for node in ast.walk(ast.parse(src)):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in holders
+            ):
+                wanted.add(node.attr)
+
+        assert wanted, "found no manager.* call sites — the walk is broken"
+        missing = sorted(a for a in wanted if not hasattr(IndexManager, a))
+        assert not missing, (
+            f"server.py calls IndexManager members that do not exist: "
+            f"{missing}. A MagicMock hides this in every other test."
+        )

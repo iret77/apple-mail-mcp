@@ -38,7 +38,6 @@ def _acct_map(uuid_to_name="Work", excluded_uuids=None):
     return m
 
 
-
 @pytest.fixture(autouse=True)
 def _isolate_server_singletons(monkeypatch):
     """Clear AccountMap state and force Strategy 0 unavailable.
@@ -4017,6 +4016,7 @@ class TestASyncThatCouldNotReadMailIsNotCompleted:
         )
         assert "full disk access" in str(r).lower()
 
+
 class TestBuildFailuresReachTheLogFile:
     """Installing a handler is not logging.
 
@@ -5136,3 +5136,52 @@ class TestOneIndexWriterAtATime:
             r = await srv.refresh_index()
 
         assert r["status"] == "already_running"
+
+
+class TestAColdAccountCacheDoesNotWidenTheQuery:
+    """A bare `get_emails()` means "the default account". When the
+    AccountMap cache is empty — `ensure_loaded()` talks to Mail, and it
+    can be slow under a batch of concurrent calls, or refused — the
+    resolved UUID stayed None and the Envelope query ran UNSCOPED. The
+    listing then answered for every account, which is a different
+    question from the one that was asked, and it looked like a correct
+    answer. Reported from the field: a bare get_emails() issued
+    alongside other calls returned mail from an account the caller had
+    not named, while the same call on its own did not."""
+
+    @pytest.mark.asyncio
+    async def test_an_empty_cache_falls_back_instead_of_querying_all(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import apple_mail_mcp.server as srv
+
+        acct_map = _acct_map()
+        acct_map.get_cached_accounts.return_value = []  # cold / failed
+
+        fetch = MagicMock(return_value=[])
+        with (
+            patch.object(srv, "_get_account_map", return_value=acct_map),
+            patch.object(
+                srv, "_resolve_visible_account", AsyncMock(return_value=None)
+            ),
+            patch.object(srv, "_excluded_account_names", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                fetch,
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path"
+            ) as env_path,
+            patch("apple_mail_mcp.index.disk.find_mail_directory"),
+            patch.object(
+                srv, "execute_query_async", AsyncMock(return_value=[])
+            ),
+        ):
+            env_path.return_value.exists.return_value = True
+            await srv.get_emails(limit=5)
+
+        for call in fetch.call_args_list:
+            assert call.kwargs.get("account_uuid") is not None, (
+                "a cold cache ran an unscoped query — the listing "
+                "silently covered every account"
+            )

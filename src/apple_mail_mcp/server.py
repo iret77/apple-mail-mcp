@@ -854,6 +854,14 @@ def _normalize_message_ids(
                     f"the `message_id` field from a search or get_emails "
                     f"result, or a list of them."
                 )
+            # Last, once the string is clean: an all-digit reference is
+            # the numeric ID, not a Message-ID. MCP clients stringify
+            # numbers routinely, and reading "150540" as a header sent
+            # it down the recovery path — a scan of EVERY visible
+            # account for a header nothing can hold. A real Message-ID
+            # is an addr-spec and carries an "@".
+            if item.isdigit():
+                item = int(item)
         # Keyed through _header_key: "<a@b>" and "a@b" are the SAME
         # message, and the brackets are not part of the identity. Both
         # spellings in one batch used to be written twice.
@@ -1883,12 +1891,26 @@ async def get_emails(
                         account_uuid = acct["id"]
                         break
 
-            if target_account and account_uuid is None:
+            # An empty cache is not "every account". `ensure_loaded()`
+            # talks to Mail, and when that is slow or fails — a cold
+            # cache raced by a concurrent call, Apple Events refused —
+            # `account_uuid` stayed None and the query below ran
+            # UNSCOPED. A single-account listing then silently answered
+            # for all of them: observed as a bare get_emails() returning
+            # mail from an account the caller never asked about, and
+            # only when it was issued alongside other calls.
+            default_unresolved = (
+                not target_account and not all_accounts and account_uuid is None
+            )
+
+            if (target_account and account_uuid is None) or default_unresolved:
+                # Fall through to JXA, which resolves the default
+                # account properly and reports an unknown one, rather
+                # than silently widening the query to every account.
                 # Unknown account name. Fall through to JXA, which
-                # reports it properly, rather than silently widening
-                # the query to every account.
                 logger.debug(
-                    "Account %r not in AccountMap; falling back to JXA",
+                    "Account %r unresolved in AccountMap; falling back "
+                    "to JXA rather than querying every account",
                     target_account,
                 )
             else:
@@ -3767,6 +3789,27 @@ async def get_index_status() -> dict:
                     "attachments": stats.attachment_count,
                     "db_size_mb": round(stats.db_size_mb, 2),
                     "failed_parse_jobs": stats.failed_jobs_count,
+                    # The count alone is a dead end: it says three
+                    # messages are missing and not WHICH. Carry a few
+                    # rows so the reason is actionable without reading
+                    # the log file.
+                    **(
+                        {
+                            "failed_parse_examples": [
+                                {
+                                    "path": j["emlx_path"],
+                                    "mailbox": (
+                                        f"{j['account']}/{j['mailbox']}"
+                                    ),
+                                    "reason": j["error_type"],
+                                    "detail": (j["error_message"] or "")[:200],
+                                }
+                                for j in manager.failed_jobs(limit=5)
+                            ]
+                        }
+                        if stats.failed_jobs_count
+                        else {}
+                    ),
                     "excluded_accounts": stats.excluded_accounts,
                     "last_sync": (
                         stats.last_sync.isoformat() if stats.last_sync else None

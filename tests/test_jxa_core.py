@@ -43,8 +43,11 @@ def _mail_core_literal() -> str:
     )
     assert body, "MailCore literal not found"
     return body.group(1)
+
+
 from tests._mocks import mock_acct_map as _mock_acct_map
 from tests._mocks import mock_index as _mock_index
+
 __all__ = ["_mock_acct_map", "_mock_index"]
 
 
@@ -483,3 +486,112 @@ class TestMailCoreIsIntact:
             f"unterminated comment block parses fine and fails only on "
             f"macOS at call time."
         )
+
+
+class TestTheGeneratedWriteScriptActuallyRuns:
+    """Asserting that a name APPEARS in the script is not asserting that
+    the script works.
+
+    0.20.0 shipped a `writeFailed` map that was used five times and
+    declared nowhere: two tests checked for the substring, both passed,
+    and every Message-ID write died on `ReferenceError: Can't find
+    variable: writeFailed` — the reference this project tells callers to
+    prefer. Only executing the thing catches that.
+    """
+
+    def _run(self, group: dict, *, collection: str) -> str:
+        """Evaluate the generated write script against a stubbed Mail."""
+        import subprocess
+
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.jxa import MAIL_CORE_JS
+
+        js = WriteBuilder.set_flag([group], "red").build()
+        core = MAIL_CORE_JS.replace(
+            'const Mail = Application("Mail");',
+            "const Mail = { accounts: () => [] };",
+        )
+        # One mailbox holding one message, addressed the way this group
+        # shape addresses it.
+        account = (
+            "({ mailboxes: () => [ { name: () => 'INBOX', messages: "
+            f"{collection} }} ] }})"
+        )
+        script = (
+            core
+            + "\n"
+            + js.replace("MailCore.getAccount(g.account)", account)
+            # The script ends in a bare JSON.stringify(...) expression —
+            # JXA returns it, node needs telling.
+            .replace("\nJSON.stringify({", "\nconsole.log(JSON.stringify({")
+            .replace("\n});", "\n}));")
+        )
+        out = subprocess.run(
+            [_node_bin(), "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert out.returncode == 0, out.stderr
+        assert "ReferenceError" not in out.stderr, out.stderr
+        return out.stdout
+
+    def test_a_message_id_write_runs(self):
+        out = self._run(
+            {
+                "account": "iCloud",
+                "headers": ["<a@b>"],
+                "by_header": True,
+            },
+            collection="{ messageId: () => ['a@b'], "
+            "0: { messageId: () => 'a@b', flagIndex: () => -1 } }",
+        )
+        assert out.strip(), "the script produced no result"
+
+    def test_a_message_id_write_that_finds_nothing_runs(self):
+        """The reported repro: a reference no mailbox holds. Every
+        header stays in `remaining`, and the loop that decides between
+        "not found" and "the write was refused" is the one that touched
+        the undeclared map — so the failure path was the ONLY path that
+        reached it, and the happy path hid the bug."""
+        out = self._run(
+            {
+                "account": "iCloud",
+                "headers": ["<nobody@nowhere>"],
+                "by_header": True,
+            },
+            collection="{ messageId: () => ['a@b'], "
+            "0: { messageId: () => 'a@b', flagIndex: () => -1 } }",
+        )
+        assert "not_found" in out
+
+    def test_a_message_id_write_that_is_refused_runs(self):
+        """Found in the batch-fetched list, but the message itself says
+        it is somebody else — `applyByHeader` returns "failed" and the
+        refusal is recorded rather than reported as a missing message."""
+        out = self._run(
+            {
+                "account": "iCloud",
+                "headers": ["<a@b>"],
+                "by_header": True,
+            },
+            collection="{ messageId: () => ['a@b'], "
+            "0: { messageId: () => 'stranger@x', flagIndex: () => -1 } }",
+        )
+        assert "failures" in out
+
+    def test_a_scan_write_runs(self):
+        out = self._run(
+            {"account": "iCloud", "ids": [1], "scan": True},
+            collection="{ id: () => [1], "
+            "0: { id: () => 1, flagIndex: () => -1 } }",
+        )
+        assert out.strip()
+
+    def test_a_located_write_runs(self):
+        out = self._run(
+            {"account": "iCloud", "mailbox": "INBOX", "ids": [1]},
+            collection="{ id: () => [1], "
+            "0: { id: () => 1, flagIndex: () => -1 } }",
+        )
+        assert out.strip()

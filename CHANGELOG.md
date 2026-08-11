@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.1] - 2026-08-11
+
+Hotfix. Ein Health-Check auf echtem macOS hat zwei Fehler derselben
+Bauart gefunden, die 0.20.0 mit grüner Testsuite ausgeliefert hat:
+portierter Aufrufcode ohne das, was er aufruft — von Mocks verdeckt.
+
+### Fixed
+- **Jeder Schreibvorgang über eine `message_id` schlug fehl.** Das
+  generierte JXA-Skript benutzte eine `writeFailed`-Map, die nirgends
+  deklariert war: `ReferenceError: Can't find variable: writeFailed`,
+  einmal pro Konto. Betroffen war genau die Referenz, die dieses
+  Projekt empfiehlt.
+- **Jeder Schreibvorgang über eine numerische ID, die der Index
+  platzieren kann, schlug fehl.** `server.py` rief
+  `manager.count_email_locations(...)` auf; die Methode existierte auf
+  `IndexManager` nicht. In den Tests war der Manager ein MagicMock.
+- **Ein bloßes `get_emails()` konnte für ALLE Konten antworten.** Ist
+  der AccountMap-Cache kalt — `ensure_loaded()` spricht mit Mail und
+  kann unter parallelen Aufrufen langsam sein oder scheitern — blieb
+  die Konto-UUID `None` und die Envelope-Abfrage lief ungefiltert. Das
+  Ergebnis sah aus wie eine korrekte Antwort auf eine andere Frage.
+  Jetzt fällt der Pfad auf JXA zurück statt die Abfrage zu weiten.
+- Eine rein numerische **Zeichenkette** ist die ID, nicht ein
+  Message-ID-Header. MCP-Clients stringifizieren Zahlen routinemäßig;
+  `"150540"` als Header zu lesen löste eine Suche in jedem sichtbaren
+  Konto aus.
+
+### Added
+- `get_index_status()` liefert `failed_parse_examples` — Pfad, Mailbox,
+  Grund und Detail der letzten Dead-Letter-Einträge. Die bloße Zahl war
+  eine Sackgasse: sie sagt, dass drei Nachrichten fehlen, nicht welche.
+
+### Tests
+- Das generierte Schreib-Skript wird jetzt in node **ausgeführt**, für
+  alle drei Gruppenformen und beide Fehlerpfade. Vorher wurde nur
+  geprüft, ob ein Bezeichner im Text vorkommt — was bei einer nicht
+  deklarierten Variablen grün ist.
+- Ein AST-Test prüft, dass jede `manager.*`-Aufrufstelle in `server.py`
+  auf `IndexManager` wirklich existiert.
+
 ## [0.20.0] - 2026-08-11
 
 Three rounds of adversarial review over the 22 units prepared for
