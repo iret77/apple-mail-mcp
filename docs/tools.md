@@ -1,6 +1,6 @@
 # Tools
 
-Apple Mail MCP provides **8 MCP tools** — a consolidated API designed for AI assistants.
+Apple Mail MCP provides **12 MCP tools** — a consolidated API designed for AI assistants.
 
 ## Overview
 

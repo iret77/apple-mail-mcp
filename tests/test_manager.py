@@ -243,10 +243,10 @@ class TestClose:
         assert manager._open_conns
 
         manager.close()
-        assert manager._open_conns == []
+        assert not manager._open_conns
 
         manager.close()  # Should not raise
-        assert manager._open_conns == []
+        assert not manager._open_conns
 
         # A later caller simply gets a fresh connection.
         assert manager._get_conn() is not None
@@ -1216,8 +1216,14 @@ class TestBuildFinallyIsRobust:
         from apple_mail_mcp.index.manager import IndexManager
 
         src = inspect.getsource(IndexManager.build_from_disk)
-        finally_at = src.rindex("finally:")
-        tail = src[finally_at:]
+        # Anchored on the start of the cleanup rather than on the last
+        # `finally:` — the lock release has its own nested one now, and
+        # the claim is about the ORDER inside the cleanup.
+        # Anchored on the start of the cleanup. `_building` is now
+        # cleared at the END of it (a status call during the final flush
+        # must not read "ready"), so the phase marker is what opens the
+        # block.
+        tail = src[src.index('self._mark_progress("finalizing")'):]
         assert tail.index("_recreate_fts_triggers") < tail.index("_flush_batch")
 
 
@@ -1387,7 +1393,10 @@ class TestUsableIndexAndErrorTracking:
         from apple_mail_mcp.index import IndexManager
 
         m = IndexManager(db_path=temp_db_path)
-        m.indexed_email_count()  # creates the DB file
+        # Create the file deliberately. indexed_email_count() no longer
+        # does it as a side effect: a status call must not change the
+        # state it describes.
+        m._get_conn()
         assert m.has_index() is True
         assert m.has_usable_index() is False  # file exists, but no rows
 
@@ -1683,3 +1692,1091 @@ class TestLockErrorIsExplainedCorrectly:
         assert (
             "apple mail has nothing to do with it" in r["user_message"].lower()
         )
+
+
+class TestAFailedFinalizationStillEndsTheBuild:
+    """The heaviest writes in the program run in the build's `finally`.
+    A failure in any of them skipped the two lines that end the build,
+    so `is_building()` stayed True for the life of the process and the
+    status tool reported a build that had been dead for hours."""
+
+    def test_an_fts_rebuild_failure_does_not_leave_a_phantom_build(
+        self, temp_db_path, tmp_path
+    ):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import manager as manager_mod
+        from apple_mail_mcp.index.manager import IndexManager
+
+        manager = IndexManager(db_path=temp_db_path)
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch.object(manager, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                return_value=iter(
+                    [
+                        {
+                            "id": 1,
+                            "account": "uuid-1",
+                            "mailbox": "INBOX",
+                            "subject": "hello",
+                        }
+                    ]
+                ),
+            ),
+            # The last write of the build, and the one most likely to
+            # fail on a damaged index.
+            patch.object(
+                manager_mod,
+                "rebuild_fts_index",
+                side_effect=RuntimeError("fts is corrupt"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            manager.build_from_disk()
+
+        assert not manager.is_building(), (
+            "a failed finalization left the build reported as running"
+        )
+        assert manager.last_error, (
+            "the finalization failure was not recorded anywhere"
+        )
+
+
+class TestAnInterruptRollsBackToo:
+    """Ctrl-C lands mid-sync as easily as a bug does, and leaves exactly
+    the same open transaction — which then blocks every later write.
+    `except Exception` does not catch it."""
+
+    def test_an_interrupt_also_rolls_back(self, temp_db_path):
+        from unittest.mock import MagicMock, patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        conn = MagicMock()
+        with (
+            patch.object(mgr, "_get_conn", return_value=conn),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch(
+                "apple_mail_mcp.index.sync.sync_from_disk",
+                side_effect=KeyboardInterrupt(),
+            ),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            mgr.sync_updates()
+
+        conn.rollback.assert_called_once()
+
+
+class TestASyncThatFailsBeforeItStartsIsStillRecorded:
+    """`last_error` is cleared at the top of the sync. Anything that
+    fails after that but outside the try — resolving the account
+    exclusions talks to Mail, opening the database runs migrations —
+    raised while the status tool reported no error at all."""
+
+    def test_a_failure_resolving_exclusions_is_recorded(
+        self, temp_db_path, tmp_path
+    ):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch.object(
+                mgr,
+                "_resolve_exclusions",
+                side_effect=RuntimeError("Mail refused the Apple Event"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            mgr.sync_updates()
+
+        assert mgr.last_error, "the sync failed and recorded nothing"
+        assert "Apple Event" in mgr.last_error
+
+
+class TestBatchedStableIdLookup:
+    """`get_rfc822_ids()` — one query for a whole page of results."""
+
+    def _insert(self, m, mid, account, mailbox, header):
+        from apple_mail_mcp.index.schema import (
+            INSERT_EMAIL_SQL,
+            email_to_row,
+        )
+
+        conn = m._get_conn()
+        conn.execute(
+            INSERT_EMAIL_SQL,
+            email_to_row(
+                {"id": mid, "subject": "s", "message_id_header": header},
+                account,
+                mailbox,
+                f"/tmp/{mid}.emlx",
+            ),
+        )
+        conn.commit()
+
+    def test_returns_the_header_for_known_rows(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "<one@x>")
+        self._insert(m, 2, "acct", "INBOX", "<two@x>")
+
+        out = m.get_rfc822_ids([("acct", "INBOX", 1), ("acct", "INBOX", 2)])
+        assert out == {
+            ("acct", "INBOX", 1): "<one@x>",
+            ("acct", "INBOX", 2): "<two@x>",
+        }
+
+    def test_the_lookup_is_scoped_to_the_mailbox(self, temp_db_path):
+        """A Mail.app id is unique only within its mailbox: the same
+        number in another mailbox is a different message."""
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "<inbox@x>")
+        self._insert(m, 1, "acct", "Sent", "<sent@x>")
+
+        assert m.get_rfc822_ids([("acct", "Sent", 1)]) == {
+            ("acct", "Sent", 1): "<sent@x>"
+        }
+
+    def test_rows_without_a_header_are_absent(self, temp_db_path):
+        """Rows indexed before v6 have NULL. Absent means "unknown" —
+        never an empty string that could match something."""
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "")
+
+        assert m.get_rfc822_ids([("acct", "INBOX", 1)]) == {}
+
+    def test_empty_input_asks_nothing(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        assert m.get_rfc822_ids([]) == {}
+
+    def test_a_large_page_stays_under_the_variable_limit(self, temp_db_path):
+        """Three variables per key; SQLite's default cap is 999."""
+        m = IndexManager(db_path=temp_db_path)
+        for i in range(400):
+            self._insert(m, i, "acct", "INBOX", f"<m{i}@x>")
+
+        out = m.get_rfc822_ids([("acct", "INBOX", i) for i in range(400)])
+        assert len(out) == 400
+
+
+class TestBuildOnlySignalsStartedAfterItCanActuallyRun:
+    """`on_started` is what the rebuild tool reports "started" on. Firing
+    it before the steps that can still refuse the build — talking to
+    Mail for the account exclusions, opening and initialising SQLite —
+    made "started" survive both failures."""
+
+    def test_a_build_that_cannot_open_the_database_never_signals(
+        self, tmp_path
+    ):
+        import sqlite3
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        manager = IndexManager(db_path=tmp_path / "index.db")
+        signalled = []
+
+        with (
+            patch.object(
+                manager,
+                "_get_conn",
+                side_effect=sqlite3.OperationalError("unable to open"),
+            ),
+            patch.object(manager, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+        ):
+            with pytest.raises(sqlite3.OperationalError):
+                manager.build_from_disk(on_started=lambda: signalled.append(1))
+
+        assert signalled == [], (
+            "a build that never opened the database reported that it started"
+        )
+
+
+class TestBuildProgressHeartbeat:
+    """A build runs on a daemon thread. Without a heartbeat, "working"
+    and "wedged" are the same observation from outside: zero indexed."""
+
+    def test_nothing_running_has_no_progress(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        assert m.build_progress() is None
+        assert m.is_building() is False
+
+    def test_heartbeat_reports_phase_and_liveness(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+
+        m._mark_progress("reading_metadata")
+        p = m.build_progress()
+        assert p["phase"] == "reading_metadata"
+        assert p["emails_done"] == 0
+        assert p["appears_stalled"] is False
+
+        m._mark_progress("indexing", done=500, seen=512)
+        p = m.build_progress()
+        assert p["phase"] == "indexing"
+        assert p["emails_done"] == 500
+        assert p["files_seen"] == 512
+
+    def test_metadata_phase_gets_a_longer_grace_period(self, temp_db_path):
+        """Reading Apple's metadata for a large mailbox legitimately
+        takes minutes with nothing written; the indexing loop must tick
+        every few seconds."""
+        m = IndexManager(db_path=temp_db_path)
+        assert (
+            m._STALL_SECONDS["reading_metadata"] > m._STALL_SECONDS["indexing"]
+        )
+
+    def test_silence_beyond_the_phase_budget_reads_as_stalled(
+        self, temp_db_path
+    ):
+        m = IndexManager(db_path=temp_db_path)
+        m._mark_progress("indexing", done=500, seen=500)
+        # Backdate the stamp instead of sleeping.
+        m._build_progress["ts"] -= m._STALL_SECONDS["indexing"] + 1
+        assert m.build_progress()["appears_stalled"] is True
+
+
+class TestBuildStateSurvivesFailure:
+    """A build that dies must not leave a phantom build on display."""
+
+    def test_failed_build_clears_the_flag_and_records_the_error(
+        self, temp_db_path
+    ):
+        m = IndexManager(db_path=temp_db_path)
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=PermissionError("no Full Disk Access"),
+            ),
+            pytest.raises(PermissionError),
+        ):
+            m.build_from_disk()
+
+        assert m.is_building() is False
+        assert m.build_progress() is None
+        assert "PermissionError" in (m.last_error or "")
+        assert any(
+            e["message"] == "Index build failed" for e in m.recent_events()
+        )
+
+    def test_failure_before_the_db_opens_does_not_mask_itself(
+        self, temp_db_path
+    ):
+        """The cleanup path writes through `conn`, which does not exist
+        when the mail directory could not even be found. Raising
+        UnboundLocalError from `finally` would hide the real cause."""
+        m = IndexManager(db_path=temp_db_path)
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                side_effect=FileNotFoundError("no ~/Library/Mail"),
+            ),
+            pytest.raises(FileNotFoundError),
+        ):
+            m.build_from_disk()
+
+
+class TestConnectionsArePerThread:
+    """A shared connection made a background rebuild block the server.
+
+    SQLite connections are not safe to share across threads, and the
+    single instance-level one meant every request needing the index
+    waited behind a rebuild — from outside, the server simply looked
+    frozen.
+    """
+
+    def test_each_thread_gets_its_own(self, temp_db_path):
+        import threading
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        seen = []
+
+        def grab():
+            seen.append(id(mgr._get_conn()))
+
+        main = id(mgr._get_conn())
+        t = threading.Thread(target=grab)
+        t.start()
+        t.join()
+
+        assert seen and seen[0] != main
+
+    def test_the_same_thread_keeps_its_connection(self, temp_db_path):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        assert mgr._get_conn() is mgr._get_conn()
+
+    def test_close_releases_every_thread_connection(self, temp_db_path):
+        import threading
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        mgr._get_conn()
+        t = threading.Thread(target=mgr._get_conn)
+        t.start()
+        t.join()
+
+        assert len(mgr._open_conns) == 2
+        mgr.close()
+        assert not mgr._open_conns
+
+
+class TestConnectionsDoNotOutliveTheirThreads:
+    """One connection per thread is right; keeping every one of them
+    alive until close() is not. A server that runs short-lived worker
+    threads accumulated a SQLite file descriptor — and an open implicit
+    transaction — per thread that had ever touched the index."""
+
+    def test_a_finished_thread_s_connection_is_closed(self, temp_db_path):
+        import sqlite3
+        import threading
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        mgr._get_conn()  # the main thread's own connection
+
+        captured: list[sqlite3.Connection] = []
+        worker = threading.Thread(
+            target=lambda: captured.append(mgr._get_conn())
+        )
+        worker.start()
+        worker.join()
+
+        # The reap runs on the next connection request.
+        threading.Thread(target=mgr._get_conn).start()
+        time.sleep(0.2)
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            captured[0].execute("SELECT 1")
+
+
+class TestEventRing:
+    """An MCP server's stderr reaches nobody under a desktop client, so
+    this ring is the only answer to "what just happened?"."""
+
+    def test_events_are_newest_first(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        m.record_event("info", "first")
+        m.record_event("info", "second")
+        assert [e["message"] for e in m.recent_events()][:2] == [
+            "second",
+            "first",
+        ]
+
+    def test_ring_is_bounded(self, temp_db_path):
+        from apple_mail_mcp.index.manager import MAX_EVENTS
+
+        m = IndexManager(db_path=temp_db_path)
+        for i in range(MAX_EVENTS + 25):
+            m.record_event("info", f"event {i}")
+        assert len(m.recent_events(limit=1000)) == MAX_EVENTS
+
+    def test_fields_are_stringified_not_dropped(self, temp_db_path):
+        """These go into an MCP response: one non-serializable value
+        would break the whole reply rather than this one event."""
+        m = IndexManager(db_path=temp_db_path)
+        m.record_event("info", "with fields", path=Path("/tmp/x"), count=3)
+        e = m.recent_events()[0]
+        assert e["path"] == "/tmp/x"
+        assert e["count"] == "3"
+
+    def test_recording_never_raises(self, temp_db_path):
+        """Diagnostics must not be able to break what they describe."""
+
+        class Hostile:
+            def __str__(self):
+                raise RuntimeError("nope")
+
+        m = IndexManager(db_path=temp_db_path)
+        m.record_event("info", "hostile", bad=Hostile())  # must not raise
+
+
+class TestFailedSyncDoesNotWedgeTheIndex:
+    """A sync that raises must not leave its transaction open.
+
+    It did: every later write then failed with "database is locked"
+    until the process restarted, and the index looked dead while
+    nothing was actually wrong with it. Two other causes were chased
+    first because the symptom is identical.
+    """
+
+    def test_rollback_runs_and_the_error_propagates(self, temp_db_path):
+        from unittest.mock import MagicMock, patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        conn = MagicMock()
+        with (
+            patch.object(mgr, "_get_conn", return_value=conn),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch(
+                "apple_mail_mcp.index.sync.sync_from_disk",
+                side_effect=RuntimeError("disk went away mid-run"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            mgr.sync_updates()
+
+        conn.rollback.assert_called_once()
+
+    def test_a_failing_rollback_does_not_mask_the_real_error(
+        self, temp_db_path
+    ):
+        from unittest.mock import MagicMock, patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        conn = MagicMock()
+        conn.rollback.side_effect = RuntimeError("rollback failed too")
+        with (
+            patch.object(mgr, "_get_conn", return_value=conn),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch(
+                "apple_mail_mcp.index.sync.sync_from_disk",
+                side_effect=RuntimeError("the original failure"),
+            ),
+            pytest.raises(RuntimeError, match="the original failure"),
+        ):
+            mgr.sync_updates()
+
+
+class TestFinalizationFailuresAreRecorded:
+    """ "Every failure" has to include the ones after the except block.
+
+    The heaviest writes — the final flush and the FTS rebuild — happen in
+    the cleanup block, past the `except`. A failure there escaped with
+    `last_error` still None, so a build that left rows body search can
+    never find reported itself as clean.
+    """
+
+    def test_a_failing_fts_rebuild_is_not_a_clean_build(self, tmp_path):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import IndexManager
+
+        mgr = IndexManager(db_path=tmp_path / "idx.db")
+
+        def one_email(*a, **kw):
+            yield {
+                "id": 1,
+                "account": "acct",
+                "mailbox": "INBOX",
+                "subject": "s",
+                "sender": "a@x",
+                "content": "body",
+                "date_received": "2026-07-28",
+                "emlx_path": "/tmp/1.emlx",
+                "attachments": [],
+            }
+
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                side_effect=one_email,
+            ),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            patch(
+                "apple_mail_mcp.index.manager.rebuild_fts_index",
+                side_effect=sqlite3.OperationalError("disk I/O error"),
+            ),
+        ):
+            mgr.build_from_disk()
+
+        assert mgr.last_error is not None, (
+            "a build whose FTS rebuild failed reported itself as clean"
+        )
+        assert "disk I/O error" in mgr.last_error
+        assert any(e["level"] == "error" for e in mgr.recent_events())
+
+
+class TestFindByRfc822:
+    """Locating an indexed message by its stable header."""
+
+    def _insert(self, m, mid, account, mailbox, header):
+        from apple_mail_mcp.index.schema import (
+            INSERT_EMAIL_SQL,
+            email_to_row,
+        )
+
+        conn = m._get_conn()
+        conn.execute(
+            INSERT_EMAIL_SQL,
+            email_to_row(
+                {"id": mid, "subject": "s", "message_id_header": header},
+                account,
+                mailbox,
+                f"/tmp/{mid}.emlx",
+            ),
+        )
+        conn.commit()
+
+    def test_either_stored_form_matches(self, temp_db_path):
+        """The .emlx keeps the angle brackets, Apple Mail's messageId
+        drops them. A strict comparison finds nothing."""
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "<bracketed@x>")
+        self._insert(m, 2, "acct", "INBOX", "bare@x")
+
+        assert m.find_by_rfc822("bracketed@x")
+        assert m.find_by_rfc822("<bracketed@x>")
+        assert m.find_by_rfc822("bare@x")
+        assert m.find_by_rfc822("<bare@x>")
+
+    def test_a_folded_header_still_matches(self, temp_db_path):
+        """trim() drops spaces but not tabs or newlines, and a folded
+        header brings exactly those."""
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "<\n\tfolded@x >")
+
+        assert m.find_by_rfc822("folded@x")
+
+    def test_every_copy_is_returned(self, temp_db_path):
+        """The same mail legitimately exists in INBOX and an archive, or
+        across accounts — guessing one would be wrong half the time."""
+        m = IndexManager(db_path=temp_db_path)
+        self._insert(m, 1, "acct", "INBOX", "<dup@x>")
+        self._insert(m, 2, "acct", "Archive", "<dup@x>")
+
+        assert len(m.find_by_rfc822("<dup@x>")) == 2
+
+    def test_an_unknown_header_returns_nothing(self, temp_db_path):
+        m = IndexManager(db_path=temp_db_path)
+        assert m.find_by_rfc822("<nope@x>") == []
+
+
+class TestFirstConnectionsDoNotRaceOnSchema:
+    """One connection per thread means several threads can meet a fresh
+    database at once — and `init_database()` creates tables and runs
+    migrations. Measured before the lock was added: "vtable constructor
+    failed: emails_fts", "duplicate column name: emlx_path", and
+    spurious migration notices."""
+
+    def test_twelve_threads_on_a_fresh_database(self, tmp_path):
+        import concurrent.futures as cf
+
+        from apple_mail_mcp.index import IndexManager
+
+        mgr = IndexManager(db_path=tmp_path / "fresh.db")
+        errors: list[str] = []
+
+        def hit() -> None:
+            try:
+                mgr._get_conn().execute("SELECT 1").fetchone()
+            except Exception as exc:  # noqa: BLE001 - reporting the race
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        with cf.ThreadPoolExecutor(max_workers=12) as pool:
+            list(pool.map(lambda _: hit(), range(12)))
+
+        assert not errors, errors
+        mgr.close()
+
+    def test_the_lock_is_only_taken_on_a_first_call(self, temp_db_path):
+        """Serializing every query would undo the change this unit is
+        about, so the thread-local has to short-circuit."""
+        from apple_mail_mcp.index import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        first = mgr._get_conn()
+
+        class Tripwire:
+            def __enter__(self):
+                raise AssertionError("lock taken on a repeat call")
+
+            def __exit__(self, *a):
+                return False
+
+        mgr._conn_lock = Tripwire()
+        assert mgr._get_conn() is first
+
+
+class TestIndexWritesAreSerializedAcrossProcesses:
+    """A thread lock is not enough here.
+
+    Claude Desktop starts this server twice, so two processes contend
+    for the same index file. Locking correctly inside each process
+    still produced "database is locked" — the lock has to live in the
+    filesystem.
+    """
+
+    def test_a_second_holder_is_refused(self, temp_db_path):
+        from apple_mail_mcp.index.manager import WriteLock
+
+        a = WriteLock(temp_db_path)
+        b = WriteLock(temp_db_path)
+        assert a.acquire(blocking=False)
+        try:
+            assert not b.acquire(blocking=False)
+        finally:
+            a.release()
+        assert b.acquire(blocking=False)
+        b.release()
+
+    def test_a_real_second_process_is_refused(self, temp_db_path):
+        """Two lock objects in one process share a file lock, so they
+        cannot show that the lock crosses the process boundary — which
+        is the entire claim. This one forks a real interpreter."""
+        import subprocess
+        import sys
+        import textwrap
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent(f"""
+                    import sys, time
+                    from apple_mail_mcp.index.manager import WriteLock
+                    lock = WriteLock({str(temp_db_path)!r})
+                    print("held" if lock.acquire(blocking=False) else "no",
+                          flush=True)
+                    time.sleep(30)
+                """),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "held"
+            mine = WriteLock(temp_db_path)
+            assert not mine.acquire(blocking=False), (
+                "a second PROCESS took a lock the first one holds"
+            )
+        finally:
+            holder.kill()
+            holder.wait(timeout=10)
+
+        mine = WriteLock(temp_db_path)
+        assert mine.acquire(blocking=False), (
+            "the lock outlived the process that held it"
+        )
+        mine.release()
+
+    def test_a_lock_file_that_cannot_be_created_is_not_a_lock(
+        self, temp_db_path, caplog
+    ):
+        """Returning True there reports an exclusivity nobody took.
+        Refusing instead would wedge every write on a read-only home,
+        so it degrades — but it has to be visible when it does."""
+        import logging
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock = WriteLock(temp_db_path)
+        with (
+            patch("os.open", side_effect=PermissionError("read-only home")),
+            caplog.at_level(logging.WARNING),
+        ):
+            assert lock.acquire(blocking=False)
+        try:
+            assert lock.degraded, (
+                "the lock degraded to this process and did not say so"
+            )
+            assert "NOT prevented" in caplog.text
+        finally:
+            lock.release()
+
+    def test_a_filesystem_without_flock_does_not_wedge_the_index(
+        self, temp_db_path, caplog
+    ):
+        """ENOTSUP is not contention. Treating every OSError as "held"
+        made the index permanently unwritable on the network home
+        directories that answer it, with "already running" as the only
+        explanation the user ever saw."""
+        import errno
+        import logging
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock = WriteLock(temp_db_path)
+        with (
+            patch(
+                "fcntl.flock",
+                side_effect=OSError(errno.ENOTSUP, "not supported"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            assert lock.acquire(blocking=False)
+        try:
+            assert lock.degraded
+        finally:
+            lock.release()
+
+    def test_a_lock_someone_else_holds_is_still_a_refusal(self, temp_db_path):
+        """The errno split must not turn real contention into a pass."""
+        from apple_mail_mcp.index.manager import WriteLock
+
+        a = WriteLock(temp_db_path)
+        b = WriteLock(temp_db_path)
+        assert a.acquire(blocking=False)
+        try:
+            assert not b.acquire(blocking=False)
+            assert not b.degraded
+        finally:
+            a.release()
+
+    def test_release_lets_the_next_one_in(self, temp_db_path):
+        from apple_mail_mcp.index.manager import WriteLock
+
+        lock = WriteLock(temp_db_path)
+        assert lock.acquire(blocking=False)
+        lock.release()
+        assert lock.acquire(blocking=False)
+        lock.release()
+
+    def test_a_busy_index_raises_rather_than_reporting_no_changes(
+        self, temp_db_path
+    ):
+        """0 changes and "never ran" must not look the same."""
+        from apple_mail_mcp.index.manager import IndexBusyError, IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        assert mgr._write_lock.acquire(blocking=False)
+        try:
+            with pytest.raises(IndexBusyError):
+                mgr.sync_updates()
+            with pytest.raises(IndexBusyError):
+                mgr.build_from_disk()
+        finally:
+            mgr._write_lock.release()
+
+    def test_an_unusable_lock_file_degrades_to_thread_locking(
+        self, temp_db_path
+    ):
+        """A read-only home must not make the index unusable.
+
+        Patching `builtins.open` proved nothing: the lock uses `os.open`,
+        so the fallback was never exercised and the test passed either
+        way.
+        """
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        with patch(
+            "os.open", side_effect=OSError("read-only file system")
+        ) as opened:
+            lock = WriteLock(temp_db_path)
+            assert lock.acquire(blocking=False)
+            lock.release()
+
+        assert opened.called, "the file-lock path was never reached"
+
+
+class TestReadingTheStatusCreatesNothing:
+    """`get_index_status()` is documented as read-only. Opening a
+    connection runs init_database(), so counting rows on a fresh install
+    created the index file — and the next `serve` then took the sync
+    path instead of building."""
+
+    def test_counting_rows_does_not_create_the_database(self, tmp_path):
+        from apple_mail_mcp.index import IndexManager
+
+        db = tmp_path / "absent.db"
+        mgr = IndexManager(db_path=db)
+
+        assert mgr.indexed_email_count() == 0
+        assert not db.exists(), "a status read created the index"
+        assert mgr.has_index() is False
+
+
+class TestRebuildDoesNotFireOneDeletePerRow:
+    """Clearing with the FTS triggers still in place is quadratic work.
+
+    emails_ad fires once per deleted row against the external content
+    index — minutes on a 64k-message mailbox, for a table that is about
+    to be empty. Dropping the triggers first and emptying FTS with a
+    single statement removes all of it.
+    """
+
+    def test_triggers_are_dropped_before_the_delete(self):
+        import inspect
+
+        from apple_mail_mcp.index import manager as m
+
+        src = inspect.getsource(m.IndexManager.build_from_disk)
+        drop = src.index("DROP TRIGGER IF EXISTS emails_ad")
+        delete = src.index('conn.execute("DELETE FROM emails")')
+        assert drop < delete, "the DELETE would fire the trigger per row"
+
+    def test_fts_is_emptied_in_one_statement(self):
+        import inspect
+
+        from apple_mail_mcp.index import manager as m
+
+        src = inspect.getsource(m.IndexManager.build_from_disk)
+        assert "VALUES('delete-all')" in src
+
+    def test_triggers_are_restored_even_when_the_build_fails(
+        self, temp_db_path
+    ):
+        """DDL commits implicitly, so a rollback does not bring them
+        back: without the restore the index silently stops tracking
+        its FTS table from then on."""
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        conn = mgr._get_conn()
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.scan_all_emails",
+                side_effect=RuntimeError("disk went away"),
+            ),
+        ):
+            with pytest.raises(RuntimeError):
+                mgr.build_from_disk()
+
+        names = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+        assert {"emails_ai", "emails_ad", "emails_au"} <= names
+
+
+class TestSingleRowCleanupTakesTheWriteLockToo:
+    """`delete_email()` is a write. Outside the lock it raced a build
+    and raised "database is locked" into a read that was otherwise
+    fine."""
+
+    def test_a_delete_during_a_build_is_skipped_not_raised(
+        self, temp_db_path, monkeypatch
+    ):
+        from apple_mail_mcp.index import manager as manager_mod
+        from apple_mail_mcp.index.manager import IndexManager, WriteLock
+
+        manager = IndexManager(db_path=temp_db_path)
+        monkeypatch.setattr(manager_mod, "WRITE_LOCK_WAIT", 0.05)
+
+        builder = WriteLock(Path(temp_db_path).with_suffix(".lock"))
+        assert builder.acquire(blocking=False)
+        try:
+            assert manager.delete_email(42) == 0
+        finally:
+            builder.release()
+
+    def test_it_deletes_when_the_index_is_free(self, temp_db_path):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        manager = IndexManager(db_path=temp_db_path)
+        conn = manager._get_conn()
+        conn.execute(
+            "INSERT INTO emails (message_id, account, mailbox, subject) "
+            "VALUES (?, ?, ?, ?)",
+            (42, "uuid-1", "INBOX", "hello"),
+        )
+        conn.commit()
+
+        assert manager.delete_email(42, account="uuid-1", mailbox="INBOX") == 1
+        assert manager._write_lock.acquire(blocking=False), (
+            "the cleanup left the write lock held"
+        )
+        manager._write_lock.release()
+
+
+class TestTheLockFileIsItsOwnFile:
+    """Documentation and operator both expect `<index>.lock`."""
+
+    def test_the_database_itself_is_not_flocked(self, tmp_path):
+        from apple_mail_mcp.index import IndexManager
+
+        db = tmp_path / "index.db"
+        mgr = IndexManager(db_path=db)
+        assert mgr._write_lock._path != db
+        assert mgr._write_lock._path.suffix == ".lock"
+
+    def test_rebuild_takes_the_lock_before_deleting(self, tmp_path):
+        """The DELETE ran outside the lock, so a second rebuild could
+        wipe rows mid-build — and it surfaced as a raw 'database is
+        locked' instead of the IndexBusyError this class exists to
+        give."""
+        from apple_mail_mcp.index import IndexManager
+        from apple_mail_mcp.index.manager import IndexBusyError
+
+        mgr = IndexManager(db_path=tmp_path / "index.db")
+        conn = mgr._get_conn()
+        conn.execute(
+            "INSERT INTO emails (message_id, account, mailbox, subject) "
+            "VALUES (1, 'a', 'INBOX', 'keep me')"
+        )
+        conn.commit()
+
+        # Somebody else is already building.
+        assert mgr._write_lock.acquire(blocking=False)
+        try:
+            with pytest.raises(IndexBusyError):
+                mgr.rebuild()
+        finally:
+            mgr._write_lock.release()
+
+        rows = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
+        assert rows == 1, "the refused rebuild deleted rows anyway"
+
+
+class TestTheLockIsNeverLeaked:
+    """The lock is taken before the first thing that can fail.
+
+    Any escape between the acquire and the release — an unreadable mail
+    directory, a JXA failure while resolving exclusions, a database that
+    will not open — left both the flock and the thread lock held for the
+    rest of the process's life. Every later build and sync was then
+    refused with "already running" while nothing was running.
+    """
+
+    def test_an_unreadable_mail_directory_releases_it(self, temp_db_path):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        with patch(
+            "apple_mail_mcp.index.disk.find_mail_directory",
+            side_effect=PermissionError("no Full Disk Access"),
+        ):
+            assert mgr.sync_updates() == 0
+
+        assert not mgr._write_lock.locked()
+
+    def test_a_failure_resolving_exclusions_releases_it(self, temp_db_path):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.manager import IndexManager
+
+        mgr = IndexManager(db_path=temp_db_path)
+        with (
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=temp_db_path.parent,
+            ),
+            patch.object(
+                mgr,
+                "_resolve_exclusions",
+                side_effect=RuntimeError("JXA refused"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            mgr.sync_updates()
+
+        assert not mgr._write_lock.locked(), (
+            "the lock stayed held, so every later sync is refused"
+        )
+
+
+class TestTriggersSurviveAFailureBeforeTheLoop:
+    """A dropped trigger outlives the failure that followed it.
+
+    Not because DDL autocommits — sqlite3 holds `DROP TRIGGER` in the
+    same implicit transaction as any DML — but because the batch commits
+    during the build make it permanent along the way.
+
+    With the drop outside the `try`, a failure in any statement between
+    it and the loop — a corrupt FTS table makes `'delete-all'` raise —
+    left the database FILE without its triggers. That survives restarts,
+    and from then on every insert lands in `emails` but never in
+    `emails_fts`: body search silently stops seeing new mail.
+    """
+
+    def _trigger_names(self, conn) -> set[str]:
+        return {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+
+    def test_a_failure_while_clearing_leaves_the_triggers_in_place(
+        self, tmp_path
+    ):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index import IndexManager
+
+        mgr = IndexManager(db_path=tmp_path / "idx.db")
+        conn = mgr._get_conn()
+        assert self._trigger_names(conn) >= {
+            "emails_ai",
+            "emails_ad",
+            "emails_au",
+        }
+
+        # Fail after the triggers are dropped, exactly where a corrupt
+        # FTS table would. sqlite3.Connection.execute is read-only, so
+        # the connection is wrapped rather than patched.
+        class Failing:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *a, **kw):
+                if "delete-all" in sql:
+                    raise sqlite3.OperationalError("vtable constructor failed")
+                return self._inner.execute(sql, *a, **kw)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        with (
+            patch.object(mgr, "_get_conn", return_value=Failing(conn)),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch.object(mgr, "_resolve_exclusions", return_value=set()),
+            pytest.raises(sqlite3.OperationalError),
+        ):
+            mgr.build_from_disk()
+
+        assert self._trigger_names(mgr._get_conn()) >= {
+            "emails_ai",
+            "emails_ad",
+            "emails_au",
+        }, "the database file lost its FTS triggers permanently"

@@ -223,6 +223,9 @@ def _mock_index(location=None, has_index=True):
     mgr = MagicMock()
     mgr.has_index.return_value = has_index
     mgr.find_email_location.return_value = location
+    # One location per id unless a test says otherwise: a MagicMock here
+    # makes the ambiguity guard raise on `> 1`.
+    mgr.count_email_locations.return_value = 1 if location else 0
     return mgr
 
 
@@ -399,6 +402,7 @@ class TestWriteBuckets:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_email_location.side_effect = locate
         amap = _mock_acct_map()
 
@@ -641,6 +645,7 @@ class TestScanFallback:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_email_location.side_effect = locate
         amap = _mock_acct_map()
 
@@ -806,6 +811,7 @@ class TestMovedMessageRecovery:
     async def test_recovers_via_header_and_reports_move(self):
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.has_usable_index.return_value = True
         # id 5 resolves in the index, but JXA no longer finds it there.
         mgr.find_email_location.return_value = ("uuid-work", "INBOX")
@@ -845,6 +851,7 @@ class TestMovedMessageRecovery:
     async def test_no_stable_id_means_no_retry(self):
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.has_usable_index.return_value = True
         mgr.find_email_location.return_value = ("uuid-work", "INBOX")
         mgr.get_rfc822_id.return_value = None  # indexed before v6
@@ -926,6 +933,7 @@ class TestReviewFindings:
         (ids are unique per mailbox only) — and we'd flag that message."""
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.has_usable_index.return_value = True
         mgr.find_email_location.return_value = ("uuid-work", "INBOX")
         mgr.get_rfc822_id.return_value = "<moved@x>"
@@ -968,6 +976,7 @@ class TestReviewFindings:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.has_usable_index.return_value = True
         mgr.find_email_location.side_effect = locate
         mgr.get_rfc822_id.return_value = "<dup@x>"  # same header for both
@@ -1188,6 +1197,7 @@ class TestMessageIdIsAcceptedForWrites:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_email_location.side_effect = locate
         mgr.find_by_rfc822.return_value = [("uuid-work", "Archiv", 77)]
         amap = _mock_acct_map()
@@ -2046,6 +2056,7 @@ class TestTheLastTwoGapPaths:
 
         mgr = MagicMock()
         mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
         mgr.find_email_location.side_effect = locate
         mgr.get_rfc822_id.return_value = "<moved@x>"
         amap = _mock_acct_map()
@@ -2199,3 +2210,1255 @@ class TestFlagColoursCarryNoMeaning:
             "purple": 5,
             "gray": 6,
         }
+
+
+class TestALiveLookupSearchesTheAccountThatWasAsked:
+    """The scan stops at its first hit, and the requested account was
+    applied AFTERWARDS. A copy of the same message in another account
+    therefore ended the search, was dropped by the filter, and the
+    account the caller named — never looked at — was reported missing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_requested_account_is_the_search_scope(self):
+        import apple_mail_mcp.server as srv
+
+        seen: list[list[str]] = []
+
+        async def fake_exec(script, timeout=None):
+            # The account list is the `targets` array in the script.
+            start = script.index("const targets = ") + len("const targets = ")
+            seen.append(json.loads(script[start : script.index(";", start)]))
+            return {"account": "Work", "mailbox": "INBOX", "id": 7}
+
+        with (
+            patch.object(srv, "execute_with_core_async", side_effect=fake_exec),
+            patch.object(
+                srv,
+                "_visible_account_names",
+                AsyncMock(return_value=["Other", "Work"]),
+            ),
+        ):
+            await srv._locate_header_via_jxa("<a@b>", "Work")
+
+        assert seen == [["Work"]], (
+            "the live search covered accounts the caller did not ask for, "
+            "and would have stopped at the first of them"
+        )
+
+    @pytest.mark.asyncio
+    async def test_without_an_account_every_visible_one_is_searched(self):
+        import apple_mail_mcp.server as srv
+
+        seen: list[list[str]] = []
+
+        async def fake_exec(script, timeout=None):
+            start = script.index("const targets = ") + len("const targets = ")
+            seen.append(json.loads(script[start : script.index(";", start)]))
+            return {"found": False, "capped": 0, "unreadable": 0}
+
+        with (
+            patch.object(srv, "execute_with_core_async", side_effect=fake_exec),
+            patch.object(
+                srv,
+                "_visible_account_names",
+                AsyncMock(return_value=["Other", "Work"]),
+            ),
+        ):
+            await srv._locate_header_via_jxa("<a@b>")
+
+        assert seen == [["Other", "Work"]]
+
+
+class TestAmbiguousIdsAreNeverGuessed:
+    """A Mail.app id is a per-mailbox ROWID.
+
+    The index schema's UNIQUE is `(account, mailbox, message_id)`, so the
+    same number legitimately names a different message in another
+    mailbox. Resolving it to one location silently picks one — for a
+    WRITE that means flagging mail the caller never named.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_id_in_two_mailboxes_is_not_written(self):
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 2  # INBOX *and* Archive
+        mgr.find_email_location.return_value = ("uuid-work", "INBOX")
+        exec_mock = AsyncMock()
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch("apple_mail_mcp.server.execute_with_core_async", exec_mock),
+        ):
+            out = await _apply_write(
+                [42], None, None, lambda g: WriteBuilder.set_read(g, True)
+            )
+
+        exec_mock.assert_not_called()  # nothing was written
+        assert out["failed"] == [42]
+        assert "more than one mailbox" in out["hint"]
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_mailbox_resolves_the_ambiguity(self):
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        # The count answers the question it is ASKED: one message once
+        # both halves of the location are pinned, two when they are not.
+        mgr.count_email_locations.side_effect = (
+            lambda mid, account=None, mailbox=None: 1
+            if (account and mailbox)
+            else 2
+        )
+        mgr.find_email_location.return_value = ("uuid-work", "Archive")
+
+        acct_map = _mock_acct_map()
+        acct_map.name_to_uuid.return_value = "uuid-work"
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=acct_map,
+            ),
+        ):
+            groups, _, _, _placed, ambiguous = await _resolve_write_targets(
+                [42], "Work", "Archive"
+            )
+
+        assert not ambiguous
+        assert groups == [
+            {"account": "Work", "mailbox": "Archive", "ids": [42]}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_mailbox_without_an_account_is_still_ambiguous(self):
+        """Every account has an INBOX, and the same ROWID names a
+        different message in each. Checking only when `mailbox` was
+        omitted let that through to an arbitrary pick — a write to mail
+        the caller never named."""
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        # Two accounts hold ROWID 42 in a mailbox called INBOX.
+        mgr.count_email_locations.side_effect = (
+            lambda mid, account=None, mailbox=None: 1 if account else 2
+        )
+        mgr.find_email_location.return_value = ("uuid-work", "INBOX")
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+        ):
+            groups, _, _, _placed, ambiguous = await _resolve_write_targets(
+                [42], None, "INBOX"
+            )
+
+        assert ambiguous == [42]
+        assert groups == []
+
+
+class TestAMovedMessageStillHasItsAttachments:
+    """`get_email(header)` asks Mail once every indexed location turns
+    out stale. The attachment and link readers stopped there instead —
+    so between two syncs a moved message could be read while its
+    attachments and links reported that it did not exist."""
+
+    @pytest.mark.asyncio
+    async def test_the_path_resolver_falls_back_to_a_live_lookup(
+        self, tmp_path
+    ):
+        import apple_mail_mcp.server as srv
+
+        # Mail's account directory, with the message under its new
+        # mailbox and the ROWID Mail reports.
+        acct_dir = tmp_path / "UUID-WORK"
+        moved = acct_dir / "Archive.mbox" / "Data" / "Messages"
+        moved.mkdir(parents=True)
+        emlx = moved / "77.emlx"
+        emlx.write_text("stub")
+
+        def _parse(path):
+            # The recorded location now holds somebody else's message —
+            # that is what "stale" means here.
+            m = MagicMock()
+            m.message_id_header = (
+                "<a@b>" if path.name == "77.emlx" else "<stranger@x>"
+            )
+            return m
+
+        acct_map = _mock_acct_map()
+        acct_map.name_to_uuid.return_value = "UUID-WORK"
+
+        mgr = MagicMock()
+        # The index still points at the OLD location, and that file is
+        # gone — every recorded candidate is stale.
+        mgr.find_by_rfc822.return_value = [("uuid-work", "INBOX", 12)]
+        mgr.has_index.return_value = True
+        mgr.find_email_path.return_value = str(
+            acct_dir / "INBOX.mbox" / "Data" / "Messages" / "12.emlx"
+        )
+
+        with (
+            patch.object(srv, "_get_index_manager", return_value=mgr),
+            patch.object(srv, "_get_account_map", return_value=acct_map),
+            patch.object(
+                srv,
+                "_excluded_account_names",
+                return_value=set(),
+            ),
+            patch.object(
+                srv,
+                "_excluded_account_uuids",
+                AsyncMock(return_value=set()),
+            ),
+            patch.object(
+                srv,
+                "_locate_header_via_jxa",
+                AsyncMock(return_value=("Work", "Archive", 77)),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch("apple_mail_mcp.index.disk.parse_emlx", side_effect=_parse),
+        ):
+            found = await srv._resolve_emlx_path_by_header("<a@b>", None, None)
+
+        assert found == emlx
+
+    @pytest.mark.asyncio
+    async def test_a_live_hit_with_the_wrong_header_is_refused(self, tmp_path):
+        """The same rule as the indexed candidates: a ROWID is a
+        hypothesis, and the file has to prove it is the right message."""
+        import apple_mail_mcp.server as srv
+
+        acct_dir = tmp_path / "UUID-WORK"
+        moved = acct_dir / "Archive.mbox" / "Data" / "Messages"
+        moved.mkdir(parents=True)
+        (moved / "77.emlx").write_text("stub")
+
+        stranger = MagicMock()
+        stranger.message_id_header = "<someone-else@b>"
+
+        acct_map = _mock_acct_map()
+        acct_map.name_to_uuid.return_value = "UUID-WORK"
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.find_by_rfc822.return_value = [("uuid-work", "INBOX", 12)]
+        mgr.find_email_path.return_value = None
+
+        with (
+            patch.object(srv, "_get_index_manager", return_value=mgr),
+            patch.object(srv, "_get_account_map", return_value=acct_map),
+            patch.object(
+                srv,
+                "_excluded_account_names",
+                return_value=set(),
+            ),
+            patch.object(
+                srv,
+                "_excluded_account_uuids",
+                AsyncMock(return_value=set()),
+            ),
+            patch.object(
+                srv,
+                "_locate_header_via_jxa",
+                AsyncMock(return_value=("Work", "Archive", 77)),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=tmp_path,
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.parse_emlx", return_value=stranger
+            ),
+            pytest.raises(ValueError, match="could not be located"),
+        ):
+            await srv._resolve_emlx_path_by_header("<a@b>", None, None)
+
+
+class TestAnIncompleteScanIsNotAnAbsence:
+    """A scan that could not read every mailbox has not established that
+    the message is gone — the unit's own contract says so."""
+
+    def test_the_generated_script_routes_that_to_failures(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_read(
+            [{"account": "A", "ids": [1], "scan": True}], True
+        ).build()
+
+        assert "could not cover every mailbox" in script
+        # …and the plain not-found path still exists for the case where
+        # the scan really did cover everything.
+        assert "notFound.push(id)" in script
+
+
+class TestAStaleIndexIsNotTheEndOfTheSearch:
+    """Every indexed location being stale says the INDEX is out of date,
+    not that the message is gone. The read path used to stop there,
+    which contradicts the rule this unit states: the index orders the
+    search, it never limits it."""
+
+    @pytest.mark.asyncio
+    async def test_a_live_search_runs_after_every_row_proves_stale(self):
+        from apple_mail_mcp.server import _get_email_by_header
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        # The index points at a ROWID that now holds a different message.
+        mgr.find_by_rfc822.return_value = [("uuid-work", "INBOX", 1)]
+
+        async def by_id(mid, acct=None, mbox=None):
+            return {
+                "id": mid,
+                "message_id": "<somebody-else@x>" if mid == 1 else "<a@x>",
+            }
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._locate_header_via_jxa",
+                AsyncMock(return_value=("Private", "Archive", 99)),
+            ),
+            patch("apple_mail_mcp.server._get_email_by_id", side_effect=by_id),
+        ):
+            out = await _get_email_by_header("<a@x>", None, None)
+
+        assert out["id"] == 99, (
+            "the message had moved to another account; the stale row "
+            "must not end the search"
+        )
+
+
+class TestATimeoutIsAnUnknownOutcomeNotAFailedWrite:
+    """The deadline says the ANSWER never came back, not that the write
+    never happened: Mail may have applied some, all or none of the batch
+    before it expired. Reporting "never reached the message" is the same
+    false verdict as calling an unfinished search a missing message."""
+
+    @pytest.mark.asyncio
+    async def test_the_hint_says_unknown_and_not_never(self):
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_email_location.return_value = ("uuid-work", "INBOX")
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="Work"),
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=TimeoutError(),
+            ),
+        ):
+            out = await _apply_write(
+                [7], None, None, lambda g: WriteBuilder.set_read(g, True)
+            )
+
+        assert out["failed"] == [7]
+        hint = out["hint"].lower()
+        assert "unknown" in hint
+        assert "never reached" not in hint, (
+            "a timeout was reported as a write that did not happen"
+        )
+        # An empty asyncio.TimeoutError stringifies to "" — the cause
+        # must not come back blank.
+        assert out["error"].strip()
+
+
+class TestAWriteThatWasRefusedIsNotAMissingMessage:
+    """`applyByHeader` returning "failed" left the header in `remaining`,
+    which then became `notFound` — an existing message reported as
+    absent because Mail refused the write or it moved between reading
+    the headers and mutating it."""
+
+    def test_the_script_routes_a_refused_write_to_failures(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        js = WriteBuilder.set_read(
+            [{"account": "Work", "headers": ["<a@b>"]}], True
+        ).build()
+
+        assert "writeFailed" in js
+        # The bucket decision has to consult it, not push straight to
+        # notFound.
+        assert "if (writeFailed.has(h))" in js
+        assert "found, but the write did not take" in js
+
+
+class TestBracketsAreNotPartOfDeduplication:
+    """`["<a@b>", "a@b"]` is one message twice. Collapsing on the raw
+    string writes it twice and reports it as both updated and unchanged
+    — against the bracket-insensitive identity this unit declares."""
+
+    def test_the_two_spellings_collapse(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids(["<a@b>", "a@b"]) == ["<a@b>"]
+        assert _normalize_message_ids(["a@b", "<a@b>"]) == ["a@b"]
+
+    def test_different_messages_still_survive(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert len(_normalize_message_ids(["<a@b>", "<c@d>"])) == 2
+
+
+class TestBucketContract:
+    """Every id lands in exactly one bucket; a batch never fails whole."""
+
+    async def _run(self, res, ids=(1,), **kw):
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=_mock_index(location=("uuid-work", "INBOX")),
+            ),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                **res,
+            ),
+        ):
+            return await _apply_write(
+                list(ids),
+                kw.get("account"),
+                kw.get("mailbox"),
+                lambda g: WriteBuilder.set_read(g, True),
+            )
+
+    @pytest.mark.asyncio
+    async def test_updated_and_unchanged_are_reported_separately(self):
+        out = await self._run(
+            {
+                "return_value": {
+                    "updated": [1],
+                    "unchanged": [2],
+                    "not_found": [],
+                }
+            },
+            ids=(1, 2),
+        )
+
+        assert out["updated"] == [1]
+        assert out["unchanged"] == [2]
+
+    @pytest.mark.asyncio
+    async def test_a_reported_failure_is_not_a_missing_message(self):
+        """ "not found" must stay a statement about the message. A
+        broken account lookup is a statement about the environment."""
+        out = await self._run(
+            {
+                "return_value": {
+                    "updated": [],
+                    "not_found": [],
+                    "failures": [
+                        {"target": 1, "reason": "no such account: Work"}
+                    ],
+                }
+            }
+        )
+
+        assert out["failed"] == [1]
+        assert out["not_found"] == []
+        assert "no such account" in out["error"]
+        assert "NOT a statement about the mail" in out["hint"]
+
+    @pytest.mark.asyncio
+    async def test_a_crashing_osascript_still_answers_per_id(self):
+        out = await self._run({"side_effect": RuntimeError("osascript died")})
+
+        assert out["failed"] == [1]
+        assert "osascript died" in out["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_capped_scan_is_not_reported_as_deletion(self):
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=_mock_index(has_index=False),
+            ),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="Work"),
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                return_value={
+                    "updated": [],
+                    "not_found": [7],
+                    "scan_capped": 12,
+                },
+            ),
+        ):
+            out = await _apply_write(
+                [7], None, None, lambda g: WriteBuilder.set_read(g, True)
+            )
+
+        assert out["not_found"] == [7]
+        assert out["diagnostics"]["mailboxes_not_searched"] == 12
+        assert "NOT evidence" in out["hint"]
+        assert "deleted" not in out["hint"].lower()
+
+    @pytest.mark.asyncio
+    async def test_the_located_writes_survive_a_failing_scan(self):
+        """Located and scan groups run in SEPARATE osascript calls, so a
+        slow scan cannot discard the fast, precise writes."""
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_email_location.side_effect = lambda mid, **kw: (
+            ("uuid-work", "INBOX") if mid == 1 else None
+        )
+        calls = []
+
+        async def fake(script, timeout=None):
+            calls.append(script)
+            if len(calls) == 1:
+                return {"updated": [1], "not_found": []}
+            raise TimeoutError("scan took too long")
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="Work"),
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                side_effect=fake,
+            ),
+        ):
+            out = await _apply_write(
+                [1, 2], None, None, lambda g: WriteBuilder.set_read(g, True)
+            )
+
+        assert len(calls) == 2
+        assert out["updated"] == [1]
+        assert out["failed"] == [2]
+
+
+class TestBuilderScript:
+    """The generated JXA, without running it."""
+
+    def test_ids_and_names_cross_over_as_json_only(self):
+        """Nothing caller-supplied may be interpolated into executable
+        JS: a mailbox called `"); doSomething();` must stay data."""
+        from apple_mail_mcp.builders import WriteBuilder
+
+        hostile = '"); throw new Error("pwned"); //'
+        script = WriteBuilder.set_read(
+            [{"account": hostile, "mailbox": hostile, "ids": [1]}], True
+        ).build()
+
+        assert json.dumps(hostile) in script
+        assert 'throw new Error("pwned")' not in script.replace(
+            json.dumps(hostile), ""
+        )
+
+    def test_flag_color_forces_the_index(self):
+        from apple_mail_mcp.builders import FLAG_COLOR_INDEX, WriteBuilder
+
+        script = WriteBuilder.set_flag(
+            [{"account": "A", "mailbox": "INBOX", "ids": [1]}],
+            True,
+            FLAG_COLOR_INDEX["red"],
+        ).build()
+
+        assert "msg.flaggedStatus = true; msg.flagIndex = 0;" in script
+
+    def test_unflag_clears_rather_than_setting_a_color(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_flag(
+            [{"account": "A", "mailbox": "INBOX", "ids": [1]}], False
+        ).build()
+
+        assert "msg.flaggedStatus = false;" in script
+        assert "flagIndex" not in script.split("JSON.stringify")[0].split(
+            "needs"
+        )[0].replace("msg.flaggedStatus() !== false", "")
+
+    def test_a_no_op_is_skipped_by_reading_live_state(self):
+        """Every write is a server round-trip on IMAP/Exchange, so a
+        write that changes nothing is not free — and the current state
+        must come from Mail, never from a possibly-stale index."""
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_read(
+            [{"account": "A", "mailbox": "INBOX", "ids": [1]}], True
+        ).build()
+
+        assert "msg.readStatus() !== true" in script
+        assert 'return "unchanged"' in script
+
+    def test_the_write_verifies_identity_before_writing(self):
+        """The id array is a snapshot: if mail arrives or is moved
+        between fetching it and writing, positions shift and the same
+        index points at a different message."""
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_read(
+            [{"account": "A", "mailbox": "INBOX", "ids": [1]}], True
+        ).build()
+
+        assert "if (msg.id() !== targetId)" in script
+        assert "collection.byId(targetId)" in script
+
+    def test_the_scan_counts_what_it_left_out(self):
+        """A scan that stopped early is not evidence of absence."""
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_read(
+            [{"account": "A", "ids": [1], "scan": True}], True
+        ).build()
+
+        assert "cappedBoxes" in script
+        assert "unreadableBoxes" in script
+        assert "scan_capped" in script
+        assert "scan_unreadable" in script
+
+    def test_environment_failures_are_kept_apart_from_not_found(self):
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_read(
+            [{"account": "A", "mailbox": "INBOX", "ids": [1]}], True
+        ).build()
+
+        assert "no such account: " in script
+        assert "cannot open mailbox " in script
+        assert "failures: failures" in script
+
+
+class TestExcludedAccountBoundary:
+    """Hidden accounts (#90) must never reach JXA."""
+
+    @pytest.mark.asyncio
+    async def test_an_id_in_a_hidden_account_is_skipped(self):
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        mgr = _mock_index(location=("uuid-secret", "INBOX"))
+        with (
+            patch(
+                "apple_mail_mcp.server._excluded_account_names",
+                return_value={"Secret"},
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(excluded_uuids={"uuid-secret"}),
+            ),
+        ):
+            groups, not_found, hidden, _amb, _amb2 = await _resolve_write_targets(
+                [7], None, None
+            )
+
+        assert groups == []
+        assert hidden == [7]
+
+    @pytest.mark.asyncio
+    async def test_naming_a_hidden_account_skips_the_whole_batch(self):
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        with patch(
+            "apple_mail_mcp.server._excluded_account_names",
+            return_value={"Secret"},
+        ):
+            groups, not_found, hidden, _amb, _amb2 = await _resolve_write_targets(
+                [1, 2], "Secret", None
+            )
+
+        assert groups == []
+        assert hidden == [1, 2]
+
+
+class TestHeaderIsAFirstClassReference:
+    """The RFC822 Message-ID as a write reference.
+
+    A Mail.app id is a per-mailbox ROWID: it dies the moment any device
+    files the message elsewhere, which is the normal case with a phone
+    and a tablet on the same account. The header survives that.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_header_becomes_a_header_group(self):
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_by_rfc822.return_value = [("uuid-work", "Archive", 42)]
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._visible_account_names",
+                AsyncMock(return_value=["Work"]),
+            ),
+        ):
+            groups, not_found, hidden, _amb, _amb2 = await _resolve_write_targets(
+                ["<a@x>"], None, None
+            )
+
+        assert groups[0]["by_header"] is True
+        assert groups[0]["headers"] == ["<a@x>"]
+        # The row is where it WAS: used to order the search, not to
+        # restrict it, and never translated into a ROWID to write to.
+        assert groups[0]["prefer_mailboxes"] == ["Archive"]
+        assert not any("ids" in g for g in groups)
+
+    @pytest.mark.asyncio
+    async def test_the_indexed_account_is_searched_first_then_the_rest(self):
+        """A row can be stale. A miss in the account it names used to end
+        the search in silence while the message sat one account over."""
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_by_rfc822.return_value = [("uuid-work", "INBOX", 42)]
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._visible_account_names",
+                AsyncMock(return_value=["Alpha", "Work", "Zeta"]),
+            ),
+        ):
+            groups, _, _, _amb, _amb2 = await _resolve_write_targets(
+                ["<a@x>"], None, None
+            )
+
+        # Insertion order, not alphabetical: sorting would throw the
+        # index's priority away.
+        assert [g["account"] for g in groups] == ["Work", "Alpha", "Zeta"]
+
+    @pytest.mark.asyncio
+    async def test_an_unplaceable_header_searches_every_account(self):
+        """Not exotic: it is every message that arrived after the last
+        sync. Scoped to one account, such a message is unreachable."""
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_by_rfc822.return_value = []
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._visible_account_names",
+                AsyncMock(return_value=["Work", "Private"]),
+            ),
+        ):
+            groups, not_found, _, _amb, _amb2 = await _resolve_write_targets(
+                ["<new@x>"], None, None
+            )
+
+        assert [g["account"] for g in groups] == ["Work", "Private"]
+        assert not not_found
+
+    @pytest.mark.asyncio
+    async def test_a_header_only_in_a_hidden_account_is_skipped(self):
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_by_rfc822.return_value = [("uuid-secret", "INBOX", 42)]
+        with (
+            patch(
+                "apple_mail_mcp.server._excluded_account_names",
+                return_value={"Secret"},
+            ),
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(excluded_uuids={"uuid-secret"}),
+            ),
+        ):
+            groups, _, hidden, _amb, _amb2 = await _resolve_write_targets(
+                ["<a@x>"], None, None
+            )
+
+        assert groups == []
+        assert hidden == ["<a@x>"]
+
+    @pytest.mark.asyncio
+    async def test_headers_are_echoed_back_as_headers(self):
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_by_rfc822.return_value = []
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._visible_account_names",
+                AsyncMock(return_value=["Work"]),
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                return_value={"updated": ["<a@x>"], "not_found": []},
+            ),
+        ):
+            out = await _apply_write(
+                ["<a@x>"], None, None, lambda g: WriteBuilder.set_read(g, True)
+            )
+
+        assert out["updated"] == ["<a@x>"]
+
+    @pytest.mark.asyncio
+    async def test_a_missing_header_may_be_called_deleted_only_when_complete(
+        self,
+    ):
+        """Every visible account was searched and nothing was skipped —
+        the one case where absence has actually been established."""
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_by_rfc822.return_value = []
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._visible_account_names",
+                AsyncMock(return_value=["Work"]),
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                return_value={
+                    "updated": [],
+                    "not_found": ["<gone@x>"],
+                    "scan_capped": 0,
+                    "scan_unreadable": 0,
+                    "scan_skipped_discard": 0,
+                },
+            ),
+        ):
+            out = await _apply_write(
+                ["<gone@x>"],
+                None,
+                None,
+                lambda g: WriteBuilder.set_read(g, True),
+            )
+
+        assert "likely deleted" in out["hint"]
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_discard_mailbox_forbids_that_claim(self):
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_by_rfc822.return_value = []
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._visible_account_names",
+                AsyncMock(return_value=["Work"]),
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                return_value={
+                    "updated": [],
+                    "not_found": ["<maybe@x>"],
+                    "scan_skipped_discard": 2,
+                },
+            ),
+        ):
+            out = await _apply_write(
+                ["<maybe@x>"],
+                None,
+                None,
+                lambda g: WriteBuilder.set_read(g, True),
+            )
+
+        assert "NOT evidence" in out["hint"]
+        assert "deleted" not in out["hint"].lower()
+
+
+class TestHeaderNormalization:
+    """Angle brackets are not part of the identity."""
+
+    def test_the_comparison_key_ignores_brackets(self):
+        from apple_mail_mcp.server import _header_key
+
+        assert _header_key("<a@b>") == _header_key("a@b")
+        assert _header_key(None) == ""
+
+    def test_the_builder_normalizes_on_both_sides(self):
+        """The .emlx header keeps its brackets, Apple's messageId drops
+        them. A strict comparison never matches."""
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_read(
+            [{"account": "A", "headers": ["<a@b>"], "by_header": True}], True
+        ).build()
+
+        assert "function normHeader(" in script
+        assert "normHeader(msg.messageId()) !== normHeader(targetHeader)" in (
+            script
+        )
+
+    def test_a_stringified_list_is_unwrapped(self):
+        """Some clients serialize a list parameter as JSON text. Taken
+        literally that is a Message-ID nothing will ever match, and the
+        caller gets a mute not_found for a message sitting right there."""
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids('["<a@b>", "<c@d>"]') == [
+            "<a@b>",
+            "<c@d>",
+        ]
+
+    def test_html_escaped_brackets_are_decoded(self):
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids("&lt;a@b&gt;") == ["<a@b>"]
+
+    def test_an_escaped_ampersand_is_left_alone(self):
+        """`&` is legal in a Message-ID local part, so "<a&amp;b@x>" and
+        "<a&b@x>" can both exist as distinct messages. Decoding would aim
+        the write at the other one while reporting success."""
+        from apple_mail_mcp.server import _normalize_message_ids
+
+        assert _normalize_message_ids("<a&amp;b@x>") == ["<a&amp;b@x>"]
+
+    def test_a_settled_header_is_not_reported_missing_by_another_account(
+        self,
+    ):
+        """One header goes to several account groups. Retiring it
+        globally is what stops a double write and a mute miss."""
+        from apple_mail_mcp.builders import WriteBuilder
+
+        script = WriteBuilder.set_read(
+            [{"account": "A", "headers": ["<a@b>"], "by_header": True}], True
+        ).build()
+
+        assert "const settled = new Set();" in script
+        assert "settled.has(String(t))" in script
+
+
+class TestHeaderReads:
+    """Reads verify the header on what came back."""
+
+    @pytest.mark.asyncio
+    async def test_a_stale_row_yields_the_next_candidate(self):
+        from apple_mail_mcp.server import _get_email_by_header
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_by_rfc822.return_value = [
+            ("uuid-work", "INBOX", 1),
+            ("uuid-work", "Archive", 2),
+        ]
+        fetched = []
+
+        async def by_id(mid, acct=None, mbox=None):
+            fetched.append(mid)
+            # ROWID 1 is somebody else's message now.
+            return {
+                "id": mid,
+                "message_id": "<other@x>" if mid == 1 else "<a@x>",
+            }
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch("apple_mail_mcp.server._get_email_by_id", side_effect=by_id),
+        ):
+            out = await _get_email_by_header("<a@x>", None, None)
+
+        assert fetched == [1, 2]
+        assert out["message_id"] == "<a@x>"
+
+    @pytest.mark.asyncio
+    async def test_a_stranger_is_never_returned(self):
+        from apple_mail_mcp.server import _get_email_by_header
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_by_rfc822.return_value = [("uuid-work", "INBOX", 1)]
+
+        async def by_id(mid, acct=None, mbox=None):
+            return {"id": mid, "message_id": "<somebody-else@x>"}
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch("apple_mail_mcp.server._get_email_by_id", side_effect=by_id),
+        ):
+            with pytest.raises(ValueError, match="stale|not where"):
+                await _get_email_by_header("<a@x>", None, None)
+
+    @pytest.mark.asyncio
+    async def test_an_unindexed_header_is_looked_for_live(self):
+        """Not indexed yet is the normal state for anything that arrived
+        after the last sync."""
+        from apple_mail_mcp.server import _get_email_by_header
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_by_rfc822.return_value = []
+
+        async def by_id(mid, acct=None, mbox=None):
+            return {"id": mid, "message_id": "<fresh@x>"}
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._locate_header_via_jxa",
+                AsyncMock(return_value=("Work", "INBOX", 99)),
+            ),
+            patch("apple_mail_mcp.server._get_email_by_id", side_effect=by_id),
+        ):
+            out = await _get_email_by_header("<fresh@x>", None, None)
+
+        assert out["id"] == 99
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_live_search_is_not_a_verdict(self):
+        from apple_mail_mcp.server import (
+            _LiveLookupIncomplete,
+            _get_email_by_header,
+        )
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_by_rfc822.return_value = []
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._locate_header_via_jxa",
+                AsyncMock(
+                    side_effect=_LiveLookupIncomplete("3 mailbox(es) skipped")
+                ),
+            ),
+        ):
+            with pytest.raises(ValueError) as err:
+                await _get_email_by_header("<x@x>", None, None)
+
+        assert "could not be completed" in str(err.value)
+        assert "deleted" not in str(err.value).lower()
+
+
+class TestReadOnlyMode:
+    """`APPLE_MAIL_READ_ONLY` finally has something to guard (#80)."""
+
+    @pytest.mark.asyncio
+    async def test_set_flag_refuses(self):
+        from apple_mail_mcp.config import set_read_only_mode
+        from apple_mail_mcp.server import set_flag
+
+        set_read_only_mode(True)
+        try:
+            with pytest.raises(PermissionError, match="read-only"):
+                await set_flag(1)
+        finally:
+            set_read_only_mode(False)
+
+    @pytest.mark.asyncio
+    async def test_set_read_status_refuses(self):
+        from apple_mail_mcp.config import set_read_only_mode
+        from apple_mail_mcp.server import set_read_status
+
+        set_read_only_mode(True)
+        try:
+            with pytest.raises(PermissionError, match="read-only"):
+                await set_read_status(1)
+        finally:
+            set_read_only_mode(False)
+
+
+class TestTargetResolution:
+    """Where a write is sent, and why."""
+
+    @pytest.mark.asyncio
+    async def test_the_index_places_the_id(self):
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        mgr = _mock_index(location=("uuid-work", "Archive"))
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+        ):
+            groups, not_found, hidden, _amb, _amb2 = await _resolve_write_targets(
+                [7], None, None
+            )
+
+        assert groups == [{"account": "Work", "mailbox": "Archive", "ids": [7]}]
+        assert not not_found and not hidden
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_hint_is_used_when_the_index_misses(self):
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=_mock_index(location=None),
+            ),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+        ):
+            groups, _, _, _amb, _amb2 = await _resolve_write_targets(
+                [7], "Work", "Sent"
+            )
+
+        assert groups == [{"account": "Work", "mailbox": "Sent", "ids": [7]}]
+
+    @pytest.mark.asyncio
+    async def test_no_index_and_no_hint_falls_back_to_a_scan(self):
+        """Writes have to work with no index at all — mirroring
+        get_email's Strategy 3."""
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=_mock_index(has_index=False),
+            ),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="Work"),
+            ),
+        ):
+            groups, not_found, _, _amb, _amb2 = await _resolve_write_targets(
+                [7], None, None
+            )
+
+        assert groups == [{"account": "Work", "ids": [7], "scan": True}]
+        assert not not_found
+
+    @pytest.mark.asyncio
+    async def test_ids_are_grouped_per_mailbox(self):
+        """One osascript call per (account, mailbox), not per message."""
+        from apple_mail_mcp.server import _resolve_write_targets
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.count_email_locations.return_value = 1
+        mgr.find_email_location.side_effect = lambda mid, **kw: {
+            1: ("uuid-work", "INBOX"),
+            2: ("uuid-work", "INBOX"),
+            3: ("uuid-work", "Sent"),
+        }[mid]
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+        ):
+            groups, _, _, _amb, _amb2 = await _resolve_write_targets(
+                [1, 2, 3], None, None
+            )
+
+        assert sorted(len(g["ids"]) for g in groups) == [1, 2]

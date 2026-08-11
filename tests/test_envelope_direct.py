@@ -428,3 +428,45 @@ class TestGmailLabelMembership:
         )
         # Message 3 is Sent Mail only and must be excluded.
         assert {r.message_id for r in rows} == {1, 2, 4}
+
+
+class TestAnAllowListBoundsTheAccounts:
+    """Apple's Envelope Index keeps rows for accounts Mail no longer
+    has. An unscoped "every account" listing handed those back under
+    their bare UUID, as if a deleted account were a visible one."""
+
+    def test_only_the_listed_accounts_answer(self, fake_envelope):
+        rows = fetch_recent_messages(
+            fake_envelope,
+            account_uuid=None,
+            mailbox_name=None,
+            filter_kind="all",
+            limit=10,
+            include_account_uuids={"ACCOUNT-A"},
+        )
+        assert rows
+        assert all("ACCOUNT-A" in r.mailbox_url for r in rows)
+
+    def test_an_empty_allow_list_returns_nothing(self, fake_envelope):
+        """Not "everything": skipping the clause for an empty set would
+        widen the query to every account, which is the opposite of what
+        an empty set of visible accounts means."""
+        rows = fetch_recent_messages(
+            fake_envelope,
+            account_uuid=None,
+            mailbox_name=None,
+            filter_kind="all",
+            limit=10,
+            include_account_uuids=set(),
+        )
+        assert rows == []
+
+    def test_no_allow_list_still_means_every_account(self, fake_envelope):
+        rows = fetch_recent_messages(
+            fake_envelope,
+            account_uuid=None,
+            mailbox_name=None,
+            filter_kind="all",
+            limit=10,
+        )
+        assert {r.message_id for r in rows} == {1, 2, 3}

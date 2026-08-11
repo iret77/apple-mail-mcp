@@ -17,6 +17,8 @@ Usage:
     apple-mail-mcp rebuild    # Force rebuild index
 """
 
+import contextlib
+import logging
 import sys
 import time
 from collections.abc import Callable
@@ -26,6 +28,8 @@ from typing import Annotated, TypeVar
 import cyclopts
 
 from .config import get_index_path
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -122,6 +126,12 @@ def _setup_file_logging() -> Path | None:
         return None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            # A log written before the mode was enforced stays
+            # world-readable forever otherwise — the handler only sets
+            # the mode on files it creates itself.
+            with contextlib.suppress(OSError):
+                path.chmod(0o600)
         handler = _OwnerOnlyRotatingFileHandler(
             path, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
         )
@@ -185,6 +195,7 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
             if manager.start_watcher(on_update=on_update):
                 print("File watcher started", file=sys.stderr)
         except Exception as e:
+            logger.error("File watcher failed to start: %s", e, exc_info=True)
             print(f"Warning: File watcher failed: {e}", file=sys.stderr)
 
     # An index *file* can exist while holding nothing — an interrupted
@@ -219,6 +230,9 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
                         file=sys.stderr,
                     )
             except Exception as e:
+                # Under a desktop client stderr goes nowhere the user
+                # will ever look — the log file exists for exactly this.
+                logger.error("Background sync failed: %s", e, exc_info=True)
                 print(
                     f"Warning: Background sync failed: {e}",
                     file=sys.stderr,
@@ -345,6 +359,7 @@ def index(
     """
     from .index import IndexManager
 
+    _setup_file_logging()
     print("Building search index from disk...")
     print(f"Index location: {get_index_path()}")
     if profile:
@@ -390,6 +405,10 @@ def index(
         print(f"  Database size: {_format_size(stats.db_size_mb)}")
 
     except PermissionError as e:
+        # The most common failure of the command most likely to fail —
+        # and the one that left server.log empty. Installing a handler
+        # is not logging.
+        logger.error("Index build failed: %s", e, exc_info=True)
         print(f"\n✗ Permission denied: {e}", file=sys.stderr)
         print("\nTo fix this:", file=sys.stderr)
         print("  1. Open System Settings", file=sys.stderr)
@@ -399,10 +418,14 @@ def index(
         sys.exit(1)
 
     except FileNotFoundError as e:
+        logger.error("Index build failed: %s", e, exc_info=True)
         print(f"\n✗ Not found: {e}", file=sys.stderr)
         sys.exit(1)
 
     except Exception as e:
+        # Installing a handler is not logging: this command is the one
+        # most likely to fail, and it used to leave server.log empty.
+        logger.error("Index build failed: %s", e, exc_info=True)
         print(f"\n✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -529,6 +552,8 @@ def rebuild(
 
     from .index import IndexManager
 
+    _setup_file_logging()
+
     scope = "entire index"
     if account and mailbox:
         scope = f"{account}/{mailbox}"
@@ -563,6 +588,7 @@ def rebuild(
         print(f"✓ Rebuilt {count:,} emails in {_format_time(elapsed)}")
 
     except Exception as e:
+        logger.error("Rebuild failed: %s", e, exc_info=True)
         print(f"\n✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
 

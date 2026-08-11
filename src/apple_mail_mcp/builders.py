@@ -537,6 +537,14 @@ for (const g of groups) {{
                     r = applyByHeader(candidates[m].messages, idx, target);
                 }} catch (e) {{
                     r = "failed";
+                    writeFailed.set(target, String(e));
+                }}
+                if (r === "failed" && !writeFailed.has(target)) {{
+                    // FOUND, and the write did not take — a refusal, or
+                    // the message moved between reading the headers and
+                    // mutating it. Letting it fall through to notFound
+                    // reports an existing message as missing.
+                    writeFailed.set(target, "Mail refused the write");
                 }}
                 // Only retire the header once it actually landed;
                 // otherwise a later mailbox may still hold a good copy.
@@ -551,7 +559,14 @@ for (const g of groups) {{
                 }}
             }}
         }}
-        for (const h of remaining) notFound.push(h);
+        for (const h of remaining) {{
+            if (writeFailed.has(h)) {{
+                fail([h], "found, but the write did not take: " +
+                     writeFailed.get(h));
+            }} else {{
+                notFound.push(h);
+            }}
+        }}
         continue;
     }}
 
@@ -591,7 +606,17 @@ for (const g of groups) {{
                 }}
             }}
         }}
-        for (const id of remaining) notFound.push(id);
+        for (const id of remaining) {{
+            if (cappedBoxes > 0 || unreadableBoxes > 0) {{
+                // The scan could not cover every mailbox of this
+                // account, so "not there" was never established.
+                fail([id], "the scan could not cover every mailbox of " +
+                     String(g.account) + ", so this id was not looked " +
+                     "for everywhere");
+            }} else {{
+                notFound.push(id);
+            }}
+        }}
         continue;
     }}
 

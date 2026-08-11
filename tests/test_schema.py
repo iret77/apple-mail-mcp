@@ -542,3 +542,148 @@ class TestConcurrentWrites:
         finally:
             conn.close()
         assert count == 2 * self.ROWS_PER_WRITER
+
+
+class TestMigrationV5ToV6:
+    """v5→v6: the RFC822 Message-ID column (stable identity).
+
+    `message_id` is a per-mailbox ROWID: it changes the moment another
+    device files the message elsewhere, which is routine when a phone
+    and a tablet share the account. The header does not.
+    """
+
+    @pytest.fixture
+    def v5_db(self):
+        """A v5 database — before stable identity."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+            CREATE TABLE emails (
+                rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                account TEXT NOT NULL,
+                mailbox TEXT NOT NULL,
+                subject TEXT,
+                sender TEXT,
+                content TEXT,
+                date_received TEXT,
+                emlx_path TEXT,
+                attachment_count INTEGER DEFAULT 0,
+                indexed_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(account, mailbox, message_id)
+            );
+            CREATE TABLE failed_index_jobs (
+                emlx_path TEXT PRIMARY KEY,
+                account TEXT NOT NULL,
+                mailbox TEXT NOT NULL,
+                error_type TEXT NOT NULL,
+                error_message TEXT NOT NULL,
+                first_seen TEXT DEFAULT (datetime('now')),
+                last_seen TEXT DEFAULT (datetime('now')),
+                attempt_count INTEGER DEFAULT 1
+            );
+        """)
+        conn.execute("INSERT INTO schema_version (version) VALUES (5)")
+        conn.execute(
+            "INSERT INTO emails (message_id, account, mailbox, subject) "
+            "VALUES (1, 'acc', 'INBOX', 'Pre-existing email')"
+        )
+        conn.commit()
+        yield conn
+        conn.close()
+
+    def test_migration_adds_the_column(self, v5_db):
+        _run_migrations(v5_db, 5, SCHEMA_VERSION)
+
+        cols = {row[1] for row in v5_db.execute("PRAGMA table_info(emails)")}
+        assert "rfc822_message_id" in cols
+
+    def test_migration_creates_the_index(self, v5_db):
+        _run_migrations(v5_db, 5, SCHEMA_VERSION)
+
+        cursor = v5_db.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND name='idx_emails_rfc822'"
+        )
+        assert cursor.fetchone() is not None
+
+    def test_existing_rows_survive_with_null(self, v5_db):
+        """An in-place ALTER, not a rebuild: a 70k index must not have to
+        be re-read to open. NULL means "unknown", and every lookup falls
+        back to the ROWID path for those rows."""
+        _run_migrations(v5_db, 5, SCHEMA_VERSION)
+
+        row = v5_db.execute(
+            "SELECT subject, rfc822_message_id FROM emails WHERE message_id = 1"
+        ).fetchone()
+        assert row[0] == "Pre-existing email"
+        assert row[1] is None
+
+    def test_migration_is_idempotent(self, v5_db):
+        """Re-running must not fail on the existing column."""
+        _run_migrations(v5_db, 5, SCHEMA_VERSION)
+        _run_migrations(v5_db, 5, SCHEMA_VERSION)
+
+    def test_migration_updates_version(self, v5_db):
+        _run_migrations(v5_db, 5, SCHEMA_VERSION)
+
+        assert (
+            v5_db.execute("SELECT version FROM schema_version").fetchone()[0]
+            == SCHEMA_VERSION
+        )
+
+
+class TestStableIdentityIsStored:
+    """The column is only useful if the write paths fill it."""
+
+    def test_email_to_row_carries_the_header(self):
+        from apple_mail_mcp.index.schema import email_to_row
+
+        row = email_to_row(
+            {"id": 7, "subject": "s", "message_id_header": "<a@b.example>"},
+            "acct",
+            "INBOX",
+            "/tmp/7.emlx",
+        )
+        assert "<a@b.example>" in row
+
+    def test_a_missing_header_is_null_not_empty_string(self):
+        """NULL means "unknown" everywhere; "" would match a query for
+        the empty header and claim a stranger's message."""
+        from apple_mail_mcp.index.schema import email_to_row
+
+        row = email_to_row(
+            {"id": 7, "subject": "s", "message_id_header": ""},
+            "acct",
+            "INBOX",
+            "/tmp/7.emlx",
+        )
+        assert None in row
+
+    def test_a_stored_row_is_queryable_by_header(self, temp_db):
+        from apple_mail_mcp.index.schema import (
+            INSERT_EMAIL_SQL,
+            email_to_row,
+        )
+
+        temp_db.execute(
+            INSERT_EMAIL_SQL,
+            email_to_row(
+                {
+                    "id": 42,
+                    "subject": "hello",
+                    "message_id_header": "<x@y.example>",
+                },
+                "acct",
+                "INBOX",
+                "/tmp/42.emlx",
+            ),
+        )
+        temp_db.commit()
+
+        found = temp_db.execute(
+            "SELECT message_id FROM emails WHERE rfc822_message_id = ?",
+            ("<x@y.example>",),
+        ).fetchone()
+        assert found[0] == 42

@@ -214,8 +214,11 @@ def fetch_recent_messages(
     filter_kind: str,
     limit: int,
     before: float | None = None,
+    before_id: int | None = None,
     after: float | None = None,
     offset: int = 0,
+    exclude_account_uuids: set[str] | None = None,
+    include_account_uuids: set[str] | None = None,
 ) -> list[EnvelopeMessageRow]:
     """Read up to `limit` recent messages via direct SQL.
 
@@ -261,8 +264,11 @@ def fetch_recent_messages(
             filter_kind=filter_kind,
             limit=limit,
             before=before,
+            before_id=before_id,
             after=after,
             offset=offset,
+            exclude_account_uuids=exclude_account_uuids,
+            include_account_uuids=include_account_uuids,
         )
     finally:
         conn.close()
@@ -276,8 +282,11 @@ def _fetch_recent_messages(
     filter_kind: str,
     limit: int,
     before: float | None = None,
+    before_id: int | None = None,
     after: float | None = None,
     offset: int = 0,
+    exclude_account_uuids: set[str] | None = None,
+    include_account_uuids: set[str] | None = None,
 ) -> list[EnvelopeMessageRow]:
     """Body of fetch_recent_messages, on an open connection."""
     where_clauses: list[str] = ["m.deleted = 0"]
@@ -306,6 +315,32 @@ def _fetch_recent_messages(
         where_clauses.append("mb.url LIKE ?")
         params.append(f"%://{account_uuid}/%")
 
+    if include_account_uuids is not None:
+        # Apple's Envelope Index keeps rows for accounts Mail no longer
+        # has, so an unscoped "every account" listing returns mail from
+        # a deleted account under its bare UUID. An empty allow-list
+        # means no account qualifies — `1 = 0` says that; skipping the
+        # clause would widen the query to everything, the opposite.
+        if include_account_uuids:
+            ors = " OR ".join(
+                "mb.url LIKE ?" for _ in sorted(include_account_uuids)
+            )
+            where_clauses.append(f"({ors})")
+            params.extend(
+                f"%://{uuid}/%" for uuid in sorted(include_account_uuids)
+            )
+        else:
+            where_clauses.append("1 = 0")
+
+    # Excluded accounts are filtered HERE, not after the fact. Dropping
+    # them from the returned rows leaves them counted against LIMIT: if
+    # hidden mail happens to be the newest 50 messages, a caller asking
+    # for 50 gets an empty list, and the next page skips visible mail it
+    # never saw.
+    for hidden in sorted(exclude_account_uuids or ()):
+        where_clauses.append("mb.url NOT LIKE ?")
+        params.append(f"%://{hidden}/%")
+
     if filter_kind == "unread":
         where_clauses.append("m.read = 0")
     elif filter_kind == "flagged":
@@ -323,8 +358,21 @@ def _fetch_recent_messages(
     # it a caller only ever sees the newest N per mailbox and cannot
     # reach a backlog at all.
     if before is not None:
-        where_clauses.append("m.date_received < ?")
-        params.append(before)
+        if before_id is not None:
+            # Keyset cursor. A timestamp alone is not a position: Mail
+            # stores whole seconds, so several messages share one. With
+            # a strict `<` on the timestamp, every row sharing the
+            # oldest second of a page becomes permanently unreachable —
+            # three messages in one second and limit=2 leaves the third
+            # invisible forever. Ties are resolved by ROWID, which the
+            # caller already has: it is the `id` of the last row it saw.
+            where_clauses.append(
+                "(m.date_received < ? OR (m.date_received = ? AND m.ROWID < ?))"
+            )
+            params.extend([before, before, before_id])
+        else:
+            where_clauses.append("m.date_received < ?")
+            params.append(before)
     if after is not None:
         where_clauses.append("m.date_received > ?")
         params.append(after)
@@ -353,7 +401,7 @@ def _fetch_recent_messages(
         LEFT JOIN addresses a  ON m.sender  = a.ROWID
         LEFT JOIN mailboxes mb ON m.mailbox = mb.ROWID
         WHERE {where_sql}
-        ORDER BY m.date_received DESC
+        ORDER BY m.date_received DESC, m.ROWID DESC
         LIMIT ? OFFSET ?
     """
     params.append(int(limit))

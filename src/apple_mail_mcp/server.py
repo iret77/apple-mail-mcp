@@ -142,6 +142,23 @@ RECOVERY_TIMEOUT = _clamped_env_int("APPLE_MAIL_RECOVERY_TIMEOUT", 60, 5, 300)
 # Ceiling for a located (precisely targeted) write. Well under the
 # 120s executor default so a wedged Mail.app cannot hold an MCP call
 # past most client timeouts.
+_TIMEOUT_MARK = "timed out"
+
+
+def _write_error_text(exc: BaseException) -> str:
+    """What to report for a write that did not come back cleanly.
+
+    A timeout is not a failed write — it is an UNKNOWN one: Mail may
+    have applied some, all or none of the batch before the deadline.
+    Reporting it as "never reached the message" is the same false
+    verdict as calling an unfinished search a missing message. It also
+    stringifies to nothing, so str(exc) would leave the cause blank.
+    """
+    if isinstance(exc, TimeoutError):
+        return f"Mail {_TIMEOUT_MARK} — outcome unknown"
+    return str(exc) or type(exc).__name__
+
+
 WRITE_TIMEOUT = _clamped_env_int("APPLE_MAIL_WRITE_TIMEOUT", 60, 5, 300)
 
 
@@ -530,6 +547,7 @@ def _index_guidance(
     *,
     state: str,
     mail_dir_accessible: bool,
+    mail_dir_missing: bool = False,
     auto_build: bool,
     stalled: bool = False,
     phase: str | None = None,
@@ -663,6 +681,25 @@ def _index_guidance(
             "Everything works. Search uses the index that was built "
             "outside the app; re-run the index command when you want it "
             "refreshed.",
+        )
+
+    if mail_dir_missing:
+        # Nothing to read, rather than something we may not read.
+        # Diagnosing this as a missing permission sends the user into
+        # System Settings to grant access to a directory that does not
+        # exist.
+        return (
+            "Apple Mail has never been set up on this Mac, so there is "
+            "no mail to index.",
+            None,
+            [
+                "Open Mail and add an account, then ask again.",
+                "If you do use Mail, check that this is the same macOS "
+                "user account.",
+            ],
+            "There is no Apple Mail data on this Mac — Mail has not "
+            "been set up here, so there is nothing to index. This is "
+            "not a permissions problem.",
         )
 
     if auto_build:
@@ -817,8 +854,12 @@ def _normalize_message_ids(
                     f"the `message_id` field from a search or get_emails "
                     f"result, or a list of them."
                 )
-        if item not in seen:
-            seen.add(item)
+        # Keyed through _header_key: "<a@b>" and "a@b" are the SAME
+        # message, and the brackets are not part of the identity. Both
+        # spellings in one batch used to be written twice.
+        key = _header_key(item) if isinstance(item, str) else item
+        if key not in seen:
+            seen.add(key)
             ids.append(item)
 
     if not ids:
@@ -966,6 +1007,7 @@ async def _resolve_write_targets(
     list[MessageRef],
     list[MessageRef],
     dict[int, tuple[str, str]],
+    list[MessageRef],
 ]:
     """Resolve message ids to JXA write groups, honoring the account gate.
 
@@ -1003,7 +1045,7 @@ async def _resolve_write_targets(
     # Explicit hidden account: refuse the whole batch up front, exactly
     # as the read tools do at their entry gate.
     if _hidden_account(account):
-        return [], [], list(ids), {}
+        return [], [], list(ids), {}, []
 
     manager = _get_index_manager()
     has_index = manager.has_index()
@@ -1105,9 +1147,26 @@ async def _resolve_write_targets(
             entry["headers"].append(header)
             entry["prefer"] |= prefer
 
+    ambiguous: list[MessageRef] = []
     for mid in int_ids:
         located: tuple[str, str] | None = None
         if has_index:
+            # A Mail.app id is a per-mailbox ROWID, so the index can
+            # legitimately hold several rows for the same number. Taking
+            # the first would write to a message the caller never named
+            # — for a WRITE that is the worst possible guess. The
+            # mailbox is part of the question, not an answer to it:
+            # naming "INBOX" without an account still leaves every
+            # account's INBOX, and the same ROWID names a different
+            # message in each.
+            if (
+                manager.count_email_locations(
+                    mid, account=idx_acct_uuid, mailbox=mailbox
+                )
+                > 1
+            ):
+                ambiguous.append(mid)
+                continue
             loc = manager.find_email_location(
                 mid, account=idx_acct_uuid, mailbox=mailbox
             )
@@ -1161,7 +1220,7 @@ async def _resolve_write_targets(
                 {"account": scan_account, "ids": scan_ids, "scan": True}
             )
 
-    return groups, not_found, skipped_hidden, placed
+    return groups, not_found, skipped_hidden, placed, ambiguous
 
 
 def _absorb_failures(res: dict, failed: list, errors: list, as_int: bool):
@@ -1202,9 +1261,13 @@ async def _apply_write(
     headers.
     """
     ids = _normalize_message_ids(message_ids)
-    groups, not_found, skipped_hidden, placed = await _resolve_write_targets(
-        ids, account, mailbox
-    )
+    (
+        groups,
+        not_found,
+        skipped_hidden,
+        placed,
+        ambiguous,
+    ) = await _resolve_write_targets(ids, account, mailbox)
 
     located = [
         g for g in groups if not g.get("scan") and not g.get("by_header")
@@ -1242,7 +1305,7 @@ async def _apply_write(
             # which writes did or did not happen.
             logger.warning("located write failed: %s", exc, exc_info=True)
             failed += [i for g in located for i in g["ids"]]
-            errors.append(str(exc))
+            errors.append(_write_error_text(exc))
 
     if scan:
         builder = make_builder(scan)
@@ -1265,7 +1328,7 @@ async def _apply_write(
             # ids as not_found rather than erroring the whole call.
             logger.warning("write scan failed: %s", exc, exc_info=True)
             failed += [i for g in scan for i in g["ids"]]
-            errors.append(str(exc))
+            errors.append(_write_error_text(exc))
 
     if by_header:
         # Caller-supplied Message-IDs. Same bounded scan as the recovery
@@ -1289,7 +1352,7 @@ async def _apply_write(
         except Exception as exc:
             logger.warning("Message-ID write failed: %s", exc, exc_info=True)
             failed += [h for g in by_header for h in g["headers"]]
-            errors.append(str(exc))
+            errors.append(_write_error_text(exc))
 
     # Recovery: a ROWID stops resolving as soon as any device files the
     # message elsewhere — the normal case with phones and tablets on the
@@ -1341,6 +1404,23 @@ async def _apply_write(
             "references_as_received": [str(i) for i in ids],
             "mailboxes_not_searched": unsearched,
         }
+    if ambiguous:
+        # Never guessed at: the same number names a different message in
+        # another mailbox, and picking one would write to mail the
+        # caller did not ask about.
+        failed.extend(ambiguous)
+        errors.append(f"{len(ambiguous)} id(s) exist in more than one mailbox")
+        result["failed"] = failed
+        result["error"] = "; ".join(dict.fromkeys(errors))[:500]
+        result["hint"] = (
+            f"{len(ambiguous)} id(s) name a message in more than one "
+            f"mailbox — a Mail.app id is only unique within its mailbox, "
+            f"so the number alone does not say which message you mean. "
+            f"Pass `mailbox` (and `account`) to say which one, and "
+            f"nothing was written for them."
+        )
+        return result
+
     if failed:
         # Say plainly that Apple Mail never carried the write out, and
         # what it said — the caller must not read this as "deleted".
@@ -1373,6 +1453,20 @@ async def _apply_write(
                 "control it (System Settings > Privacy & Security > "
                 "Automation)."
             )
+        if _TIMEOUT_MARK in blob:
+            # A timeout says the ANSWER never came back, not that the
+            # write never happened: Mail may have applied some, all or
+            # none of them before the deadline.
+            result["hint"] = (
+                f"{len(failed)} write(s) timed out: Mail did not answer "
+                f"in time, so whether it applied them is UNKNOWN — some, "
+                f"all or none may have gone through. Read the messages "
+                f"back to see the current state before retrying; "
+                f"re-running is safe, because setting a flag or a read "
+                f"status twice changes nothing. Reported: "
+                f"{result['error']}"
+            )
+            return result
         result["hint"] = (
             f"{len(failed)} write(s) never reached the message — this is "
             f"NOT a statement about the mail, which is most likely fine. "
@@ -1647,6 +1741,7 @@ async def get_emails(
     ] = "all",
     limit: int = 50,
     before: str | None = None,
+    before_id: int | None = None,
     after: str | None = None,
     offset: int = 0,
 ) -> list[EmailSummary]:
@@ -1688,6 +1783,17 @@ async def get_emails(
     """
     limit, offset = _validate_pagination(limit, offset)
     before_ts = _parse_date_bound(before, "before")
+    # Against the PARSED bound, not the raw argument: "" and "   " are
+    # None once parsed, so testing `before` let an empty timestamp
+    # through and then returned the NEWEST page — which a caller paging
+    # backwards reads as "start again", an endless loop over the same
+    # rows. The two halves of the cursor belong together.
+    if before_id is not None and before_ts is None:
+        raise ValueError(
+            "`before_id` is the second half of a cursor and needs "
+            "`before` as well: pass the `date_received` and the `id` of "
+            "the oldest row you have seen."
+        )
     after_ts = _parse_date_bound(after, "after")
     all_accounts = isinstance(account, str) and account.strip().lower() in (
         "all",
@@ -1751,12 +1857,21 @@ async def get_emails(
             excluded_names = _excluded_account_names()
             excluded_uuids = _get_account_map().names_to_uuids(excluded_names)
             account_uuid: str | None = None
+            include_uuids: set[str] | None = None
             if target_account:
                 account_uuid = _get_account_map().name_to_uuid(target_account)
             elif all_accounts:
-                # Explicitly every account: leave the scope open. Hidden
-                # accounts are still dropped below, by UUID.
+                # Every account Mail actually HAS — not every account
+                # the Envelope Index still holds rows for. Apple keeps
+                # those after an account is removed, and an unscoped
+                # query handed them back under their bare UUID as if
+                # they were a visible account.
                 account_uuid = None
+                include_uuids = {
+                    acct["id"]
+                    for acct in (_get_account_map().get_cached_accounts() or [])
+                    if acct["name"] not in excluded_names
+                }
             else:
                 # No account requested: scope to the first account,
                 # matching the documented behavior and the JXA path
@@ -1785,8 +1900,11 @@ async def get_emails(
                     filter_kind=filter,
                     limit=limit,
                     before=before_ts,
+                    before_id=before_id,
                     after=after_ts,
                     offset=offset,
+                    exclude_account_uuids=excluded_uuids,
+                    include_account_uuids=include_uuids,
                 )
                 visible = [
                     r
@@ -1814,6 +1932,20 @@ async def get_emails(
                 summaries = [
                     EmailSummary(
                         id=r.message_id,
+                        # Only under "all": a single-account listing
+                        # already knows its account, and adding the
+                        # field there would change every existing
+                        # response for no gain.
+                        **(
+                            {
+                                "account": _get_account_map().uuid_to_name(
+                                    r.account_uuid
+                                )
+                                or r.account_uuid
+                            }
+                            if all_accounts
+                            else {}
+                        ),
                         message_id=headers.get(
                             (r.account_uuid, r.mailbox_name, r.message_id)
                         ),
@@ -2093,7 +2225,9 @@ class _LiveLookupIncomplete(RuntimeError):
     """
 
 
-async def _locate_header_via_jxa(header: str) -> tuple[str, str, int] | None:
+async def _locate_header_via_jxa(
+    header: str, account: str | None = None
+) -> tuple[str, str, int] | None:
     """Find a message by its RFC822 header without using the index.
 
     Returns ``(account, mailbox, id)``, or None when every mailbox was
@@ -2103,10 +2237,18 @@ async def _locate_header_via_jxa(header: str) -> tuple[str, str, int] | None:
         _LiveLookupIncomplete: the search could not be completed, so
             nothing may be concluded about the message.
     """
-    accounts = await _visible_account_names()
-    if not accounts:
-        one = await _resolve_visible_account(None)
-        accounts = [one] if one else []
+    if account:
+        # `account` narrows the SEARCH, not the result. Filtering
+        # afterwards was a silent miss: the scan stops at its first hit,
+        # so a copy of the same message in another account ended the
+        # search, was then dropped by the filter, and the requested
+        # account's copy — never looked at — was reported missing.
+        accounts = [account]
+    else:
+        accounts = await _visible_account_names()
+        if not accounts:
+            one = await _resolve_visible_account(None)
+            accounts = [one] if one else []
     if not accounts:
         raise _LiveLookupIncomplete("no visible account could be resolved")
     script = f"""
@@ -2244,9 +2386,33 @@ async def _get_email_by_header(
 
     if last_error is not None:
         logger.debug("header lookup last error: %s", last_error)
+    # Every indexed location was stale. That says the INDEX is out of
+    # date, not that the message is gone — ask Mail before concluding
+    # anything: "the index orders the search, it never limits it".
+    try:
+        live = await _locate_header_via_jxa(header, account)
+    except _LiveLookupIncomplete as exc:
+        raise ValueError(
+            f"Email {header!r} could not be reached: every location on "
+            f"record is stale, and the live search could not be "
+            f"completed either ({exc}). This says nothing about whether "
+            f"the message exists."
+        ) from None
+    if live is not None:
+        acct_name, mbox, rowid = live
+        if acct_name not in _excluded_account_names():
+            try:
+                result = await _get_email_by_id(rowid, acct_name, mbox)
+            except Exception as exc:
+                logger.debug("live candidate unreadable: %s", exc)
+            else:
+                if _header_key(result.get("message_id")) == _header_key(header):
+                    return result
+
     raise ValueError(
         f"Email {header!r} could not be retrieved: every location on "
-        f"record is stale. Call refresh_index() and try again."
+        f"record is stale, and Mail does not have it either. Call "
+        f"refresh_index() and try again."
     )
 
 
@@ -2515,9 +2681,13 @@ async def _get_email_by_id(
             # not read. Absence was never established, so do not claim
             # it: the caller can act on this, "not found" it cannot.
             detail = raw.split("INCOMPLETE:", 1)[-1].rstrip(")").strip()
+            # The builder may already say "not searched"; appending it
+            # again produced "not searched not searched".
+            if not detail.endswith("not searched"):
+                detail = f"{detail} not searched"
             raise ValueError(
                 f"Message {message_id} was not found, but the search was "
-                f"incomplete ({detail} not searched). This does not mean "
+                f"incomplete ({detail}). This does not mean "
                 f"the message is gone — pass `account` and `mailbox` to "
                 f"look in the right place, or use its Message-ID."
             ) from None
@@ -2668,10 +2838,70 @@ async def _resolve_emlx_path_by_header(
         ) == _header_key(header):
             return path
 
+    # Every indexed location was stale — which says the INDEX is out of
+    # date, not that the message is gone. `get_email` already asks Mail
+    # at this point; stopping here meant a moved message could be read
+    # while its attachments and links reported it missing.
+    try:
+        live = await _locate_header_via_jxa(header, account)
+    except _LiveLookupIncomplete as exc:
+        raise ValueError(
+            f"Email {header!r} could not be reached: every location on "
+            f"record is stale, and the live search could not be "
+            f"completed either ({exc}). This says nothing about whether "
+            f"the message exists."
+        ) from None
+    if live is not None:
+        acct_name, _mbox, rowid = live
+        if acct_name not in _excluded_account_names():
+            found = await _emlx_path_for_live_location(
+                acct_name, rowid, header, excluded_uuids
+            )
+            if found is not None:
+                return found
+
     raise ValueError(
         f"Email {header!r} could not be located on disk: every entry on "
-        f"record is stale. Call refresh_index() and try again."
+        f"record is stale, and Mail does not have it either. Call "
+        f"refresh_index() and try again."
     )
+
+
+async def _emlx_path_for_live_location(
+    account: str,
+    rowid: int,
+    header: str,
+    excluded_uuids: set[str],
+) -> _Path | None:
+    """The `.emlx` file for a message Mail just located, or None.
+
+    Mail hands back an account and a ROWID; the file is named after that
+    ROWID, so the search is a filename match inside the one account —
+    bounded, and only reached once every indexed location has already
+    turned out stale. The header is verified on what is found, for the
+    same reason the indexed candidates are: the file must be the message
+    that was asked for, not whatever now owns that number.
+    """
+    from .index.disk import find_mail_directory, parse_emlx
+
+    acct_uuid = _get_account_map().name_to_uuid(account) or account
+    try:
+        mail_dir = await asyncio.to_thread(find_mail_directory)
+    except (FileNotFoundError, PermissionError):
+        return None
+    base = mail_dir / acct_uuid
+    if not base.is_dir():
+        return None
+    for pattern in (f"{rowid}.emlx", f"{rowid}.partial.emlx"):
+        for candidate in sorted(base.rglob(pattern)):
+            if _path_in_excluded_account(str(candidate), excluded_uuids):
+                continue
+            parsed = await asyncio.to_thread(parse_emlx, candidate)
+            if parsed is None:
+                continue
+            if _header_key(parsed.message_id_header) == _header_key(header):
+                return candidate
+    return None
 
 
 @mcp.tool
@@ -3286,7 +3516,7 @@ async def refresh_index(full: bool = False) -> dict:
                 started.set()  # never leave the caller waiting
 
         threading.Thread(target=_build, daemon=True).start()
-        await asyncio.to_thread(started.wait, BUILD_START_TIMEOUT)
+        confirmed = await asyncio.to_thread(started.wait, BUILD_START_TIMEOUT)
 
         if outcome:
             exc = outcome[0]
@@ -3303,6 +3533,23 @@ async def refresh_index(full: bool = False) -> dict:
                 "status": "failed",
                 "message": "The index rebuild could not be started.",
                 "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        if not confirmed:
+            # The wait timed out and the thread has not failed either:
+            # the build may be starting slowly, or it may be stuck. Not
+            # knowing is not the same as "started" — say which one this
+            # is, or a status tool showing no progress looks like a
+            # second bug rather than the answer.
+            return {
+                "status": "unconfirmed",
+                "message": (
+                    "A rebuild was started but had not begun reading "
+                    f"mail after {BUILD_START_TIMEOUT:.0f} seconds. Ask "
+                    "for the index status in a minute: rising progress "
+                    "means it is running, an unchanged index means it "
+                    "is stuck and the server log has the reason."
+                ),
             }
 
         return {
@@ -3405,11 +3652,32 @@ async def get_index_status() -> dict:
     # failure (no Full Disk Access) and it must be reported even when
     # no index exists yet.
     mail_dir_accessible = True
+    mail_dir_missing = False
     mail_dir: str | None = None
-    try:
+
+    def _probe_mail_dir() -> str:
         from .index.disk import find_mail_directory
 
-        mail_dir = str(await asyncio.to_thread(find_mail_directory))
+        path = find_mail_directory()
+        # find_mail_directory() caches for the life of the process, so
+        # on its own it answers "was access granted at startup?". Access
+        # can be revoked while the server runs, and detecting that is
+        # what this probe is FOR — so read the directory for real.
+        with os.scandir(path) as entries:
+            next(iter(entries), None)
+        return str(path)
+
+    try:
+        mail_dir = await asyncio.to_thread(_probe_mail_dir)
+    except FileNotFoundError as exc:
+        # No ~/Library/Mail at all. Diagnosing that as a missing
+        # permission sends the user into System Settings to grant access
+        # to something that does not exist — Mail has simply never been
+        # set up on this Mac.
+        mail_dir_accessible = False
+        mail_dir_missing = True
+        mail_dir = None
+        logger.debug("Mail directory absent: %s", exc)
     except Exception as exc:
         mail_dir_accessible = False
         mail_dir = None
@@ -3541,6 +3809,7 @@ async def get_index_status() -> dict:
     problem, note, next_steps, user_message = _index_guidance(
         state=state,
         mail_dir_accessible=mail_dir_accessible,
+        mail_dir_missing=mail_dir_missing,
         auto_build=auto_build,
         stalled=bool(result.get("build_appears_stalled")),
         phase=result.get("build_phase"),

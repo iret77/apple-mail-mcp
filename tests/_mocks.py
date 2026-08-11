@@ -15,6 +15,9 @@ def mock_index(location=None, has_index=True):
     mgr = MagicMock()
     mgr.has_index.return_value = has_index
     mgr.find_email_location.return_value = location
+    # One location per id unless a test says otherwise: a MagicMock here
+    # makes the ambiguity guard raise on `> 1`.
+    mgr.count_email_locations.return_value = 1 if location else 0
     return mgr
 
 

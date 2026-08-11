@@ -424,3 +424,74 @@ class TestWatcherRespectsTheWriteLock:
 
         assert lock.acquire(blocking=False)
         lock.release()
+
+
+class TestTheWatcherIsAWriterToo:
+    """The one writer nobody thinks of: it has no user in front of it,
+    so it wrote into a running build or sync and produced exactly the
+    "database is locked" storm the write lock exists to end."""
+
+    def _make_watcher(self, db_path: Path) -> IndexWatcher:
+        import threading
+
+        from apple_mail_mcp.index.manager import WriteLock
+
+        watcher = IndexWatcher.__new__(IndexWatcher)
+        watcher.db_path = str(db_path)
+        watcher._conn = None
+        watcher._pending_adds = {}
+        watcher._pending_deletes = set()
+        watcher._pending_lock = threading.Lock()
+        watcher._stop_event = threading.Event()
+        watcher._mail_dir = None
+        watcher._thread = None
+        watcher.on_update = None
+        watcher.debounce_ms = 500
+        watcher._exclude_account_uuids = set()
+        watcher._write_lock = WriteLock(Path(db_path).with_suffix(".lock"))
+        watcher._requeue = IndexWatcher._requeue.__get__(watcher)
+        return watcher
+
+    def test_a_batch_waits_for_a_running_build_instead_of_joining_it(
+        self, watcher_db, monkeypatch
+    ):
+        from apple_mail_mcp.index import watcher as watcher_mod
+        from apple_mail_mcp.index.manager import WriteLock
+
+        db_path, conn = watcher_db
+        conn.close()
+        w = self._make_watcher(db_path)
+        w._pending_deletes.add(("acc", "INBOX", 1))
+
+        monkeypatch.setattr(watcher_mod, "WRITE_LOCK_TIMEOUT_SEC", 0.05)
+        builder = WriteLock(Path(db_path).with_suffix(".lock"))
+        assert builder.acquire(blocking=False)
+        try:
+            with patch.object(w, "_process_batch") as write:
+                w._process_pending()
+            write.assert_not_called()
+        finally:
+            builder.release()
+
+        # Deferred, not dropped: the next round writes it.
+        assert ("acc", "INBOX", 1) in w._pending_deletes
+        with patch.object(w, "_process_batch") as write:
+            w._process_pending()
+        write.assert_called_once()
+
+    def test_a_failed_batch_does_not_leak_the_lock(self, watcher_db):
+        db_path, conn = watcher_db
+        conn.close()
+        w = self._make_watcher(db_path)
+        w._pending_deletes.add(("acc", "INBOX", 1))
+
+        with (
+            patch.object(w, "_process_batch", side_effect=RuntimeError("boom")),
+            pytest.raises(RuntimeError),
+        ):
+            w._process_pending()
+
+        assert w._write_lock.acquire(blocking=False), (
+            "a failed batch left the index write lock held"
+        )
+        w._write_lock.release()

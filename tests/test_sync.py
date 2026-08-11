@@ -360,3 +360,110 @@ class TestOneBadMessageCannotAbortTheSync:
             (str(bad),),
         ).fetchone()
         assert row is not None and row[0] == "AttributeError"
+
+
+class TestAnUnparseableFileIsRecordedToo:
+    """`parse_emlx()` answers a file it cannot make sense of with None
+    rather than an exception, so it never reached the DLQ path — the
+    message was absent from the index with nothing to explain the gap,
+    one branch away from the silence this unit removes."""
+
+    def test_a_none_result_lands_in_the_dlq(self, temp_db, tmp_path):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.sync import sync_from_disk
+
+        mail_dir = tmp_path / "V10"
+        box = mail_dir / "ACCT" / "INBOX.mbox" / "Data" / "Messages"
+        box.mkdir(parents=True)
+        (box / "1.emlx").write_bytes(b"12\nnot a message")
+
+        with patch("apple_mail_mcp.index.disk.parse_emlx", return_value=None):
+            sync_from_disk(temp_db, mail_dir)
+
+        rows = temp_db.execute(
+            "SELECT emlx_path FROM failed_index_jobs"
+        ).fetchall()
+        assert len(rows) == 1, (
+            "the message vanished from the index with no record"
+        )
+
+
+class TestAPartialInsertIsNotLeftBehind:
+    """A failure AFTER the email row went in leaves a half-indexed
+    message: the row exists, so the next sync sees the id in the DB
+    inventory and never revisits it. Its attachments stay missing
+    forever, while the DLQ row claims it will be retried."""
+
+    def test_the_row_is_removed_so_the_next_sync_retries(
+        self, temp_db, tmp_path
+    ):
+        from unittest.mock import patch
+
+        from apple_mail_mcp.index.sync import sync_from_disk
+
+        mail_dir = tmp_path / "V10"
+        box = mail_dir / "ACCT" / "INBOX.mbox" / "Data" / "Messages"
+        box.mkdir(parents=True)
+        emlx = box / "1.emlx"
+        mime = (
+            b"From: a@b.com\r\nSubject: s\r\n"
+            b"Date: Mon, 1 Jan 2026 10:00:00 +0100\r\n"
+            b'Content-Type: multipart/mixed; boundary="B"\r\n\r\n--B\r\n'
+            b"Content-Type: text/plain\r\n\r\nbody\r\n--B\r\n"
+            b"Content-Type: application/pdf\r\n"
+            b'Content-Disposition: attachment; filename="a.pdf"\r\n\r\n'
+            b"XX\r\n--B--\r\n"
+        )
+        emlx.write_bytes(f"{len(mime)}\n".encode() + mime + b"<plist/>")
+
+        # The email row goes in; the attachments do not.
+        with patch(
+            "apple_mail_mcp.index.sync.insert_attachments",
+            side_effect=sqlite3.ProgrammingError("bad parameter"),
+        ):
+            sync_from_disk(temp_db, mail_dir)
+
+        rows = temp_db.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
+        assert rows == 0, (
+            "a half-indexed message stayed in the index, so the next "
+            "sync will skip it and its attachments are lost for good"
+        )
+        dlq = temp_db.execute(
+            "SELECT COUNT(*) FROM failed_index_jobs"
+        ).fetchone()[0]
+        assert dlq == 1
+
+
+class TestOversizedIsRecordedEvenAtTheCap:
+    """The size check has to run before the mailbox cap.
+
+    A mailbox already at MAX_EMAILS swallowed the file with no DLQ row —
+    the exact silence this unit removes, restored by ordering. And a
+    size skip must not be counted as a cap skip: the remedies differ,
+    and "hit cap" advises raising a limit that is not the problem.
+    """
+
+    def test_a_capped_mailbox_still_records_the_size_skip(
+        self, temp_db, tmp_path, monkeypatch
+    ):
+        from apple_mail_mcp.index.sync import sync_from_disk
+
+        mail_dir = tmp_path / "V10"
+        box = mail_dir / "ACCT" / "INBOX.mbox" / "Data" / "Messages"
+        box.mkdir(parents=True)
+        payload = b"x" * (2 * 1024 * 1024)
+        (box / "1.emlx").write_bytes(f"{len(payload)}\n".encode() + payload)
+
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAIL_MB", "1")
+        # Cap of zero: every mailbox counts as already full.
+        monkeypatch.setenv("APPLE_MAIL_INDEX_MAX_EMAILS", "0")
+
+        sync_from_disk(temp_db, mail_dir)
+
+        rows = temp_db.execute(
+            "SELECT error_message FROM failed_index_jobs"
+        ).fetchall()
+        assert [r[0] for r in rows] == ["too_large"], (
+            "the oversized message vanished because the mailbox was capped"
+        )

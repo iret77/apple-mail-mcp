@@ -244,6 +244,8 @@ def sync_from_disk(
     )
 
     skipped_per_mailbox: dict[tuple[str, str], int] = {}
+    # Counted apart from cap skips: different cause, different remedy.
+    oversized = 0
 
     # Process NEW emails (parse content and insert)
     for row in sorted_new:
@@ -251,22 +253,27 @@ def sync_from_disk(
         mailbox = row["mailbox"]
         path = row["emlx_path"]
 
-        # Check mailbox limit (None means uncapped)
         mb_key = (account, mailbox)
         current_count = mailbox_counts.get(mb_key, 0)
-        if max_per_mailbox is not None and current_count >= max_per_mailbox:
-            skipped_per_mailbox[mb_key] = skipped_per_mailbox.get(mb_key, 0) + 1
-            continue
 
         try:
-            # Oversized files are skipped by parse_emlx with a bare
-            # None; check first so the skip is recorded instead of
-            # vanishing (the build path does the same).
+            # Size BEFORE the cap. A mailbox already at its limit would
+            # otherwise swallow an oversized file with no DLQ row — the
+            # exact silence this check exists to remove, restored by
+            # ordering. The two are also counted separately: "hit cap"
+            # and "too large" have different remedies, and reporting a
+            # size skip as a cap skip advises raising a limit that is
+            # not the problem.
             if emlx_too_large(Path(path)):
                 conn.execute(
                     RECORD_PARSE_FAILURE_SQL,
                     skip_row(path, account, mailbox, SKIP_REASON_TOO_LARGE),
                 )
+                oversized += 1
+                continue
+
+            # Check mailbox limit (None means uncapped)
+            if max_per_mailbox is not None and current_count >= max_per_mailbox:
                 skipped_per_mailbox[mb_key] = (
                     skipped_per_mailbox.get(mb_key, 0) + 1
                 )
@@ -275,6 +282,21 @@ def sync_from_disk(
             # a single mail with an undecodable header stopped every
             # later message from being indexed for a full day.
             parsed = parse_emlx(Path(path))
+            if parsed is None:
+                # A bare None is a parse failure like any other: the
+                # message would otherwise vanish from the index with
+                # nothing anywhere to say it ever existed.
+                conn.execute(
+                    RECORD_PARSE_FAILURE_SQL,
+                    parse_failure_row(
+                        path,
+                        account,
+                        mailbox,
+                        ValueError("parse_emlx returned no message"),
+                    ),
+                )
+                errors += 1
+                continue
             if parsed:
                 attachments = parsed.attachments or []
                 insert_row = email_to_row(
@@ -312,6 +334,16 @@ def sync_from_disk(
             # caller's face.
             logger.debug("Failed to parse %s: %s", path, e, exc_info=True)
             errors += 1
+            # A failure AFTER the email row went in leaves a half-indexed
+            # message: the row exists, so the next sync sees the id in
+            # the DB inventory and never revisits it — its attachments
+            # stay missing forever, and the DLQ row says "will retry"
+            # about something nothing will retry. Remove the partial row
+            # so the message is genuinely absent and gets another chance.
+            try:
+                conn.execute("DELETE FROM emails WHERE emlx_path = ?", (path,))
+            except sqlite3.Error:
+                logger.debug("Could not remove partial row for %s", path)
             # Record into the DLQ for visibility / future retry.
             try:
                 conn.execute(

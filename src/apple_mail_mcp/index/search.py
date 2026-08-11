@@ -621,6 +621,10 @@ def search_attachments(
             "sender": row["sender"],
             "date_received": row["date_received"],
             "filename": row["filename"],
+            # Selected above and then dropped here — server.py indexes
+            # into this key, so an attachment search raised KeyError for
+            # every hit it found.
+            "rfc822_message_id": row["rfc822_message_id"],
         }
         for row in cursor
     ]

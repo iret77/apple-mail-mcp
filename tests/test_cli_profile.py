@@ -8,6 +8,7 @@ helper *is* the new behavior; the CLI surface around it is unchanged.
 from __future__ import annotations
 
 import pstats
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -70,6 +71,7 @@ class TestNonBlockingStartup:
         """mcp.run() is called immediately, not after sync."""
         mock_manager = MagicMock()
         mock_manager.has_index.return_value = True
+        mock_manager.has_usable_index.return_value = True
         # sync_updates sleeps to simulate slow sync
         mock_manager.sync_updates.side_effect = lambda: (time.sleep(5) or 0)
 
@@ -98,3 +100,123 @@ class TestNonBlockingStartup:
         import apple_mail_mcp.server as srv
 
         assert not hasattr(srv, "_sync_lock")
+
+
+class TestAnEmptyIndexIsBuiltNotSynced:
+    """`has_index()` is true for a database file with no rows in it —
+    what an interrupted or permission-denied first build leaves behind.
+    A sync cannot fill that: it reconciles what is already indexed. So
+    every such server went down the sync path and reported state
+    "empty" forever, with auto-build sitting right there unused."""
+
+    def test_a_zero_row_index_takes_the_build_path(self):
+        mock_manager = MagicMock()
+        mock_manager.has_index.return_value = True
+        # A file with no rows in it: has_index() is true, but a sync
+        # cannot fill it — only a build can.
+        mock_manager.has_usable_index.return_value = False
+        mock_manager.indexed_email_count.return_value = 0
+
+        with (
+            patch(
+                "apple_mail_mcp.index.IndexManager.get_instance",
+                return_value=mock_manager,
+            ),
+            patch("apple_mail_mcp.server.mcp"),
+            patch("apple_mail_mcp.server._cleanup_old_attachments"),
+            patch(
+                "apple_mail_mcp.config.get_index_auto_build", return_value=True
+            ),
+        ):
+            from apple_mail_mcp.cli import _run_serve
+
+            _run_serve(watch=False)
+
+        for _ in range(50):
+            if mock_manager.build_from_disk.called:
+                break
+            time.sleep(0.05)
+        mock_manager.build_from_disk.assert_called_once()
+        mock_manager.sync_updates.assert_not_called()
+
+
+class TestAutoBuildOnFirstRun:
+    """What `serve` does when there is no index yet."""
+
+    def _serve(self, monkeypatch, auto_build: str, capsys):
+        mock_manager = MagicMock()
+        mock_manager.has_index.return_value = False
+        mock_manager.has_usable_index.return_value = False
+        mock_manager.build_from_disk.return_value = 3
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", auto_build)
+
+        with (
+            patch(
+                "apple_mail_mcp.index.IndexManager.get_instance",
+                return_value=mock_manager,
+            ),
+            patch("apple_mail_mcp.server.mcp", MagicMock()),
+            patch("apple_mail_mcp.server._cleanup_old_attachments"),
+        ):
+            from apple_mail_mcp.cli import _run_serve
+
+            _run_serve(watch=False)
+        # The build runs on a daemon thread; give it a moment.
+        for _ in range(50):
+            if mock_manager.build_from_disk.called:
+                break
+            time.sleep(0.01)
+        return mock_manager, capsys.readouterr().err
+
+    def test_disabled_builds_nothing_but_says_so(self, monkeypatch, capsys):
+        """Silence here becomes an empty body search later, with nothing
+        to explain it."""
+        manager, err = self._serve(monkeypatch, "false", capsys)
+
+        manager.build_from_disk.assert_not_called()
+        assert "No search index" in err
+        assert "apple-mail-mcp index" in err
+
+    def test_enabled_builds_in_the_background(self, monkeypatch, capsys):
+        manager, err = self._serve(monkeypatch, "true", capsys)
+
+        manager.build_from_disk.assert_called_once()
+        assert "building in the background" in err
+
+    def test_the_build_really_is_in_the_background(self, monkeypatch, capsys):
+        """The other test passes even if the build were synchronous,
+        because the mock returns instantly. Make it slow: mcp.run() has
+        to be reached before the build finishes, or 'background' is just
+        a word in a message."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_build(*a, **kw):
+            started.set()
+            release.wait(timeout=5)
+            return 0
+
+        mock_manager = MagicMock()
+        mock_manager.has_index.return_value = False
+        mock_manager.has_usable_index.return_value = False
+        mock_manager.build_from_disk.side_effect = slow_build
+        mock_mcp = MagicMock()
+        monkeypatch.setenv("APPLE_MAIL_INDEX_AUTO_BUILD", "true")
+
+        try:
+            with (
+                patch(
+                    "apple_mail_mcp.index.IndexManager.get_instance",
+                    return_value=mock_manager,
+                ),
+                patch("apple_mail_mcp.server.mcp", mock_mcp),
+                patch("apple_mail_mcp.server._cleanup_old_attachments"),
+            ):
+                from apple_mail_mcp.cli import _run_serve
+
+                _run_serve(watch=False)
+
+            assert started.wait(timeout=5), "the build never started"
+            mock_mcp.run.assert_called_once()  # reached while it runs
+        finally:
+            release.set()

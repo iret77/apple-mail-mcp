@@ -157,7 +157,44 @@ const MailCore = {
         return (parts[parts.length - 1] || n).trim();
     },
 
+    /**
+     * The same normalization, but KEEPING the hierarchy.
+     *
+     * `normalizeMailboxName` compares last segments, which is what
+     * makes "[Gmail]/Sent Mail" answer "Sent Mail". Applied to a
+     * request that is itself a path it does too much: "projects/inbox"
+     * reduces to "inbox" and the account's real INBOX answers it —
+     * whichever of the two Mail happens to list first. A nested
+     * request names one specific folder, so it is compared whole.
+     */
+    normalizeMailboxPath(name) {
+        let n = String(name == null ? "" : name).trim().toLowerCase();
+        n = n.replace(/^\[[^\]]*\][\/.]?/, "");   // "[Gmail]/…"
+        n = n.replace(/^inbox[\/.]/, "");          // "INBOX.Sent"
+        return n.split(/[\/.]/).map(part => part.trim())
+            .filter(part => part.length > 0).join("/");
+    },
+
     /** Which well-known role does this name denote, if any? */
+    /**
+     * True when `name` is a mailbox Mail itself would place at the top
+     * of an account, rather than a folder the user nested somewhere.
+     *
+     * The distinction decides whether the role table may claim it.
+     * `normalizeMailboxName` deliberately drops hierarchy, so
+     * "Projects/INBOX" — somebody's own subfolder — reduces to "inbox"
+     * and would otherwise answer a request for the real inbox. Only the
+     * PROVIDER prefixes are hierarchy we are entitled to ignore:
+     * "[Gmail]/Sent Mail" and dovecot's "INBOX.Sent" are the same
+     * mailbox under a different naming scheme; "Projects/INBOX" is not.
+     */
+    isTopLevelMailbox(name) {
+        let n = String(name == null ? "" : name).trim();
+        n = n.replace(/^\[[^\]]*\][\/.]?/, "");   // "[Gmail]/…"
+        n = n.replace(/^INBOX[\/.]/i, "");        // "INBOX.Sent"
+        return !/[\/.]/.test(n);
+    },
+
     mailboxRole(name) {
         const n = this.normalizeMailboxName(name);
         if (!n) return null;
@@ -212,8 +249,12 @@ const MailCore = {
      * has no "INBOX" but a "Posteingang"; Exchange says "Deleted
      * Items"; Gmail hides its folders under "[Gmail]/". So the exact
      * name is tried first because it is cheap, then Mail's own notion
-     * of the role, then normalized matching that ignores hierarchy and
-     * case, and only then the name table.
+     * of the role, then the localized/legacy name table, and only then
+     * normalized matching that ignores hierarchy and case.
+     *
+     * The table before the normalized match, not after: normalization
+     * drops hierarchy, so a user's own "Projects/INBOX" reduces to
+     * "inbox" and would answer a request for the real inbox.
      */
     getMailbox(account, name) {
         // 1. Exact match — cheap and correct when it hits.
@@ -225,11 +266,25 @@ const MailCore = {
             // fall through
         }
 
-        const role = this.mailboxRole(name);
+        // A REQUEST that is itself a nested path names a specific
+        // folder, not a role: "projects/inbox" is somebody's own
+        // mailbox, even though its last segment normalizes to "inbox".
+        // Treating it as a role request made the top-level rule below
+        // reject the very folder that was asked for — which broke
+        // upstream's case-insensitive lookup for custom mailboxes.
+        const role = this.isTopLevelMailbox(name)
+            ? this.mailboxRole(name)
+            : null;
         let names = [];
+        let listError = null;
         try {
             names = account.mailboxes.name();
         } catch (e) {
+            // An account whose mailboxes cannot be read is not an
+            // account without the mailbox. Reporting "no mailbox
+            // matching X. Available: " with an empty list states a
+            // verdict the lookup never established.
+            listError = e;
             names = [];
         }
 
@@ -239,26 +294,67 @@ const MailCore = {
             if (special) return special;
         }
 
-        // 3. Normalized match: ignores case and provider hierarchy, so
-        //    "[Gmail]/Sent Mail" answers a request for "Sent Mail".
-        const wanted = this.normalizeMailboxName(name);
-        for (const actual of names) {
-            if (this.normalizeMailboxName(actual) === wanted) {
-                return account.mailboxes.byName(actual);
-            }
-        }
-
-        // 4. Same role, different word — the localized/legacy table.
+        // 3. Same role, different word — the localized/legacy table.
+        //    This runs BEFORE the generic normalized match, and the
+        //    order is load-bearing: normalization drops provider
+        //    hierarchy, so a user's own "Projects/INBOX" normalizes to
+        //    "inbox" and would answer a request for the real inbox. On
+        //    a German account (Posteingang + Projects/INBOX) that
+        //    returned the subfolder — the wrong mailbox, silently.
+        //    A ROLE request is answered by a mailbox that plays the
+        //    role; only a non-role name falls through to shape matching.
         if (role) {
             for (const actual of names) {
-                if (this.mailboxRole(actual) === role) {
+                // A nested user folder must not claim a role. Without
+                // the top-level test, "Projects/INBOX" answers a request
+                // for the inbox whenever it happens to be listed first —
+                // and a test that fixes the listing order hides it.
+                if (
+                    this.mailboxRole(actual) === role &&
+                    this.isTopLevelMailbox(actual)
+                ) {
                     return account.mailboxes.byName(actual);
                 }
             }
         }
 
+        // 4. Normalized match: ignores case and provider hierarchy, so
+        //    "[Gmail]/Sent Mail" answers a request for "Sent Mail" and
+        //    "INBOX.Projects" answers "Projects".
+        const wanted = this.normalizeMailboxName(name);
+        const wantedPath = this.normalizeMailboxPath(name);
+        const wantedIsPath = !this.isTopLevelMailbox(name);
+        for (const actual of names) {
+            if (wantedIsPath) {
+                // The request is a path: it names ONE folder. Matching
+                // last segments here let the account's real INBOX
+                // answer a request for "projects/inbox" whenever Mail
+                // listed it first — upstream's case-insensitive custom
+                // mailbox lookup, returning the wrong mailbox.
+                if (this.normalizeMailboxPath(actual) !== wantedPath) continue;
+                return account.mailboxes.byName(actual);
+            }
+            if (this.normalizeMailboxName(actual) !== wanted) continue;
+            // When a ROLE was requested, only a top-level mailbox may
+            // answer it here too. Otherwise an account whose only
+            // "inbox-shaped" name is the user's own "Projects/INBOX"
+            // silently reads and writes in that subfolder. Failing
+            // loudly lists what does exist, and the caller can name it
+            // exactly — stage 1 still matches an exact name.
+            if (role && !this.isTopLevelMailbox(actual)) continue;
+            return account.mailboxes.byName(actual);
+        }
+
         // 5. Nothing matched. Name what IS there: the caller can only
         //    act on this if it learns which mailboxes exist.
+        if (listError) {
+            throw new Error(
+                "Could not read the mailboxes of this account, so " +
+                JSON.stringify(String(name)) + " could not be looked " +
+                "for: " + (listError && listError.message
+                    ? listError.message : String(listError))
+            );
+        }
         throw new Error(
             "No mailbox matching " + JSON.stringify(String(name)) +
             (role ? " (role: " + role + ")" : "") +

@@ -46,6 +46,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# How long a single-row cleanup waits for the index write lock before
+# giving up. Long enough to ride out a batch commit, short enough not to
+# stall the read it is attached to behind a full rebuild.
+WRITE_LOCK_WAIT = 2.0
+
 # How many lifecycle events to keep in memory for the status tool.
 MAX_EVENTS = 50
 
@@ -66,10 +71,14 @@ class WriteLock:
     process, where flock would not: the same file description is shared.
     """
 
-    def __init__(self, path: Path):
-        self._path = path
+    def __init__(self, path: Path | str):
+        self._path = Path(path)
         self._thread_lock = threading.Lock()
         self._fd: int | None = None
+        # True once the file lock could not actually be taken and the
+        # lock degraded to this process only. Callers that promise
+        # cross-process exclusivity have to be able to see that.
+        self.degraded = False
 
     def acquire(self, blocking: bool = False, timeout: float = 0.0) -> bool:
         """Take both locks, or neither. Returns False if unavailable."""
@@ -92,21 +101,50 @@ class WriteLock:
             raise
 
     def _acquire_file_lock(self) -> bool:
+        import errno
         import fcntl
 
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
-        except OSError:
-            # Cannot create a lock file (read-only home?). Degrade to
-            # thread-only rather than blocking all writes forever.
-            logger.debug("Lock file unavailable at %s", self._path)
+        except OSError as exc:
+            # No lock file, so no cross-process guarantee. Refusing here
+            # would wedge every write forever on a read-only home, so
+            # the lock degrades to this process — but it says so, at
+            # WARNING, instead of returning the same True a real
+            # acquisition returns. The lock file sits beside the
+            # database, so in practice the write that follows is about
+            # to fail on its own and will say why.
+            self.degraded = True
+            logger.warning(
+                "Cannot create the index lock file at %s (%s). Writes "
+                "from a second process are NOT prevented.",
+                self._path,
+                exc,
+            )
             return True
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
-            return False
+        except OSError as exc:
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                # Genuinely held by someone else — the case this lock
+                # exists for.
+                os.close(fd)
+                return False
+            # Anything else means flock does not work here (some
+            # network home directories answer ENOTSUP or ENOLCK).
+            # Treating that as "held" made the index permanently
+            # unwritable on those filesystems, with "already running"
+            # as the only explanation.
+            self.degraded = True
+            logger.warning(
+                "The filesystem holding %s does not support locking "
+                "(%s). Writes from a second process are NOT prevented.",
+                self._path,
+                exc,
+            )
+            self._fd = fd
+            return True
         self._fd = fd
         return True
 
@@ -189,7 +227,12 @@ class IndexManager:
         # One connection per thread (see _get_conn): a shared connection
         # would make every query wait behind a running build or sync.
         self._local = threading.local()
-        self._open_conns: list[sqlite3.Connection] = []
+        # Keyed by thread id so a connection can be closed when its
+        # thread ends. A plain list kept every connection ever opened
+        # alive until close(): short-lived worker threads then ran the
+        # process out of SQLite file descriptors, and each dead thread's
+        # connection also held its own open transaction.
+        self._open_conns: dict[int, sqlite3.Connection] = {}
         self._conn_lock = threading.Lock()
         # SQLite allows a single writer. A build and a sync running at
         # once fight over it: one wipes rows the other just wrote, and
@@ -324,6 +367,13 @@ class IndexManager:
         interrupted or permission-denied first build leaves an empty
         database behind, which must not be mistaken for a usable index.
         """
+        # Do NOT open a connection when the file is absent:
+        # init_database() would create it, and a *status* call that
+        # creates the index turns the next `serve` down the sync path
+        # instead of the first-build path — the tool changes the state
+        # it is asked to describe.
+        if not self._db_path.exists():
+            return 0
         try:
             row = (
                 self._get_conn()
@@ -379,12 +429,35 @@ class IndexManager:
         if conn is None:
             # Serialize first-time setup: concurrent threads must not
             # race on creating the schema or running a migration.
+            ident = threading.get_ident()
             with self._conn_lock:
+                self._close_dead_thread_conns(reclaim=ident)
                 conn = init_database(self._db_path)
-            self._local.conn = conn
-            with self._conn_lock:
-                self._open_conns.append(conn)
+                self._local.conn = conn
+                self._open_conns[ident] = conn
         return conn
+
+    def _close_dead_thread_conns(self, reclaim: int | None = None) -> None:
+        """Close connections whose thread has ended. Call under the lock.
+
+        A dead thread's thread-local is gone with it, so nothing can
+        reach its connection any more — but sqlite3 keeps the file
+        descriptor, and the implicit transaction, until the object is
+        closed.
+
+        `reclaim` is the calling thread's own id, treated as dead here:
+        the caller has just found its thread-local EMPTY, so an entry
+        under that id belongs to a finished thread whose id the OS handed
+        out again. Leaving it alive would have overwritten the entry and
+        leaked the connection.
+        """
+        alive = {t.ident for t in threading.enumerate()} - {reclaim}
+        for ident in [i for i in self._open_conns if i not in alive]:
+            conn = self._open_conns.pop(ident)
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("Closing a finished thread's connection failed")
 
     def close(self) -> None:
         """Close every connection this manager has opened.
@@ -393,7 +466,7 @@ class IndexManager:
         for a connection get a fresh one.
         """
         with self._conn_lock:
-            for conn in self._open_conns:
+            for conn in list(self._open_conns.values()):
                 try:
                     conn.close()
                 except sqlite3.Error:
@@ -605,8 +678,6 @@ class IndexManager:
         # state is visible. Callers use this to distinguish a started
         # build from one refused on the first line.
         self.record_event("info", "Index build started")
-        if on_started is not None:
-            on_started()
 
         conn = None
         # Set when a swallowed error in the cleanup path means the
@@ -636,6 +707,13 @@ class IndexManager:
             exclude_account_uuids = self._resolve_exclusions()
 
             conn = self._get_conn()
+
+            if on_started is not None:
+                # Deliberately AFTER the two steps that can still refuse
+                # the build — resolving exclusions talks to Mail, and
+                # _get_conn() opens and initialises SQLite. Signalling
+                # before them made "started" survive both failures.
+                on_started()
             max_per_mailbox = get_index_max_emails()
 
             # Drop the FTS triggers BEFORE clearing, not after. With
@@ -713,6 +791,16 @@ class IndexManager:
                 if attachments:
                     batch_attachments.append((len(batch) - 1, attachments))
 
+                # This file parses now. A row left from an earlier
+                # failure would otherwise outlive the problem: a full
+                # rebuild is exactly when a user expects the dead-letter
+                # queue to shrink, and it never did.
+                path_now = email_data.get("emlx_path")
+                if path_now:
+                    from .schema import CLEAR_PARSE_FAILURE_SQL
+
+                    conn.execute(CLEAR_PARSE_FAILURE_SQL, (path_now,))
+
                 if len(batch) >= batch_size:
                     self._flush_batch(conn, batch, batch_attachments)
                     self._mark_progress(
@@ -747,11 +835,13 @@ class IndexManager:
                     logger.debug("rollback after failed build failed")
             raise
         finally:
-            # The build is no longer running, however it ended. Set
-            # before the flush so a failure in cleanup can't leave the
-            # status tool reporting a phantom in-progress build.
-            self._building = False
-            self._build_progress = None
+            # NOT cleared here. The heaviest writes in the program run
+            # below — the final flush and the FTS rebuild — and a status
+            # call during them would report "ready", which also lets a
+            # fresh disk walk start against a database still being
+            # rewritten. The flag is cleared in the inner `finally`,
+            # once the cleanup is over however it went.
+            self._mark_progress("finalizing")
 
             # NOTE: the write lock is released at the very END of this
             # block. Everything below still writes — the final flush and
@@ -760,74 +850,95 @@ class IndexManager:
             # open transaction then made these writes fail with
             # "database is locked" from inside this `finally`.
 
-            # Nothing was opened (e.g. Mail unreadable): no schema
-            # state to restore. Guarded with a conditional rather than
-            # an early return — returning from `finally` would swallow
-            # the exception that brought us here.
-            if conn is not None:
-                # Restore the triggers FIRST. DROP TRIGGER is DDL and
-                # autocommits, so a rollback does not bring them back:
-                # if anything below throws before this runs, the
-                # triggers are gone from the database file permanently
-                # and new mail silently stops entering the search
-                # index. Nothing may precede this.
-                self._recreate_fts_triggers(conn)
+            # The heaviest writes in the program run here. An error
+            # in any of them used to escape this block unrecorded, so
+            # a build that ended badly left `last_error` empty and
+            # read as clean. Recorded, then re-raised: a status call
+            # that says the build ended must be able to say how.
+            try:
+                # Nothing was opened (e.g. Mail unreadable): no schema
+                # state to restore. Guarded with a conditional rather than
+                # an early return — returning from `finally` would swallow
+                # the exception that brought us here.
+                if conn is not None:
+                    # Restore the triggers FIRST. DROP TRIGGER is DDL and
+                    # autocommits, so a rollback does not bring them back:
+                    # if anything below throws before this runs, the
+                    # triggers are gone from the database file permanently
+                    # and new mail silently stops entering the search
+                    # index. Nothing may precede this.
+                    self._recreate_fts_triggers(conn)
 
-                # Best-effort from here: losing the tail of a build is
-                # recoverable, breaking the schema is not.
-                try:
-                    # Flush any remaining partial batch (crash-safe)
-                    if batch:
-                        self._flush_batch(conn, batch, batch_attachments)
-                        total_indexed += len(batch)
-
-                    # Update sync state for whatever we managed to index
-                    if mailbox_counts:
-                        now = datetime.now().isoformat()
-                        for (acct_, mbox_), count in mailbox_counts.items():
-                            conn.execute(
-                                """INSERT OR REPLACE INTO sync_state
-                                 (account, mailbox, last_sync, message_count)
-                                 VALUES (?, ?, ?, ?)""",
-                                (acct_, mbox_, now, count),
-                            )
-                        conn.commit()
-                except sqlite3.Error as exc:
-                    finalize_error = f"{type(exc).__name__}: {exc}"
-                    logger.exception("Could not finalize index build")
-
-                # Rebuild FTS index (must run even if scan crashed
-                # mid-iteration, otherwise emails table has rows
-                # but FTS5 is empty)
-                if total_indexed > 0:
-                    if progress_callback:
-                        msg = "Building search index..."
-                        progress_callback(total_indexed, total_indexed, msg)
-
+                    # Best-effort from here: losing the tail of a build is
+                    # recoverable, breaking the schema is not.
                     try:
-                        rebuild_fts_index(conn)
-                        optimize_fts_index(conn)
+                        # Flush any remaining partial batch (crash-safe)
+                        if batch:
+                            self._flush_batch(conn, batch, batch_attachments)
+                            total_indexed += len(batch)
+
+                        # Update sync state for whatever we managed to index
+                        if mailbox_counts:
+                            now = datetime.now().isoformat()
+                            for (acct_, mbox_), count in mailbox_counts.items():
+                                conn.execute(
+                                    """INSERT OR REPLACE INTO sync_state
+                                    (account, mailbox, last_sync,
+                                     message_count)
+                                    VALUES (?, ?, ?, ?)""",
+                                    (acct_, mbox_, now, count),
+                                )
+                            conn.commit()
                     except sqlite3.Error as exc:
                         finalize_error = f"{type(exc).__name__}: {exc}"
-                        logger.exception("FTS rebuild failed")
+                        logger.exception("Could not finalize index build")
 
-                # Log cap warnings (aggregate summary)
-                if capped_mailboxes:
-                    logger.warning(
-                        "%d mailbox(es) hit the per-mailbox cap (%d). "
-                        "Increase APPLE_MAIL_INDEX_MAX_EMAILS to index more.",
-                        len(capped_mailboxes),
-                        max_per_mailbox,
-                    )
-                    if progress_callback:
-                        msg = (
-                            f"Warning: {len(capped_mailboxes)} mailbox(es) "
-                            f"hit cap ({max_per_mailbox})"
+                    # Rebuild FTS index (must run even if scan crashed
+                    # mid-iteration, otherwise emails table has rows
+                    # but FTS5 is empty)
+                    if total_indexed > 0:
+                        if progress_callback:
+                            msg = "Building search index..."
+                            progress_callback(total_indexed, total_indexed, msg)
+
+                        try:
+                            rebuild_fts_index(conn)
+                            optimize_fts_index(conn)
+                        except sqlite3.Error as exc:
+                            finalize_error = f"{type(exc).__name__}: {exc}"
+                            logger.exception("FTS rebuild failed")
+
+                    # Log cap warnings (aggregate summary)
+                    if capped_mailboxes:
+                        logger.warning(
+                            "%d mailbox(es) hit the per-mailbox cap "
+                            "(%d). Increase APPLE_MAIL_INDEX_MAX_EMAILS "
+                            "to index more.",
+                            len(capped_mailboxes),
+                            max_per_mailbox,
                         )
-                        progress_callback(total_indexed, total_indexed, msg)
+                        if progress_callback:
+                            msg = (
+                                f"Warning: {len(capped_mailboxes)} mailbox(es) "
+                                f"hit cap ({max_per_mailbox})"
+                            )
+                            progress_callback(total_indexed, total_indexed, msg)
 
-            # Released last: every write above must be protected.
-            self._write_lock.release()
+            except Exception as exc:
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                self.record_event(
+                    "error",
+                    "Index build finalization failed",
+                    error=self._last_error,
+                )
+                raise
+            finally:
+                # Cleanup is over, however it went: only now is the
+                # build really finished.
+                self._building = False
+                self._build_progress = None
+                # Released last: every write above must be protected.
+                self._write_lock.release()
 
         # Disk inventory just changed — drop the cache so the next
         # status call reflects truth.
@@ -957,7 +1068,10 @@ class IndexManager:
             # locked" until it was restarted.
             try:
                 self._get_conn().rollback()
-            except sqlite3.Error:
+            except Exception:
+                # Broad on purpose: the rollback is best-effort, and an
+                # exception raised HERE would replace the failure that
+                # brought us in — the caller would debug the wrong one.
                 logger.debug("rollback after failed sync failed")
             self._last_error = f"{type(exc).__name__}: {exc}"
             self.record_event("error", "Sync failed", error=self._last_error)
@@ -1080,6 +1194,25 @@ class IndexManager:
         Returns:
             Number of emails re-indexed
         """
+        # The DELETE below is a write like any other. Outside the lock a
+        # second rebuild could wipe rows mid-build, and the caller saw a
+        # raw "database is locked" instead of the IndexBusyError this
+        # class exists to give.
+        if not self._write_lock.acquire(blocking=False):
+            self.record_event("info", "Rebuild skipped: index busy")
+            raise IndexBusyError("An index build or sync is already running.")
+        try:
+            return self._rebuild_locked(account, mailbox, progress_callback)
+        finally:
+            self._write_lock.release()
+
+    def _rebuild_locked(
+        self,
+        account: str | None = None,
+        mailbox: str | None = None,
+        progress_callback: Callable[[int, int | None, str], None] | None = None,
+    ) -> int:
+        """Body of rebuild(), holding the index write lock."""
         conn = self._get_conn()
 
         # Delete existing entries for rebuild scope
@@ -1389,8 +1522,34 @@ class IndexManager:
             mailbox: Optional mailbox filter
 
         Returns:
-            Number of rows deleted (typically 0 or 1).
+            Number of rows deleted (typically 0 or 1), or 0 when the
+            index was busy — see below.
+
+        This takes the same write lock a build or a sync holds. Removing
+        a row that no longer has a file is housekeeping, not the
+        caller's answer: rather than raise "database is locked" into a
+        read that was otherwise fine, a delete that cannot get the lock
+        is skipped and logged. The stale row survives until the next
+        read or sync, which is what it did before this cleanup existed.
         """
+        if not self._write_lock.acquire(timeout=WRITE_LOCK_WAIT):
+            logger.info(
+                "Index busy — leaving the stale row for message %s in "
+                "place; the next read or sync removes it.",
+                message_id,
+            )
+            return 0
+        try:
+            return self._delete_email_locked(message_id, account, mailbox)
+        finally:
+            self._write_lock.release()
+
+    def _delete_email_locked(
+        self,
+        message_id: int,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> int:
         conn = self._get_conn()
         where = ["message_id = ?"]
         params: list = [message_id]
