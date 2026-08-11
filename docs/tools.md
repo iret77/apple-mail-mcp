@@ -129,7 +129,7 @@ Get a single email with full content. Uses a 3-strategy cascade to find the mess
 | `account` | `string?` | env default | Helps find the message faster |
 | `mailbox` | `string?` | `INBOX` | Helps find the message faster |
 
-**Returns:** Full email with: `id`, `subject`, `sender`, `content` (full body text), `date_received`, `date_sent`, `read`, `flagged`, `reply_to`, `message_id` (RFC 822 Message-ID header), `attachments` (list of `{filename, mime_type, size}`).
+**Returns:** Full email with: `id`, `subject`, `sender`, `content` (full body text), `date_received`, `date_sent`, `read`, `flagged`, `reply_to`, `message_id` (RFC 822 Message-ID header, always in its bracketed form `<a@b>` whichever strategy answered), `account` and `mailbox` (where the message is *now*), `attachments` (list of `{filename, mime_type, size}`).
 
 ```python
 get_email(12345)

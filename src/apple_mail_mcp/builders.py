@@ -714,6 +714,10 @@ class GetEmailBuilder:
 const targetId = {self.message_id};
 let msg = null;
 {acct_setup}
+// The account this scan ran in — reported back so the caller learns
+// where the message actually is, not just that it exists.
+let accountName = null;
+try {{ accountName = String(account.name()); }} catch (e) {{}}
 
 let allMailboxes;
 try {{
@@ -731,6 +735,10 @@ const mbLimit = Math.min(allMailboxes.length, {self.max_mailboxes});
 // A scan that stops early is not evidence of absence. Count what was
 // left out and say so, instead of letting "not found" stand for both.
 let unsearched = Math.max(0, allMailboxes.length - mbLimit);
+// Where it was found. This strategy answers precisely when the index
+// does NOT know the message — so it is the one case where the caller
+// cannot derive the location, and the one that used to drop it.
+let foundMailbox = null;
 for (let i = 0; i < mbLimit && !msg; i++) {{
     try {{
         const mb = allMailboxes[i];
@@ -738,6 +746,7 @@ for (let i = 0; i < mbLimit && !msg; i++) {{
         const mbIdx = mbIds.indexOf(targetId);
         if (mbIdx !== -1) {{
             msg = mb.messages[mbIdx];
+            try {{ foundMailbox = String(mb.name()); }} catch (e) {{}}
         }}
     }} catch(e) {{
         unsearched++;  // inaccessible mailbox (Junk/Drafts -1728)
@@ -766,6 +775,8 @@ JSON.stringify({{
     flagged: msg.flaggedStatus(),
     reply_to: msg.replyTo(),
     message_id: msg.messageId(),
+    mailbox: foundMailbox,
+    account: accountName,
     attachments: attachments
 }});
 """

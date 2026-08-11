@@ -2500,6 +2500,17 @@ async def _get_email_by_id(
         for field in ("date_received", "date_sent"):
             if field in result:
                 result[field] = to_local_iso(result[field])
+        # One spelling of the header, whichever strategy answered. The
+        # `.emlx` keeps the angle brackets, Apple's `messageId` drops
+        # them — so the same message came back as "<a@b>" from disk and
+        # "a@b" from JXA, and a caller comparing strings saw two
+        # different messages. Brackets are the RFC form and what
+        # search() and get_emails() already hand out.
+        header = result.get("message_id")
+        if isinstance(header, str) and header.strip():
+            bare = header.strip()
+            if not bare.startswith("<"):
+                result["message_id"] = f"<{bare}>"
         try:
             mgr = _get_index_manager()
             if mgr.has_index():
@@ -2694,7 +2705,17 @@ async def _get_email_by_id(
         result = await execute_with_core_async(
             script, timeout=STRATEGY3_TIMEOUT
         )
-        return _enrich_attachments(result)
+        # The scan is the ONE strategy that answers when the index does
+        # not know the message — so it is the one case where the caller
+        # cannot derive the location, and it was the only return path
+        # that did not record it.
+        return _enrich_attachments(
+            _with_location(
+                result,
+                result.get("account") or resolved_account,
+                result.get("mailbox"),
+            )
+        )
     except TimeoutError:
         if account and mailbox:
             hint = (

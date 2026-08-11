@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.3] - 2026-08-11
+
+Aus der Nachuntersuchung des gemeldeten `message_id: null`. Die Ursache
+war Latenz, kein Defekt — der schnelle Auflistungspfad liest Apples
+Live-Index, der stabile Header kommt aus unserem, und der hängt
+zwischen den Syncs hinterher. Belegt an einer festen Nachricht: vorher
+`null`, nach `refresh_index()` gesetzt. Die Rohausgaben derselben
+Untersuchung zeigten aber zwei Fehler, nach denen niemand gesucht hatte.
+
+### Fixed
+- **Der Mailbox-Scan verschwieg, wo er die Nachricht gefunden hat.**
+  Strategie 3 antwortet genau dann, wenn der Index die Nachricht NICHT
+  kennt — frisch eingetroffen, oder gerade von einem anderen Gerät
+  verschoben. Das ist der einzige Fall, in dem der Aufrufer den Ort
+  nicht selbst herleiten kann, und es war der einzige Rückgabepfad von
+  vieren ohne `_with_location`. Das JXA-Skript hatte die Mailbox in der
+  Hand und gab weder sie noch das Konto zurück. `CLAUDE.md` sagt seit
+  jeher zu, dass `get_email` den aktuellen Ort meldet. Relevant über
+  die Auskunft hinaus: die Mehrdeutigkeitsprüfung beim Schreiben
+  verlangt genau `account` + `mailbox`.
+- **Eine Schreibweise für den Message-ID-Header.** Die `.emlx` behält
+  die spitzen Klammern, Apples `messageId` lässt sie weg — dieselbe
+  Nachricht kam als `<a@b>` oder als `a@b` zurück, je nachdem welche
+  Strategie geantwortet hatte. `search()` und `get_emails()` liefern
+  immer die Klammerform; `get_email()` tut es jetzt auch. Für den
+  Abgleich war das nie ein Problem (alles läuft über `_header_key`),
+  für jeden, der Strings vergleicht, schon.
+
 ## [0.20.2] - 2026-08-11
 
 Aus dem zweiten Health-Check. Der Check selbst lief durch (PASS,

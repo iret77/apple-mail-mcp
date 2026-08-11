@@ -5228,3 +5228,128 @@ class TestTheStatusSaysWhetherTheLogIsBeingWritten:
                 f"{leak} in the status path would ship log CONTENT — "
                 f"subjects and file paths — to the caller"
             )
+
+
+class TestTheScanReportsWhereItFoundTheMessage:
+    """Strategy 3 answers precisely when the index does NOT know the
+    message — a mail that just arrived, or one another device just
+    moved. That is the one case where the caller cannot derive the
+    location, and it was the only return path that dropped it: the JXA
+    script had the mailbox in hand and returned neither it nor the
+    account. CLAUDE.md promises `get_email` reports the current
+    location. Reported from the field."""
+
+    def test_the_generated_script_returns_the_location(self):
+        from apple_mail_mcp.builders import GetEmailBuilder
+
+        js = GetEmailBuilder(
+            message_id=1, account="Work", max_mailboxes=5, attachment_js="[]"
+        ).build()
+        assert "mailbox: foundMailbox" in js
+        assert "account: accountName" in js
+        assert "foundMailbox = String(mb.name())" in js
+
+    @pytest.mark.asyncio
+    async def test_the_tool_passes_it_through(self):
+        from unittest.mock import AsyncMock, patch
+
+        import apple_mail_mcp.server as srv
+
+        # The script reports the mailbox it found; the ACCOUNT has to
+        # be filled in by _with_location, which this return path used
+        # not to call. Leaving it out of the payload is what makes this
+        # test fail without the fix instead of passing through.
+        found = {
+            "id": 1,
+            "subject": "x",
+            "message_id": "a@b",
+            "mailbox": "Junk",
+        }
+        with (
+            patch.object(srv, "_get_index_manager") as mgr,
+            patch.object(
+                srv,
+                "_resolve_visible_account",
+                AsyncMock(return_value="iCloud"),
+            ),
+            patch.object(srv, "_excluded_account_names", return_value=set()),
+            patch.object(
+                srv,
+                "execute_with_core_async",
+                AsyncMock(side_effect=[Exception("s1"), found]),
+            ),
+            patch.object(
+                srv, "execute_query_async", AsyncMock(return_value=[])
+            ),
+        ):
+            mgr.return_value.has_index.return_value = False
+            out = await srv.get_email(1)
+
+        assert out["mailbox"] == "Junk"
+        assert out["account"] == "iCloud"
+
+
+class TestOneSpellingOfTheHeaderWhicheverStrategyAnswered:
+    """The `.emlx` keeps the angle brackets, Apple's `messageId` drops
+    them — so the same message came back as "<a@b>" from disk and "a@b"
+    from JXA, while search() and get_emails() always say "<a@b>". A
+    caller comparing strings saw two different messages. Reported from
+    the field."""
+
+    @pytest.mark.asyncio
+    async def test_a_jxa_answer_is_bracketed_like_the_index(self):
+        from unittest.mock import AsyncMock, patch
+
+        import apple_mail_mcp.server as srv
+
+        bare = {"id": 1, "subject": "x", "message_id": "a@b"}
+        with (
+            patch.object(srv, "_get_index_manager") as mgr,
+            patch.object(
+                srv,
+                "_resolve_visible_account",
+                AsyncMock(return_value="iCloud"),
+            ),
+            patch.object(srv, "_excluded_account_names", return_value=set()),
+            patch.object(
+                srv,
+                "execute_with_core_async",
+                AsyncMock(side_effect=[Exception("s1"), bare]),
+            ),
+            patch.object(
+                srv, "execute_query_async", AsyncMock(return_value=[])
+            ),
+        ):
+            mgr.return_value.has_index.return_value = False
+            out = await srv.get_email(1)
+
+        assert out["message_id"] == "<a@b>"
+
+    @pytest.mark.asyncio
+    async def test_an_already_bracketed_header_is_left_alone(self):
+        from unittest.mock import AsyncMock, patch
+
+        import apple_mail_mcp.server as srv
+
+        already = {"id": 1, "subject": "x", "message_id": "<a@b>"}
+        with (
+            patch.object(srv, "_get_index_manager") as mgr,
+            patch.object(
+                srv,
+                "_resolve_visible_account",
+                AsyncMock(return_value="iCloud"),
+            ),
+            patch.object(srv, "_excluded_account_names", return_value=set()),
+            patch.object(
+                srv,
+                "execute_with_core_async",
+                AsyncMock(side_effect=[Exception("s1"), already]),
+            ),
+            patch.object(
+                srv, "execute_query_async", AsyncMock(return_value=[])
+            ),
+        ):
+            mgr.return_value.has_index.return_value = False
+            out = await srv.get_email(1)
+
+        assert out["message_id"] == "<a@b>"
