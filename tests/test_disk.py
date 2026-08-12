@@ -1966,22 +1966,109 @@ class TestTheDlqShrinksAndTheWatcherFillsIt:
         assert [r[0] for r in rows] == ["too_large"]
 
 
-class TestANestedMailboxKeepsItsFullName:
-    """The Envelope Index and the disk walk must derive the SAME name.
+class TestTheMailboxNameStopsAtTheGuidDirectory:
+    """The fixtures of the previous round were INVENTED.
 
-    Apple nests a submailbox as its parent's child directory —
-    `Archiv.mbox/2026.mbox/Data/…` — and the old walk stopped at the
-    first `.mbox`, recording every message of `Archiv/2026` as living in
-    `Archiv`. The Envelope Index derives `Archiv/2026` from the mailbox
-    URL, so the listing path's (account, mailbox, id) lookup missed and
-    every such message lost its stable Message-ID. No sync repaired it:
-    the row was indexed, just under a name nothing asks for.
+    They wrote `Archiv.mbox/2026.mbox/Data/…` because that is what I
+    assumed the layout was. Apple actually puts a GUID directory
+    between the mailbox and its data:
 
-    Reported from the field as "message_id: null for some rows, and
-    refresh_index() does not lower the count".
+        <account>/INBOX.mbox/D85A1046-EE7C-422F-99AD-8B1BCA92881E/Data/…
+
+    Collecting every component up to `Data` swallowed that GUID into
+    the name. The index then stored `INBOX/D85A1046-…` while the
+    Envelope Index derives `INBOX` from the mailbox URL, so EVERY
+    stable-id lookup missed (`message_id: null` on every row of every
+    listing), and the mailbox value handed to a caller could not be
+    passed back to `set_flag` — Mail has no such mailbox.
+
+    The paths marked REAL below were taken from a live Mail directory
+    (via `failed_parse_examples` in a field report). The nested case is
+    kept for the Envelope Index's own `Archiv/2026` form and is
+    explicitly NOT verified against a real Mail directory.
     """
 
-    def _both(self, url: str, rel: str) -> tuple[str, str]:
+    def _name(self, rel: str) -> str:
+        from pathlib import Path
+
+        from apple_mail_mcp.index.disk import _infer_account_mailbox
+
+        mail_dir = Path("/Users/x/Library/Mail/V10")
+        return _infer_account_mailbox(mail_dir / rel, mail_dir)[1]
+
+    GUID = "D85A1046-EE7C-422F-99AD-8B1BCA92881E"
+
+    def test_real_layout_inbox(self):
+        assert (
+            self._name(f"U/INBOX.mbox/{self.GUID}/Data/1/Messages/1.emlx")
+            == "INBOX"
+        )
+
+    def test_real_layout_drafts(self):
+        assert (
+            self._name(f"U/Drafts.mbox/{self.GUID}/Data/1/Messages/1.emlx")
+            == "Drafts"
+        )
+
+    def test_a_name_with_spaces_keeps_them(self):
+        assert (
+            self._name(f"U/Sent Messages.mbox/{self.GUID}/Data/1/1.emlx")
+            == "Sent Messages"
+        )
+
+    def test_plain_parent_directories_are_kept(self):
+        assert (
+            self._name(f"U/Work/Projects/Q1.mbox/{self.GUID}/Data/1.emlx")
+            == "Work/Projects/Q1"
+        )
+
+    def test_a_submailbox_keeps_both_segments(self):
+        """Unverified against a real Mail directory — see the class
+        docstring. Kept because the Envelope Index uses this form."""
+        assert (
+            self._name(f"U/Archiv.mbox/2026.mbox/{self.GUID}/Data/1.emlx")
+            == "Archiv/2026"
+        )
+
+    def test_without_any_mbox_no_name_is_invented(self):
+        assert self._name("U/SomeDir/1.emlx") == "Unknown"
+
+    def test_no_guid_ever_reaches_the_name(self):
+        """The property, not just the examples: whatever the shape, a
+        component that is not a `.mbox` must not end up in the name."""
+        for rel in (
+            f"U/INBOX.mbox/{self.GUID}/Data/1/Messages/1.emlx",
+            f"U/Junk.mbox/{self.GUID}/Data/9/9/Messages/9.emlx",
+            f"U/Archiv.mbox/2026.mbox/{self.GUID}/Data/1.emlx",
+        ):
+            assert self.GUID not in self._name(rel)
+
+
+class TestTheTwoSidesAgreeOnTheMailboxName:
+    """The disk walk and the Envelope Index must derive the SAME name:
+    the listing path looks the stable header up by
+    (account, mailbox, id), so any disagreement loses it."""
+
+    GUID = "D85A1046-EE7C-422F-99AD-8B1BCA92881E"
+
+    @pytest.mark.parametrize(
+        ("url", "rel", "expected"),
+        [
+            ("imap://U/INBOX", "U/INBOX.mbox/{g}/Data/1/1.emlx", "INBOX"),
+            ("imap://U/Junk", "U/Junk.mbox/{g}/Data/1/1.emlx", "Junk"),
+            (
+                "imap://U/Sent%20Messages",
+                "U/Sent Messages.mbox/{g}/Data/1/1.emlx",
+                "Sent Messages",
+            ),
+            (
+                "imap://U/Archiv/2026",
+                "U/Archiv.mbox/2026.mbox/{g}/Data/1.emlx",
+                "Archiv/2026",
+            ),
+        ],
+    )
+    def test_both_sides_agree(self, url, rel, expected):
         from pathlib import Path
 
         from apple_mail_mcp.index.disk import _infer_account_mailbox
@@ -1989,43 +2076,11 @@ class TestANestedMailboxKeepsItsFullName:
 
         mail_dir = Path("/Users/x/Library/Mail/V10")
         _, from_url = _parse_mailbox_url(url)
-        _, from_disk = _infer_account_mailbox(mail_dir / rel, mail_dir)
-        return from_url, from_disk
-
-    @pytest.mark.parametrize(
-        ("url", "rel", "expected"),
-        [
-            (
-                "imap://U/INBOX",
-                "U/INBOX.mbox/Data/1/Messages/1.emlx",
-                "INBOX",
-            ),
-            (
-                "imap://U/Archiv/2026",
-                "U/Archiv.mbox/2026.mbox/Data/1/Messages/1.emlx",
-                "Archiv/2026",
-            ),
-            (
-                "imap://U/%5BGmail%5D/Trash",
-                "U/[Gmail].mbox/Trash.mbox/Data/1/Messages/1.emlx",
-                "[Gmail]/Trash",
-            ),
-            (
-                "ews://U/Posteingang/Kunden",
-                "U/Posteingang.mbox/Kunden.mbox/Data/1/Messages/1.emlx",
-                "Posteingang/Kunden",
-            ),
-            (
-                "imap://U/Sent%20Mail",
-                "U/Sent Mail.mbox/Data/1/Messages/1.emlx",
-                "Sent Mail",
-            ),
-        ],
-    )
-    def test_both_sides_agree(self, url, rel, expected):
-        from_url, from_disk = self._both(url, rel)
+        _, from_disk = _infer_account_mailbox(
+            mail_dir / rel.format(g=self.GUID), mail_dir
+        )
         assert from_url == expected
         assert from_disk == expected, (
-            "the disk walk and the Envelope Index disagree on the "
-            "mailbox name — the stable-id lookup keys on it"
+            "the disk walk and the Envelope Index disagree — the "
+            "stable-id lookup keys on this name"
         )

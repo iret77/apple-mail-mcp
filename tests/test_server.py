@@ -5353,3 +5353,21 @@ class TestOneSpellingOfTheHeaderWhicheverStrategyAnswered:
             out = await srv.get_email(1)
 
         assert out["message_id"] == "<a@b>"
+
+
+class TestAMissingAccountIsNamedInTheListingError:
+    """ "does not exist in account None" reads like a corrupted request.
+    Reported from the field twice — the write path was fixed in 0.20.2,
+    this one sits in the listing path and was missed."""
+
+    def test_no_none_in_the_message(self):
+        import inspect
+
+        from apple_mail_mcp import server
+
+        src = inspect.getsource(server.get_emails)
+        assert "does not exist in account " not in src, (
+            "the account is interpolated straight into the text; with "
+            "no account given that prints 'account None'"
+        )
+        assert "the default account" in src

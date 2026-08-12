@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.4] - 2026-08-11
+
+**Behebt eine Regression aus 0.20.2.** Wer 0.20.2 oder 0.20.3
+installiert hat, sollte wechseln — dort lieferte `get_emails()` für
+JEDE Zeile `message_id: null`, und der von `get_email()` gemeldete
+`mailbox`-Wert war für Schreibaufrufe unbrauchbar.
+
+> **Nach dem Update `refresh_index()` aufrufen.** Der erste Lauf ist
+> groß: die unter 0.20.2/0.20.3 geschriebenen Zeilen tragen einen
+> falschen Mailbox-Namen und werden komplett ersetzt.
+
+### Fixed
+- **Der Mailbox-Name schluckte Apples GUID-Verzeichnis.** Das echte
+  Layout ist `<mailbox>.mbox/<GUID>/Data/…`; die Änderung aus 0.20.2
+  sammelte jede Komponente bis `Data` und schrieb deshalb
+  `INBOX/D85A1046-…` in den Index, wo `INBOX` hingehört. Zwei Folgen,
+  beide aus dem Feld gemeldet:
+  - Der stabile Header wird über `(account, mailbox, id)`
+    nachgeschlagen — der Envelope Index sagt `INBOX`, der Index sagte
+    `INBOX/D85A1046-…`. **Jede** Zeile **jeder** Auflistung kam mit
+    `message_id: null` zurück, unabhängig vom Alter der Nachricht.
+  - `get_email()` gab denselben Namen als `mailbox` heraus. Zurück an
+    `set_flag()` gereicht — der Weg, den die Tool-Doku empfiehlt —
+    scheiterte er mit "No mailbox matching".
+
+  Ursache der Ursache: die Testfixtures für 0.20.2 waren **erfunden**.
+  Sie beschrieben ein Layout ohne GUID-Verzeichnis, das ich nie an
+  einem echten Mail-Verzeichnis geprüft hatte. Die neuen Fixtures
+  benutzen Pfade aus einem realen Postfach und sind als solche
+  markiert; der Fall "Untermailbox" ist ausdrücklich als unbelegt
+  gekennzeichnet.
+- Eine nicht existierende Mailbox ohne `account` meldet nicht mehr
+  "does not exist in account None". Der Schreibpfad war in 0.20.2
+  behoben, dieser Lesepfad übersehen.
+
 ## [0.20.3] - 2026-08-11
 
 Aus der Nachuntersuchung des gemeldeten `message_id: null`. Die Ursache

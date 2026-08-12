@@ -1355,17 +1355,32 @@ def _infer_account_mailbox(emlx_path: Path, mail_dir: Path) -> tuple[str, str]:
         # Message-ID for every message in a nested mailbox — and no
         # sync repairs it, because the row is indexed, just under a
         # name nothing asks for.
+        # The name ends at the first component that is NOT a `.mbox`.
+        #
+        # Apple puts a GUID directory between the mailbox and its data:
+        #   <account>/INBOX.mbox/D85A1046-…-881E/Data/1/Messages/1.emlx
+        # Collecting everything up to `Data` therefore swallowed that
+        # GUID into the name ("INBOX/D85A1046-…"), which matched nothing
+        # in Mail and matched nothing the Envelope Index derives from
+        # the mailbox URL. Every stable-id lookup missed, and the value
+        # handed to a caller could not be passed back to a write.
+        #
+        # A `.mbox` directly inside another `.mbox` is a submailbox and
+        # keeps both segments. That branch is kept for the Envelope
+        # Index's own nested form (`Archiv/2026`) but is NOT verified
+        # against a real Mail directory — unlike the GUID case above,
+        # which came from one.
         mailbox = "Unknown"
         components: list[str] = []
         saw_mbox = False
         for part in parts[1:]:
-            if part == "Data":
-                break
             if part.endswith(".mbox"):
-                saw_mbox = True
                 components.append(part[:-5])
-            else:
-                components.append(part)
+                saw_mbox = True
+                continue
+            if saw_mbox:
+                break  # the GUID directory, or `Data`
+            components.append(part)  # a plain parent above the .mbox
         # Without a single `.mbox` this is not a mailbox path at all —
         # naming it after some directory would invent a location.
         if saw_mbox and components:

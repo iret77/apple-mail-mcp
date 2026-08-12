@@ -2087,9 +2087,17 @@ async def get_emails(
             # the answer. Pass it through instead of flattening it into
             # a bare "not found".
             available = raw.split("Available:", 1)[-1].strip()
+            # `None` is not an account name. When no account was given
+            # the message has to name the default, or it reads like a
+            # corrupted request.
+            where = (
+                repr(target_account)
+                if target_account
+                else "the default account"
+            )
             raise ValueError(
-                f"Mailbox {target_mailbox!r} does not exist in account "
-                f"{target_account!r}. This account's mailboxes are: "
+                f"Mailbox {target_mailbox!r} does not exist in "
+                f"{where}. This account's mailboxes are: "
                 f"{available}. Call list_mailboxes() and pass one of "
                 f"these as `mailbox`; Mail names them in the system "
                 f"language, so the English default may not apply here."
