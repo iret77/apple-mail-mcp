@@ -1420,8 +1420,19 @@ async def _apply_write(
         # placed the message, which accounts were searched, or whether
         # the reference arrived in the shape the caller intended.
         header_groups = [g for g in by_header]
+        # EVERY account that was actually attempted, not just the ones a
+        # header was searched in. Built from the header groups alone,
+        # this came back empty for a numeric id while a scan had walked
+        # the default account's mailboxes — the field said "nothing was
+        # searched" about a search that had happened, which is the one
+        # thing diagnostics must never do. `None` means the default
+        # account: name it rather than print a null.
+        attempted = [
+            g.get("account") or "the default account"
+            for g in (*header_groups, *located, *scan)
+        ]
         result["diagnostics"] = {
-            "accounts_searched": [g.get("account") for g in header_groups],
+            "accounts_searched": sorted(dict.fromkeys(attempted)),
             "mailboxes_preferred": sorted(
                 {
                     mb
@@ -1470,6 +1481,18 @@ async def _apply_write(
                 "index may name it differently than Mail does. Retry with "
                 "the Message-ID instead of the numeric id, which searches "
                 "by header rather than by mailbox name."
+            )
+        elif "could not cover every mailbox" in blob:
+            # The script already said the precise thing. Blaming
+            # Automation here sent the caller into System Settings for
+            # a permission that is usually fine: Mail simply refuses
+            # some mailboxes (Drafts and Junk answer -1728), and a scan
+            # that skipped one has not established absence.
+            cause = (
+                "Some mailboxes could not be read during the scan, so "
+                "this is NOT a statement that the message is gone. Pass "
+                "`account` and `mailbox` to address it directly, or use "
+                "its `message_id` header, which is searched everywhere."
             )
         elif "-1743" in blob or "not authorized" in blob:
             cause = (
@@ -2814,6 +2837,22 @@ class AttachmentContent(TypedDict, total=False):
     links: list[LinkResult]
 
 
+def _normalize_message_ref(value: int | str) -> int | str:
+    """One reference, through the same door as a batch.
+
+    `get_email` normalizes its reference; the attachment and link
+    readers did not — so the same message was found by one tool and not
+    by the next. Two client habits broke them, both handled here:
+
+    - MCP clients stringify numbers, and `"140295"` read as a
+      Message-ID header resolves to nothing.
+    - Some clients HTML-escape the brackets, so `<a@b>` arrives as
+      `&lt;a@b&gt;` — a header nothing can match, and the error then
+      echoed the escaped form, which made it look like a display bug.
+    """
+    return _normalize_message_ids(value)[0]
+
+
 async def _resolve_emlx_path(
     message_id: int | str,
     account: str | None = None,
@@ -3005,6 +3044,9 @@ async def get_email_links(
         >>> get_email_links(12345)
         {"links": [{"url": "https://...", "text": "Click"}]}
     """
+    # Same door as the batch tools: a stringified number is an id, and
+    # HTML-escaped brackets are still brackets.
+    message_id = _normalize_message_ref(message_id)
     emlx_path = await _resolve_emlx_path(message_id, account, mailbox)
     from .index.disk import get_email_links as _get_links
 
@@ -3051,6 +3093,9 @@ async def get_email_attachment(
     except Exception:
         pass
 
+    # Same door as the batch tools: a stringified number is an id, and
+    # HTML-escaped brackets are still brackets.
+    message_id = _normalize_message_ref(message_id)
     emlx_path = await _resolve_emlx_path(message_id, account, mailbox)
     from .index.disk import get_attachment_content
 

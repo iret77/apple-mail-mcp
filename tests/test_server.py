@@ -5371,3 +5371,68 @@ class TestAMissingAccountIsNamedInTheListingError:
             "no account given that prints 'account None'"
         )
         assert "the default account" in src
+
+
+class TestEverySingleReferenceToolTakesTheSameForms:
+    """`get_email` normalized its reference; the attachment and link
+    readers did not. The same message was therefore found by one tool
+    and not by the next — `get_email_attachment` failed on EVERY
+    message, because MCP clients stringify numbers and some HTML-escape
+    the angle brackets. Reported from the field: "Email '140295' not
+    found in index", while get_email, set_flag and search found it."""
+
+    def _index_with(self, tmp_path, mid=140295, header="<a@b>"):
+        from apple_mail_mcp.index.manager import IndexManager
+
+        m = IndexManager(db_path=tmp_path / "i.db")
+        m._get_conn().execute(
+            "INSERT INTO emails (message_id, account, mailbox, subject,"
+            " emlx_path, rfc822_message_id) VALUES (?,?,?,?,?,?)",
+            (mid, "U", "INBOX", "s", str(tmp_path / "m.emlx"), header),
+        )
+        m._get_conn().commit()
+        return m
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "ref",
+        [140295, "140295", "<a@b>", "a@b", "&lt;a@b&gt;"],
+        ids=["int", "stringified-int", "header", "bare-header", "escaped"],
+    )
+    async def test_the_resolver_accepts_every_form(self, tmp_path, ref):
+        from unittest.mock import AsyncMock, patch
+
+        import apple_mail_mcp.server as srv
+
+        m = self._index_with(tmp_path)
+        (tmp_path / "m.emlx").write_text("stub")
+
+        parsed = type("P", (), {"message_id_header": "<a@b>"})()
+        with (
+            patch.object(srv, "_get_index_manager", return_value=m),
+            patch.object(
+                srv, "_excluded_account_uuids", AsyncMock(return_value=set())
+            ),
+            patch.object(srv, "_hidden_account", return_value=False),
+            patch.object(srv, "_excluded_account_names", return_value=set()),
+            patch("apple_mail_mcp.index.disk.parse_emlx", return_value=parsed),
+        ):
+            got = await srv._resolve_emlx_path(
+                srv._normalize_message_ref(ref), None, None
+            )
+        assert got == tmp_path / "m.emlx"
+
+    def test_both_readers_normalize_before_resolving(self):
+        """The guard: a future reader that forgets this is the bug
+        again, and it is invisible to every mocked test."""
+        import inspect
+
+        from apple_mail_mcp import server
+
+        for tool in (server.get_email_links, server.get_email_attachment):
+            src = inspect.getsource(tool)
+            assert "_normalize_message_ref(" in src, (
+                f"{tool.__name__} resolves a reference without "
+                f"normalizing it — a stringified id or escaped brackets "
+                f"will not be found"
+            )

@@ -3504,3 +3504,100 @@ class TestANumericStringIsAnIdNotAHeader:
         from apple_mail_mcp.server import _normalize_message_ids
 
         assert _normalize_message_ids([150540, "150540"]) == [150540]
+
+
+class TestTheDiagnosticsReportTheSearchThatHappened:
+    """`accounts_searched` was built from the header groups alone, so a
+    numeric id came back with an EMPTY list while a scan had just
+    walked the default account's mailboxes. The field said "nothing was
+    searched" about a search that had happened — the one thing
+    diagnostics must never do. Reported from the field."""
+
+    @pytest.mark.asyncio
+    async def test_a_scanned_account_appears_in_the_diagnostics(self):
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = False  # nothing placed -> scan
+        mgr.count_email_locations.return_value = 0
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value=None),  # the default account
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                return_value={
+                    "updated": [],
+                    "not_found": [7],
+                    "scan_unreadable": 1,
+                },
+            ),
+        ):
+            out = await _apply_write(
+                [7], None, None, lambda g: WriteBuilder.set_read(g, True)
+            )
+
+        searched = out["diagnostics"]["accounts_searched"]
+        assert searched, "a scan ran but the diagnostics reported none"
+        assert "the default account" in searched
+        assert None not in searched, "a null is not an account name"
+
+
+class TestAnIncompleteScanIsNotAnAutomationProblem:
+    """The generic hint sent the caller into System Settings for a
+    permission that is usually fine. Mail simply refuses some mailboxes
+    (Drafts and Junk answer -1728) — and the script already said the
+    precise thing. Reported from the field."""
+
+    @pytest.mark.asyncio
+    async def test_the_hint_names_the_incomplete_scan(self):
+        from apple_mail_mcp.builders import WriteBuilder
+        from apple_mail_mcp.server import _apply_write
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = False
+        mgr.count_email_locations.return_value = 0
+
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=_mock_acct_map(),
+            ),
+            patch(
+                "apple_mail_mcp.server._resolve_visible_account",
+                AsyncMock(return_value="Work"),
+            ),
+            patch(
+                "apple_mail_mcp.server.execute_with_core_async",
+                return_value={
+                    "updated": [],
+                    "failures": [
+                        {
+                            "target": 7,
+                            "reason": "the scan could not cover every "
+                            "mailbox of Work, so this id was not looked "
+                            "for everywhere",
+                        }
+                    ],
+                    "scan_unreadable": 1,
+                },
+            ),
+        ):
+            out = await _apply_write(
+                [7], None, None, lambda g: WriteBuilder.set_read(g, True)
+            )
+
+        hint = out["hint"].lower()
+        assert "could not be read" in hint or "not a statement" in hint
+        assert "automation" not in hint, (
+            "an unreadable mailbox was blamed on Automation permission"
+        )

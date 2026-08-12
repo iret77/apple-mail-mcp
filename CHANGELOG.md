@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.5] - 2026-08-12
+
+Aus dem Health-Check gegen 0.20.4. Die drei Regressionen von zuvor
+waren nicht mehr reproduzierbar; dafür stand ein Tool still, das seit
+längerem niemand mit einem stringifizierten Bezug aufgerufen hatte.
+
+### Fixed
+- **`get_email_attachment()` und `get_email_links()` fanden gar
+  nichts.** Beide lösen ihre Referenz auf, ohne sie zu normalisieren —
+  `get_email` tut es, die beiden nicht. Damit brachen zwei ganz normale
+  Client-Gewohnheiten sie vollständig:
+  - MCP-Clients stringifizieren Zahlen. `"140295"` wurde als
+    Message-ID-Header gelesen und fand nichts.
+  - Manche Clients maskieren die spitzen Klammern, `<a@b>` kommt als
+    `&lt;a@b&gt;` an — ein Header, den nichts trifft. Die Fehlermeldung
+    gab dann die maskierte Form zurück, was wie ein Anzeigefehler
+    aussah, aber die Ursache war.
+
+  Beide Tools gehen jetzt durch dieselbe Tür wie die Batch-Tools. Ein
+  Test prüft alle fünf Formen (int, stringifizierte Zahl, Header mit
+  und ohne Klammern, maskiert), ein zweiter verbietet einem künftigen
+  Leser, die Normalisierung wieder zu vergessen.
+- **`accounts_searched` meldete eine leere Liste, obwohl gesucht
+  wurde.** Das Feld entstand nur aus den Header-Gruppen; bei einer
+  numerischen ID lief ein Scan über die Mailboxen des Standard-Kontos,
+  und die Diagnose behauptete, es sei nichts durchsucht worden. Genau
+  das dürfen Diagnosefelder nie. Jetzt stehen alle tatsächlich
+  angefassten Konten drin, und `null` wird als "the default account"
+  benannt.
+- **Ein unvollständiger Scan wurde der Automation-Berechtigung
+  angelastet.** Der generische Hinweis schickte Aufrufer in die
+  Systemeinstellungen für eine Berechtigung, die meist in Ordnung ist —
+  Mail verweigert schlicht einzelne Mailboxen (Drafts und Junk
+  antworten mit -1728). Der Hinweis sagt jetzt, was das Skript ohnehin
+  schon gemeldet hatte.
+
+### Tests
+- Die Selbstheilung eines unter 0.20.2/0.20.3 geschriebenen Index ist
+  jetzt ein Test mit echten Dateien statt einer Behauptung in den
+  Release Notes: eine Zeile mit `INBOX/<GUID>` wird beim nächsten Sync
+  durch `INBOX` ersetzt.
+
 ## [0.20.4] - 2026-08-11
 
 **Behebt eine Regression aus 0.20.2.** Wer 0.20.2 oder 0.20.3

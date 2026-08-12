@@ -467,3 +467,44 @@ class TestOversizedIsRecordedEvenAtTheCap:
         assert [r[0] for r in rows] == ["too_large"], (
             "the oversized message vanished because the mailbox was capped"
         )
+
+
+class TestAnIndexWrittenWithGuidNamesHealsItself:
+    """0.20.2/0.20.3 wrote `INBOX/<GUID>` where `INBOX` belongs. The
+    release notes promise the next sync repairs that — a claim worth a
+    test, since two of the last three defects were unverified claims."""
+
+    def test_the_next_sync_replaces_the_poisoned_row(self, tmp_path):
+        from apple_mail_mcp.index.manager import IndexManager
+        from apple_mail_mcp.index.sync import sync_from_disk
+
+        guid = "D85A1046-EE7C-422F-99AD-8B1BCA92881E"
+        mail = tmp_path / "V10"
+        msgs = mail / "UUID-A" / "INBOX.mbox" / guid / "Data" / "1" / "Messages"
+        msgs.mkdir(parents=True)
+        (msgs / "4711.emlx").write_text(
+            "120\nFrom: a@b\nSubject: Test\nMessage-ID: <t@x>\n\nBody\n"
+        )
+
+        manager = IndexManager(db_path=tmp_path / "i.db")
+        conn = manager._get_conn()
+        conn.execute(
+            "INSERT INTO emails (message_id, account, mailbox, subject,"
+            " emlx_path, rfc822_message_id) VALUES (?,?,?,?,?,?)",
+            (
+                4711,
+                "UUID-A",
+                f"INBOX/{guid}",  # what 0.20.2/0.20.3 wrote
+                "Test",
+                str(msgs / "4711.emlx"),
+                "<t@x>",
+            ),
+        )
+        conn.commit()
+
+        sync_from_disk(conn, mail)
+
+        names = [r[0] for r in conn.execute("SELECT mailbox FROM emails")]
+        assert names == ["INBOX"], (
+            f"the poisoned row survived the sync: {names}"
+        )
