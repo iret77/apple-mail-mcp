@@ -138,3 +138,15 @@ silently using degraded config.
 2. **Mail.app is busy.** If Mail is syncing or processing rules, JXA calls may time out. Wait and retry.
 
 3. **macOS permission prompt.** The first time `osascript` accesses Mail, macOS may show a permission dialog. Check for any pending prompts.
+
+## Verifying a release yourself
+
+Before trusting a build with your own mail — or before handing it to
+someone else — run the [Health Check](health-check.md). It is a
+protocol you paste into a fresh Claude Desktop session; it exercises
+every tool against your real mailbox and touches exactly one message,
+reversibly.
+
+The automated test suite never talks to Apple Events: the JXA scripts
+run in node against stubs. That check is the part which cannot be
+automated away from a Mac.
