@@ -1358,9 +1358,9 @@ def _infer_account_mailbox(emlx_path: Path, mail_dir: Path) -> tuple[str, str]:
         # The name ends at the first component that is NOT a `.mbox`.
         #
         # Apple puts a GUID directory between the mailbox and its data:
-        #   <account>/INBOX.mbox/D85A1046-…-881E/Data/1/Messages/1.emlx
+        #   <account>/INBOX.mbox/00000000-…/Data/1/Messages/1.emlx
         # Collecting everything up to `Data` therefore swallowed that
-        # GUID into the name ("INBOX/D85A1046-…"), which matched nothing
+        # GUID into the name ("INBOX/00000000-…"), which matched nothing
         # in Mail and matched nothing the Envelope Index derives from
         # the mailbox URL. Every stable-id lookup missed, and the value
         # handed to a caller could not be passed back to a write.

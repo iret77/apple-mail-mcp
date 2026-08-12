@@ -62,11 +62,11 @@ JEDE Zeile `message_id: null`, und der von `get_email()` gemeldete
 - **Der Mailbox-Name schluckte Apples GUID-Verzeichnis.** Das echte
   Layout ist `<mailbox>.mbox/<GUID>/Data/…`; die Änderung aus 0.20.2
   sammelte jede Komponente bis `Data` und schrieb deshalb
-  `INBOX/D85A1046-…` in den Index, wo `INBOX` hingehört. Zwei Folgen,
+  `INBOX/00000000-…` in den Index, wo `INBOX` hingehört. Zwei Folgen,
   beide aus dem Feld gemeldet:
   - Der stabile Header wird über `(account, mailbox, id)`
     nachgeschlagen — der Envelope Index sagt `INBOX`, der Index sagte
-    `INBOX/D85A1046-…`. **Jede** Zeile **jeder** Auflistung kam mit
+    `INBOX/00000000-…`. **Jede** Zeile **jeder** Auflistung kam mit
     `message_id: null` zurück, unabhängig vom Alter der Nachricht.
   - `get_email()` gab denselben Namen als `mailbox` heraus. Zurück an
     `set_flag()` gereicht — der Weg, den die Tool-Doku empfiehlt —

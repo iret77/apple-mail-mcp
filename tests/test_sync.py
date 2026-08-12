@@ -478,7 +478,7 @@ class TestAnIndexWrittenWithGuidNamesHealsItself:
         from apple_mail_mcp.index.manager import IndexManager
         from apple_mail_mcp.index.sync import sync_from_disk
 
-        guid = "D85A1046-EE7C-422F-99AD-8B1BCA92881E"
+        guid = "00000000-0000-0000-0000-000000000000"
         mail = tmp_path / "V10"
         msgs = mail / "UUID-A" / "INBOX.mbox" / guid / "Data" / "1" / "Messages"
         msgs.mkdir(parents=True)

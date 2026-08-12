@@ -1973,19 +1973,23 @@ class TestTheMailboxNameStopsAtTheGuidDirectory:
     assumed the layout was. Apple actually puts a GUID directory
     between the mailbox and its data:
 
-        <account>/INBOX.mbox/D85A1046-EE7C-422F-99AD-8B1BCA92881E/Data/…
+        <account>/INBOX.mbox/00000000-0000-0000-0000-000000000000/Data/…
 
     Collecting every component up to `Data` swallowed that GUID into
-    the name. The index then stored `INBOX/D85A1046-…` while the
+    the name. The index then stored `INBOX/00000000-…` while the
     Envelope Index derives `INBOX` from the mailbox URL, so EVERY
     stable-id lookup missed (`message_id: null` on every row of every
     listing), and the mailbox value handed to a caller could not be
     passed back to `set_flag` — Mail has no such mailbox.
 
-    The paths marked REAL below were taken from a live Mail directory
-    (via `failed_parse_examples` in a field report). The nested case is
-    kept for the Envelope Index's own `Archiv/2026` form and is
-    explicitly NOT verified against a real Mail directory.
+    The layout below — a GUID directory between `<mailbox>.mbox` and
+    `Data` — was confirmed against a live Mail directory in a field
+    report. The GUID itself is the nil UUID here on purpose: the real
+    one identifies somebody's machine and has no business in a public
+    repository. Only its SHAPE matters to the code under test.
+
+    The nested case is kept for the Envelope Index's own `Archiv/2026`
+    form and is explicitly NOT verified against a real Mail directory.
     """
 
     def _name(self, rel: str) -> str:
@@ -1996,15 +2000,15 @@ class TestTheMailboxNameStopsAtTheGuidDirectory:
         mail_dir = Path("/Users/x/Library/Mail/V10")
         return _infer_account_mailbox(mail_dir / rel, mail_dir)[1]
 
-    GUID = "D85A1046-EE7C-422F-99AD-8B1BCA92881E"
+    GUID = "00000000-0000-0000-0000-000000000000"
 
-    def test_real_layout_inbox(self):
+    def test_confirmed_layout_inbox(self):
         assert (
             self._name(f"U/INBOX.mbox/{self.GUID}/Data/1/Messages/1.emlx")
             == "INBOX"
         )
 
-    def test_real_layout_drafts(self):
+    def test_confirmed_layout_drafts(self):
         assert (
             self._name(f"U/Drafts.mbox/{self.GUID}/Data/1/Messages/1.emlx")
             == "Drafts"
@@ -2049,7 +2053,7 @@ class TestTheTwoSidesAgreeOnTheMailboxName:
     the listing path looks the stable header up by
     (account, mailbox, id), so any disagreement loses it."""
 
-    GUID = "D85A1046-EE7C-422F-99AD-8B1BCA92881E"
+    GUID = "00000000-0000-0000-0000-000000000000"
 
     @pytest.mark.parametrize(
         ("url", "rel", "expected"),
