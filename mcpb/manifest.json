@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "apple-mail-mcp",
   "display_name": "Read and Write Apple Mail",
-  "version": "0.20.5",
+  "version": "0.20.6",
   "description": "Fast Apple Mail access for Claude — full-coverage FTS5 body search, disk-first reads, plus flag/color and read/unread write tools.",
   "long_description": "Apple Mail MCP gives Claude fast, reliable access to your macOS Mail: full-coverage FTS5 body search (no recency cap), ~3ms disk-first single-email reads via .emlx parsing, and batch listing across accounts and mailboxes. This build also adds the first write tools — flag/unflag single emails or batches with Apple Mail's seven flag colors, and mark messages read (seen) or unread (unseen). Write tools return per-id result buckets so a batch never fails as a whole, and honor read-only mode and account-exclusion boundaries. The bundle is a thin launcher: it runs the Python server via `uvx` (uv required) and fetches the code from the public GitHub fork, so no Python is bundled. This is a fork of imdinu/apple-mail-mcp (GPL-3.0) tracking the write-ops branch; not affiliated with or endorsed by Apple Inc.",
   "author": {
@@ -83,6 +83,12 @@
       "description": "Check for a newer build once a day when the extension starts. Failures never block startup — the last working build is used.",
       "default": true
     },
+    "auto_install_uv": {
+      "type": "boolean",
+      "title": "Install uv automatically",
+      "description": "On first run, if the required 'uv' helper is missing, install it automatically into ~/.apple-mail-mcp/bin (no admin rights, no PATH changes). Turn off in locked-down/managed setups — the extension then shows in-app instructions to install uv by hand instead of installing it.",
+      "default": true
+    },
     "auto_build_index": {
       "type": "boolean",
       "title": "Build the search index automatically",
@@ -127,6 +133,7 @@
       ],
       "env": {
         "APPLE_MAIL_MCP_AUTO_UPDATE": "${user_config.auto_update}",
+        "APPLE_MAIL_MCP_AUTO_INSTALL_UV": "${user_config.auto_install_uv}",
         "APPLE_MAIL_INDEX_AUTO_BUILD": "${user_config.auto_build_index}",
         "APPLE_MAIL_READ_ONLY": "${user_config.read_only}",
         "APPLE_MAIL_DEFAULT_ACCOUNT": "${user_config.default_account}",

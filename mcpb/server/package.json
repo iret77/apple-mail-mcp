@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Marks index.js as an ES module. The launcher shim uses `import` and top-level `await`; without this file Node only treats a bare .js as ESM on >=20.17/22.7 (auto-detect), so on Claude Desktop's older bundled Node (the manifest allows >=18) `node server/index.js` throws 'Cannot use import statement outside a module' and the server exits before it starts. This makes it ESM on every supported Node."
+}
