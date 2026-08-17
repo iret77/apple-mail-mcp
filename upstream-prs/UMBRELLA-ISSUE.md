@@ -62,7 +62,7 @@ arrives with no diagnostic channel. These give it one.
 | B2 · `get_index_status()` | State, progress, whether `~/Library/Mail` is readable (the Full Disk Access check), DLQ counts and examples, and actionable `next_steps`. |
 | B3 · `refresh_index()` | Sync on demand; `full=True` rebuilds in the background. Reports `already_running` / `failed` instead of a blind "started". |
 | B4 · server log file | Rotating log at `~/.apple-mail-mcp/server.log`, kept `0600` even after rotation. |
-| B5 · optional auto-build | Build the index on first `serve` when none exists; opt-in, default `false` (a product decision, not a bug fix). |
+| B5 · optional auto-build | Build the index on first `serve` when none exists, behind an `auto_build` flag. The default is a product call: `false` for a plain PyPI/CLI install (don't walk `~/Library/Mail` unasked), but `true` if you adopt E1, since a one-click desktop user expects indexing to work without a separate `apple-mail-mcp index` run. Our fork ships `true`, paired with the `.mcpb`, for exactly that reason, so E1 and this default come as a set. |
 
 ## Track C: writing, and stable identity
 
