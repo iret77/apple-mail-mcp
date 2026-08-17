@@ -73,7 +73,8 @@ upstream branch is cut mechanically rather than from memory.
 
 | Item | Where | Why |
 |---|---|---|
-| `mcpb/`, `scripts/build-mcpb.sh`, `dist/`, `upstream-prs/`, this file | fork branches | fork distribution and PR prep; `strip` drops them |
+| `scripts/build-mcpb.sh`, `dist/`, `upstream-prs/`, this file | fork branches | fork distribution and PR prep; `strip` drops them |
+| `mcpb/` (fork-specific parts) | fork branches | the auto-update / revision-stamp wiring stays fork-only — but the **generic** one-click bundle is offered upstream as **E1** (Track E), stamps stripped |
 | `install_mode`, `source_ref`, `APPLE_MAIL_MCP_LAUNCHER`, `APPLE_MAIL_MCP_REF` | server.py | describes our bundle launcher |
 | `SERVER_REVISION` | server.py | our build stamp; upstream ships via PyPI, where the package version answers it |
 | The `.mcpb` paragraph in the README | README.md | fork-specific |

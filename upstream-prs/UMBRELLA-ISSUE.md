@@ -16,22 +16,23 @@ A few ground rules we're holding ourselves to:
 - **No PR touches `CHANGELOG.md` / `pyproject.toml` / `server.json`** — the
   release number and changelog placement are yours. Changelog prose ships in each
   PR body, ready to paste.
-- Fork-only distribution bits (a `.mcpb` desktop bundle, build stamps) are
-  stripped out and never appear in a PR.
+- Fork-specific bits (build/revision stamps, our auto-update launcher wiring) are
+  stripped out and never appear in a PR. The `.mcpb` install bundle *itself* we'd
+  love to contribute though — see **Track E** — just without those stamps.
 
-### On #106 (single-writer lock) — one small hardening we'd offer
+### On #106 (single-writer lock) — a robustness fix for your IndexLock (A8)
 
-We independently hit #106 before your `0.4.3` and shipped our own lock; now that
-you've solved it with `IndexLock`, we're **not** proposing our implementation.
-One thing we found and fixed that `IndexLock.try_acquire()` doesn't yet handle:
-it treats **any** `OSError` from `flock` as "held" and returns `False`. On a
-filesystem that can't lock (some network / FUSE homes answer `ENOLCK` /
-`ENOTSUP`) that makes the index **permanently unwritable** — every retry reads as
-contention forever — and an `os.open` failure on a read-only home isn't caught at
-all. We'd gladly send a small PR (**A8**, below) that distinguishes genuine
-contention (`EWOULDBLOCK` / `EAGAIN` / `EACCES` → not the writer) from an
-unlockable filesystem (degrade to single-process with a warning, don't wedge).
-Everything else below is orthogonal to the lock.
+Here we **are** proposing something. We hit #106 independently before your
+`0.4.3` and shipped our own lock; you've since solved it with `IndexLock`, so
+we're not asking you to swap that out. But your `IndexLock.try_acquire()` has a
+real robustness bug we'd like to fix: it treats **any** `OSError` from `flock` as
+"held" and returns `False`. On a filesystem that can't lock (some network / FUSE
+homes answer `ENOLCK` / `ENOTSUP`) that makes the index **permanently
+unwritable** — every retry reads as contention forever — and an `os.open` failure
+on a read-only home isn't caught at all. **A8** (below) distinguishes genuine
+contention (`EWOULDBLOCK` / `EAGAIN` / `EACCES`) from an unlockable filesystem
+(degrade to single-process with a warning, don't wedge). Small, and against your
+own code.
 
 ---
 
@@ -84,6 +85,15 @@ guards nothing — track C gives it something to guard.
 | **D2** cross-account listing | `get_emails(account="all")` lists across every visible account in one call; exclusions still hold by UUID. |
 | **D3** mailbox pagination | `get_emails(before=, after=, offset=)` makes a mailbox walkable backwards — otherwise only the newest N are reachable. |
 
+## Track E — install UX
+
+The single biggest friction for a non-technical user today is setup: installing
+`uv`/`pip` and hand-editing `claude_desktop_config.json`. This removes it.
+
+| Unit | Adds |
+|---|---|
+| **E1** one-click Claude Desktop install (`.mcpb`) | A double-click desktop-extension bundle (`manifest_version 0.3`) — the user installs by opening the file, no `uv`/`pip` and no JSON editing. A small Node launcher boots the Python server and **self-heals a missing `uv`** (fetches it, or explains clearly instead of failing silently). We'd contribute a **generic** bundle; our fork-specific auto-update / build-revision tracking stays on the fork. This is, in practice, the change that makes the server usable for people who aren't comfortable at a terminal. |
+
 ---
 
 ### What we'd like from you
@@ -92,9 +102,10 @@ Just tell us **which units (or whole tracks) you want as PRs** — and whether y
 prefer them fine-grained (one per unit) or bundled per track. Our suggested first
 wave, if you want a starting point: **A1, A3, A4, A9, A11** — small, low-risk,
 each reviewable in minutes, and A9/A11 in particular make the server usable on
-localized and nested-mailbox setups.
+localized and nested-mailbox setups. **E1** (one-click install) is the highest
+user-facing impact if you'd like to start there instead.
 
-Every unit is already prepared on a branch in the fork with tests passing
-(`ruff check` / `ruff format --check` / `pytest`); once you say the word we open
-exactly the ones you want, rebased on your current `main`. Happy to adjust
-scope, split, or drop any of them.
+Each unit is implemented and tested on the fork; on your word we open exactly the
+ones you want as a focused PR, **freshly rebased on your current `main`** (not a
+stale branch), with `ruff check` / `ruff format --check` / `pytest` green. Happy
+to adjust scope, split, or drop any of them.
