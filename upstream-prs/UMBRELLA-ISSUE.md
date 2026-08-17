@@ -103,7 +103,8 @@ fixes, with A9 and A11 making the server work on localized and nested-mailbox
 setups. If you'd rather lead with user impact, E1 (one-click install) is the
 largest.
 
-Each unit is implemented and tested on the fork. On your word we open the ones
-you want as focused PRs, freshly rebased on your current `main`, with
-`ruff check`, `ruff format --check`, and `pytest` green. Glad to split, rescope,
+Each unit is implemented and tested on the fork (A8 targets your `IndexLock` and
+E1 is a clean extraction of our bundle, both of which we'd prepare fresh). On
+your word we open the ones you want as focused PRs, freshly rebased on your
+current `main`, with `ruff check`, `ruff format --check`, and `pytest` green. Glad to split, rescope,
 or drop any of them.
