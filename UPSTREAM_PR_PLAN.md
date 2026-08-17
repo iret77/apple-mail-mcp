@@ -19,10 +19,17 @@ because the old one drifted:
    is active. `upstream-prs/UMBRELLA-ISSUE.md` carries the unit map and asks
    which units they want; we open exactly those, each a focused diff against
    current `main`, when they say so. We do **not** pre-stage 22 branches to rot.
-4. **#106 / A8 is withdrawn.** Upstream shipped its own single-writer `IndexLock`
-   in 0.4.3. Our fork solved #106 earlier and more completely (WriteLock +
-   rollback + per-thread connections + event ring); we keep ours on the fork
-   (the 0.4.3 merge is `-s ours`) and simply **do not offer A8**.
+4. **#106 / A8 — keep ours, offer a hardening PR.** Upstream shipped its own
+   `IndexLock` in 0.4.3. Adopting it *verbatim* is impossible for us: our
+   `refresh_index(full=True)` (B3) rebuilds while the watcher writes, a
+   concurrency upstream avoids by ordering sync-then-watch and having no
+   on-demand rebuild — their `index_writer` role does not serialize it, so a
+   verbatim swap would corrupt our index. So we **keep our `WriteLock`** on the
+   fork (the 0.4.3 merge is `-s ours`). We do **not** offer our lock, but we
+   *do* offer **A8 reborn**: a small PR hardening *their* `IndexLock` against a
+   non-lockable filesystem (it currently wedges the index permanently) — the one
+   thing our #106 work still contributes. See `upstream-prs/A8-harden-index-lock.md`.
+   Alignment happens by contributing up, not by downgrading our product.
 
 Everything below documents the individual units. Read it as the catalog, not as
 a list of long-lived branches to maintain.
@@ -93,7 +100,7 @@ surface; all repair demonstrably broken behaviour.
 | A5 | `fix/sync-transaction-rollback` | `manager.py` | ⊘ |
 | A6 | `fix/per-thread-connections` | `manager.py` | ↑ A5 |
 | A7 | `perf/rebuild-fts-delete-all` | `manager.py` | ↑ A6 |
-| ~~A8~~ | ~~`fix/cross-process-write-lock`~~ | **WITHDRAWN** — upstream shipped its own `IndexLock` for #106 in 0.4.3. Not offered. | — |
+| A8 | `fix/harden-index-lock` (reborn) | **Against upstream's 0.4.3 `IndexLock`**, not our fork: it wedges the index on a non-lockable filesystem. Our original `fix/cross-process-write-lock` is NOT offered (we keep it on the fork). | ⊘ |
 | A9 | `fix/mailbox-roles-not-names` | `jxa/mail_core.js` | ⊘ |
 | A10 | `fix/incomplete-search-is-not-absence` | `server.py`, `builders.py` | ⊘ |
 | A11 | `fix/nested-mailbox-path` (new) | `index/disk.py` (`_infer_account_mailbox`) | ⊘ |

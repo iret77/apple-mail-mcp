@@ -19,12 +19,19 @@ A few ground rules we're holding ourselves to:
 - Fork-only distribution bits (a `.mcpb` desktop bundle, build stamps) are
   stripped out and never appear in a PR.
 
-### On #106 (single-writer lock) — already yours, not proposing it
+### On #106 (single-writer lock) — one small hardening we'd offer
 
-We independently hit and fixed the concurrent-writer index storm (#106) before
-your `0.4.3` shipped its `IndexLock`. Since **you've already solved it**, we're
-**not** proposing our version — flagging it only so the overlap is on the table
-rather than a surprise. Everything below is orthogonal to the lock.
+We independently hit #106 before your `0.4.3` and shipped our own lock; now that
+you've solved it with `IndexLock`, we're **not** proposing our implementation.
+One thing we found and fixed that `IndexLock.try_acquire()` doesn't yet handle:
+it treats **any** `OSError` from `flock` as "held" and returns `False`. On a
+filesystem that can't lock (some network / FUSE homes answer `ENOLCK` /
+`ENOTSUP`) that makes the index **permanently unwritable** — every retry reads as
+contention forever — and an `os.open` failure on a read-only home isn't caught at
+all. We'd gladly send a small PR (**A8**, below) that distinguishes genuine
+contention (`EWOULDBLOCK` / `EAGAIN` / `EACCES` → not the writer) from an
+unlockable filesystem (degrade to single-process with a warning, don't wedge).
+Everything else below is orthogonal to the lock.
 
 ---
 
@@ -39,6 +46,7 @@ rather than a surprise. Everything below is orthogonal to the lock.
 | **A5** sync rollback | An aborted sync transaction stayed open and blocked *every* later write with "database is locked". |
 | **A6** per-thread connections | A background rebuild froze the server; `threading.local` connections fix it. |
 | **A7** FTS rebuild integrity | A rebuild could leave the index with no FTS triggers, surviving restarts. Triggers restored as the first `finally` action. |
+| **A8** harden `IndexLock` | *Against your 0.4.3 code, not our fork.* `try_acquire()` treats any `flock` `OSError` as contention → a non-locking filesystem wedges the index permanently; a read-only home raises uncaught. Distinguishes real contention from an unlockable FS (degrade + warn). See the #106 note above. |
 | **A9** mailbox roles, not names | `INBOX` is a string; a German Mail has `Posteingang`, Exchange `Deleted Items`, Gmail `[Gmail]/…`. The no-arg call failed outright on a localized install. Resolves by role: exact name → Mail's `sentMailbox`/`trashMailbox`/… → normalized match → a table of localized names from Apple's own user guide → fail loudly listing what exists. |
 | **A10** incomplete search ≠ absence | A tool reported "not found" when the search was actually incomplete (a mailbox cap, an unreadable mailbox, a timeout, a denied permission — all produce the *identical* empty answer). Each scan branch now counts what it left out and says so. |
 | **A11** nested mailbox / GUID path | Path inference swallowed Apple's GUID directory into the mailbox name (`INBOX/<GUID>`) and stopped at the first `.mbox`, so a nested mailbox (`Archiv/2026`) was recorded under the wrong name. That name disagrees with the one the Envelope Index derives from the mailbox URL — **so every message in a nested mailbox lost its stable-id lookup**, and no sync repaired it. |
