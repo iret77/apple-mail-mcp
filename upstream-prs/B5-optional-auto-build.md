@@ -1,4 +1,4 @@
-**Title:** `feat: optional index auto-build on first serve (default off)`
+**Title:** `feat: optional index auto-build on first serve`
 
 **Branch:** `iret77:feat/optional-auto-build` · **Depends on:** nothing (⊘)
 
@@ -15,37 +15,41 @@ Two things, deliberately separate:
 1. **The silent case gets a voice.** With no index and no auto-build, startup now
    says so and names the command that fixes it. This part costs nothing and is
    unconditional.
-2. **`[index] auto_build` / `APPLE_MAIL_INDEX_AUTO_BUILD`, default `false`.** When
-   enabled, the first `serve` without an index kicks off `build_from_disk()` on a
-   daemon thread, so the server answers immediately and the build reports its own
-   outcome.
+2. **`[index] auto_build` / `APPLE_MAIL_INDEX_AUTO_BUILD`** (the default is a
+   product call, covered below). When enabled, the first `serve` without an index
+   kicks off `build_from_disk()` on a daemon thread, so the server answers
+   immediately and the build reports its own outcome.
 
 `_start_watcher()` moves out of the sync branch so a first build can hand over to
 it too; otherwise `--watch` quietly does nothing on a fresh install.
 
 ### Worth pushing back on — this is the actual question
 
-**The default is a product decision, not a bug fix, so it ships off.** With `true`
-the server walks `~/Library/Mail` unasked on first start — minutes on a large
-mailbox, and it needs Full Disk Access. Whether that is acceptable for your users
-is your call, not mine; flipping it is one line, and I deliberately left it off
-rather than choosing for you.
+**The default is a product decision, not a bug fix, and it depends on how the
+server reaches the user.** For a plain PyPI/CLI install we suggest `false`: with
+`true` the server walks `~/Library/Mail` unasked on first start, which is minutes
+on a large mailbox and needs Full Disk Access. But if you adopt the one-click
+`.mcpb` installer (the E1 unit in our umbrella issue), `true` is the right
+default: someone who double-clicks an installer expects search to work, not to
+run `apple-mail-mcp index` by hand. Our fork ships `true` for exactly that
+reason, paired with the `.mcpb`. Flipping it is one line either way.
 
-If you prefer `true`, the honest framing for the changelog is "first run builds
-the index automatically", and the Full Disk Access requirement should probably
-move up in the README.
+If you prefer `true` regardless of packaging, the honest changelog framing is
+"first run builds the index automatically", and the Full Disk Access requirement
+should probably move up in the README.
 
 ### Changelog
 
 ```markdown
 ### Added
 
-- **Optional index auto-build on first `serve`** — `[index] auto_build` /
-  `APPLE_MAIL_INDEX_AUTO_BUILD`, default `false`. When enabled and no index
-  exists, the first `serve` builds one on a background thread so a fresh install
-  is usable without a separate `apple-mail-mcp index` run. Off by default because
-  it walks `~/Library/Mail` unasked, which takes minutes on a large mailbox and
-  requires Full Disk Access.
+- **Optional index auto-build on first `serve`.** `[index] auto_build` /
+  `APPLE_MAIL_INDEX_AUTO_BUILD`. When enabled and no index exists, the first
+  `serve` builds one on a background thread so a fresh install is usable without a
+  separate `apple-mail-mcp index` run. The default is a product decision: off for
+  a plain install (it walks `~/Library/Mail` unasked, minutes on a large mailbox,
+  and requires Full Disk Access), on when shipped via the one-click `.mcpb`
+  installer.
 
 ### Fixed
 
@@ -78,6 +82,6 @@ uv run pytest -q                # 499 passed
 ```bash
 gho iret77 pr create --repo imdinu/apple-mail-mcp --base main \
   --head iret77:feat/optional-auto-build \
-  --title "feat: optional index auto-build on first serve (default off)" \
+  --title "feat: optional index auto-build on first serve" \
   --body-file upstream-prs/B5-optional-auto-build.md
 ```
