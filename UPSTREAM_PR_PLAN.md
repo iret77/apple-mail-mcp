@@ -1,8 +1,31 @@
 # Upstream PR plan — iret77/apple-mail-mcp → imdinu/apple-mail-mcp
 
-Measured, not assumed: `git merge-base upstream/main feat/write-ops-flag-read`
-== `upstream/main` HEAD (`ee655d4`). **Upstream is zero commits ahead of us**;
-we are ahead by the work listed below. No rebase needed.
+## Current strategy (supersedes the 22-branch mechanics below)
+
+The per-unit catalog further down is still the **manifest** — it is what feeds
+the umbrella issue and each future PR body. But the *delivery* model has changed,
+because the old one drifted:
+
+1. **`main` is the single source of truth.** All fixes land on `main`. No bugfix
+   is ever made directly on an upstream branch, and no branch is hand-kept in
+   sync with `main`. Upstream branches are **disposable projections of `main`,
+   generated on demand** right before a PR is opened, and force-pushed if updated.
+2. **Fetch upstream before every claim and every projection.** `upstream/main`
+   moved to **0.4.3 (`d59806b`)** while we assumed it was dormant at 0.4.2 — a
+   stale local ref hid it. `main` has since been merged up to 0.4.3
+   (`git fetch upstream` is step 0, always). Base every projection on the
+   freshly-fetched upstream HEAD.
+3. **Offer shape: one umbrella issue first, then PRs on demand.** The maintainer
+   is active. `upstream-prs/UMBRELLA-ISSUE.md` carries the unit map and asks
+   which units they want; we open exactly those, each a focused diff against
+   current `main`, when they say so. We do **not** pre-stage 22 branches to rot.
+4. **#106 / A8 is withdrawn.** Upstream shipped its own single-writer `IndexLock`
+   in 0.4.3. Our fork solved #106 earlier and more completely (WriteLock +
+   rollback + per-thread connections + event ring); we keep ours on the fork
+   (the 0.4.3 merge is `-s ours`) and simply **do not offer A8**.
+
+Everything below documents the individual units. Read it as the catalog, not as
+a list of long-lived branches to maintain.
 
 ## Guiding idea
 
@@ -70,9 +93,10 @@ surface; all repair demonstrably broken behaviour.
 | A5 | `fix/sync-transaction-rollback` | `manager.py` | ⊘ |
 | A6 | `fix/per-thread-connections` | `manager.py` | ↑ A5 |
 | A7 | `perf/rebuild-fts-delete-all` | `manager.py` | ↑ A6 |
-| A8 | `fix/cross-process-write-lock` | `manager.py`, `watcher.py` | ↑ A6 |
+| ~~A8~~ | ~~`fix/cross-process-write-lock`~~ | **WITHDRAWN** — upstream shipped its own `IndexLock` for #106 in 0.4.3. Not offered. | — |
 | A9 | `fix/mailbox-roles-not-names` | `jxa/mail_core.js` | ⊘ |
 | A10 | `fix/incomplete-search-is-not-absence` | `server.py`, `builders.py` | ⊘ |
+| A11 | `fix/nested-mailbox-path` (new) | `index/disk.py` (`_infer_account_mailbox`) | ⊘ |
 
 **A1 — an undecodable header aborts the entire sync.** A non-ASCII `Subject`,
 `Received`, `Content-ID` or attachment filename makes Python's `email` module
@@ -141,6 +165,18 @@ search establishes it.
 
 *A10 is partly independent of tracks B and C: `get_email`'s Strategy 3 scan and
 the stale-path shortcut exist in upstream today.*
+
+**A11 — a nested mailbox loses its stable identity.** New unit, found after the
+first cut (fork commits 0.20.2 / 0.20.4 + a fixture chore). `_infer_account_mailbox`
+stopped at the first `.mbox` and swallowed Apple's GUID directory into the name:
+`Archiv/2026` was recorded as `Archiv`, and `INBOX.mbox/<GUID>/…` as
+`INBOX/<GUID>`. That name disagrees with the one the Envelope Index derives from
+the mailbox URL (`imap://UUID/Archiv/2026`), and the listing path looks a row up
+by `(account, mailbox, id)` — **so every message in a nested mailbox lost its
+stable Message-ID, and no sync repaired it** (the row is indexed, just under a
+name nothing asks for). Touches only `index/disk.py` + `tests/test_disk.py`;
+independent of every other unit. This code exists in upstream today, so it is a
+genuine standalone bug fix, not a fold-in.
 
 ## Track B — diagnostics (additive, the tool surface grows)
 
