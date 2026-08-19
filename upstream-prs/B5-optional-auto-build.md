@@ -26,12 +26,12 @@ it too; otherwise `--watch` quietly does nothing on a fresh install.
 ### Worth pushing back on — this is the actual question
 
 **The default is a product decision, not a bug fix, and it depends on how the
-server reaches the user.** For a plain PyPI/CLI install we suggest `false`: with
+server reaches the user.** For a plain PyPI/CLI install I suggest `false`: with
 `true` the server walks `~/Library/Mail` unasked on first start, which is minutes
 on a large mailbox and needs Full Disk Access. But if you adopt the one-click
-`.mcpb` installer (the E1 unit in our umbrella issue), `true` is the right
+`.mcpb` installer (the E1 unit in my umbrella issue), `true` is the right
 default: someone who double-clicks an installer expects search to work, not to
-run `apple-mail-mcp index` by hand. Our fork ships `true` for exactly that
+run `apple-mail-mcp index` by hand. My fork ships `true` for exactly that
 reason, paired with the `.mcpb`. Flipping it is one line either way.
 
 If you prefer `true` regardless of packaging, the honest changelog framing is

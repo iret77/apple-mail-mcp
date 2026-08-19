@@ -22,7 +22,7 @@ paths do, which is where a caller actually collects references.)
 
 - **FTS search** and **attachment search** read it from the `rfc822_message_id`
   column added in C1.
-- **The Envelope Index fast path** takes it from our own index in **one** batched
+- **The Envelope Index fast path** takes it from the fork's own index in **one** batched
   `get_rfc822_ids()` statement for the whole page. Apple's Envelope Index has no
   header column, so this is the only source; a per-row query would undo the reason
   that path exists. A row the index does not know yields `None` — never a wrong

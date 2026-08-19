@@ -44,8 +44,8 @@ apart.
 
 `build_from_disk()` moves its setup inside the `try`, so the cleanup block has to
 cope with a connection that was never opened — exactly the failure being
-reported. Returning from `finally` would swallow the exception that brought us
-there, so it is a conditional.
+reported. Returning from `finally` would swallow the exception responsible for
+it, so it is a conditional.
 
 ### Worth pushing back on
 

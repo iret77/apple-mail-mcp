@@ -1,12 +1,12 @@
 **Title:** `fix: IndexLock must not wedge on a filesystem that cannot flock`
 
-**Branch:** `iret77:fix/harden-index-lock` (projected on demand from our fork's
+**Branch:** `iret77:fix/harden-index-lock` (projected on demand from my fork's
 equivalent fix) · **Depends on:** nothing (⊘) · **Against:** your 0.4.3 `IndexLock`
 
 ---
 
-This is the **one** overlap with your `0.4.3` #106 work that we think is still
-worth a PR — not our lock, just a robustness gap in yours we already hit and
+This is the **one** overlap with your `0.4.3` #106 work that I think is still
+worth a PR — not my lock, just a robustness gap in yours I already hit and
 fixed on the fork.
 
 ### The bug

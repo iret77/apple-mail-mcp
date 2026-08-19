@@ -32,7 +32,7 @@ make.
    answers a request for the real inbox whenever it is listed first, which is
    also the kind of defect a test can hide by fixing the listing order.
    `[Gmail]/Sent Mail` and `INBOX.Sent` still resolve: a provider prefix is
-   hierarchy we are entitled to ignore, a user folder is not.
+   hierarchy the normalizer is entitled to ignore, a user folder is not.
 5. **Fail loudly** — the error names the role and lists the mailboxes that
    actually exist.
 
