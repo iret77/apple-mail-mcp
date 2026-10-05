@@ -76,7 +76,7 @@
     "auto_update": {
       "type": "boolean",
       "title": "Automatic updates",
-      "description": "Check for a newer build once a day when the extension starts. Failures never block startup — the last working build is used.",
+      "description": "Re-resolve the configured source once a day when the extension starts. The default build is pinned, so this only brings in new code when Source names a branch; a new server arrives with a new bundle. Failures never block startup — the last working build is used.",
       "default": true
     },
     "auto_install_uv": {
@@ -114,7 +114,7 @@
     "source_ref": {
       "type": "string",
       "title": "Source (advanced)",
-      "description": "Which build to run. Leave empty for the default branch build. Advanced: a uv requirement such as \"apple-mail-mcp\" (PyPI) or a git ref.",
+      "description": "Which build to run. Leave empty for the server build this bundle pins. Advanced: a uv requirement such as \"apple-mail-mcp\" (PyPI) or a git ref.",
       "default": "",
       "required": false
     }

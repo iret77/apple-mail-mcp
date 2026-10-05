@@ -7,15 +7,21 @@ Apple Mail MCP tools — including the write tools (`set_flag`,
 The bundle is deliberately tiny (~3 kB): `server/index.js` is a Node
 launcher shim that starts the Python MCP server via **`uvx`** and proxies
 stdio. No Python is bundled — `uv` fetches the right macOS wheels on first
-run, and the server code is pulled from the public fork by git ref.
+run, and the server code is pulled from the public fork by git ref: each
+bundle pins one `server-vX.Y.Z` tag, so a new server arrives with a new
+bundle.
 
 ## Prerequisites (on the Mac)
 
 - **macOS** with Apple Mail configured.
-- **uv** installed (provides `uvx`): <https://docs.astral.sh/uv/>. The
-  shim probes `~/.local/bin`, Homebrew, and `~/.cargo/bin`, so a standard
-  uv install is found even under Claude Desktop's minimal `PATH`. If uv
-  lives elsewhere, set `UVX_BIN` to its absolute path.
+- **uv** (provides `uvx`) — nothing to do by hand. If it is missing, the
+  launcher installs it on first run into `~/.apple-mail-mcp/bin` (no admin
+  rights, no `PATH` changes; setting *Install uv automatically*). If that
+  is off or fails (offline, managed Mac), the extension still connects and
+  answers every request with instructions to install uv by hand. An
+  existing uv is found in `~/.local/bin`, Homebrew and `~/.cargo/bin` even
+  under Claude Desktop's minimal `PATH`; anywhere else, set `UVX_BIN` to
+  its absolute path.
 - **Full Disk Access** for whatever builds the search index (needed for
   `.emlx` reads and reliable message-id resolution): System Settings →
   Privacy & Security → Full Disk Access.
@@ -26,26 +32,27 @@ From a checkout (any OS with Node 18+ — the `.mcpb` is
 platform-independent):
 
 ```bash
-./scripts/build-mcpb.sh          # -> dist/apple-mail-mcp.mcpb
+./scripts/build-mcpb.sh          # -> dist/apple-mail-mcp-<version>.mcpb
 ```
 
 ## Install
 
-1. Double-click `dist/apple-mail-mcp.mcpb`. Claude Desktop shows an
-   install dialog → **Install**.
+1. Double-click `dist/apple-mail-mcp-<version>.mcpb`. Claude Desktop
+   shows an install dialog → **Install**.
 2. Talk to Claude: *"flag mail 12345 red"*, *"mark these three as
    unread"*. Grant the Mail automation prompt on the first tool call.
 
 That's it — no terminal step. The search index builds itself in the
 background on first run (needs Full Disk Access for Claude Desktop), and
 the write tools resolve message ids by scanning meanwhile, so they work
-right away. The write tools return per-id buckets
-(`updated` / `not_found` / `skipped_hidden`).
+right away. The write tools return per-reference buckets
+(`updated` / `unchanged` / `not_found` / `failed` / `skipped_hidden`).
 
-To build the index up front instead, run:
+To build the index up front instead, run (`<tag>` is the `server-v…` tag
+your bundle pins — `get_index_status()` shows it as `source_ref`):
 
 ```bash
-uvx --from git+https://github.com/iret77/apple-mail-mcp@feat/write-ops-flag-read apple-mail-mcp index --verbose
+uvx --from git+https://github.com/iret77/apple-mail-mcp@<tag> apple-mail-mcp index --verbose
 ```
 
 ## Two setups — pick one
@@ -91,12 +98,13 @@ and no terminal needed:
 
 | Field | Default | Purpose |
 |---|---|---|
-| **Automatic updates** | on | Check once a day for a newer build at startup. |
-| **Build the search index automatically** | on | Off switches to the manual (no-disk-access) mode below. |
+| **Automatic updates** | on | Re-resolve the configured source once a day at startup. With the default pinned build this changes nothing; it matters when **Source** names a branch. |
+| **Install uv automatically** | on | Install the `uv` helper on first run if it is missing. Off for managed Macs — the extension then shows how to install it by hand. |
+| **Build the search index automatically** | on | Off switches to the manual (no-disk-access) mode above. |
 | **Read-only mode** | off | Disable the write tools (`set_flag`, `set_read_status`). |
 | **Default account** | — | Account used when a request doesn't name one. |
 | **Hidden accounts** | — | Comma-separated accounts to hide completely (never indexed, searched, read, or written). |
-| **Source (advanced)** | — | Which build to run; empty = the default branch build. Set to `apple-mail-mcp` once the write tools ship to PyPI. |
+| **Source (advanced)** | — | Which build to run; empty = the `server-v…` tag this bundle pins. Advanced: a uv requirement such as `apple-mail-mcp` (PyPI) or another git ref. |
 
 `UVX_BIN` remains an environment-only escape hatch for a non-standard
 `uvx` location. All the usual `APPLE_MAIL_*` settings apply too — see the
@@ -104,15 +112,20 @@ and no terminal needed:
 
 ## Updating
 
-Automatic: with **Automatic updates** on (the default), the launcher
-re-resolves the branch at most once every 24 h when Claude Desktop starts
-the extension. It's bounded (45 s) and best-effort — a slow or failed
-check never blocks startup; the last working build is used instead.
+A new server version arrives with a new bundle: install it over the old
+one. The bundle pins one `server-v…` tag, and a tag does not move.
 
-To force an update now, restart the extension after:
+With **Automatic updates** on (the default), the launcher re-resolves its
+source at most once every 24 h when Claude Desktop starts the extension,
+and always once after a new bundle is installed. That only brings in new
+code when **Source** names a moving branch. It is bounded (120 s) and
+best-effort — a slow or failed check never blocks startup; the last
+working build is used instead.
+
+To force a refresh now, restart the extension after:
 
 ```bash
-uvx --refresh --from git+https://github.com/iret77/apple-mail-mcp@feat/write-ops-flag-read apple-mail-mcp --version
+uvx --refresh --from git+https://github.com/iret77/apple-mail-mcp@<tag> apple-mail-mcp --version
 ```
 
 ## License / attribution
