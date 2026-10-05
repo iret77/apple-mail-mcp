@@ -139,6 +139,11 @@ PASS / FAIL / UNCLEAR.
   `get_emails(mailbox="Trash", limit=3)` — results or an *empty* list,
   never an error, even when Mail is not in English. And **not** the
   contents of the inbox.
+- `get_emails(account="all", mailbox="Sent", limit=50)` — rows from
+  **every** account that has sent mail, whatever its sent mailbox is
+  called (`Gesendet`, `[Gmail]/Sent Mail`, `Sent Messages`). Name any
+  account from `list_accounts()` that you know has sent mail and that
+  is missing.
 - `get_emails(mailbox="Definitely-Does-Not-Exist-XYZ", limit=1)` — an
   error listing the mailboxes that *do* exist, with no "None"/"null".
 

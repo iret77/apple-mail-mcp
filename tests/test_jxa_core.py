@@ -7,6 +7,7 @@ application, so the resolution order is testable here.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -200,6 +201,178 @@ const account = {{ mailboxes }};
             f"console.log(MailCore.isDiscardMailbox({name!r}));"
         )
         assert got == ("true" if discard else "false")
+
+
+class TestSpecialMailboxMustBelongToTheAccount:
+    """Mail.sdef defines `sent mailbox` & co. on the APPLICATION only
+    ("The top level Sent mailbox", the unified one in the sidebar); the
+    account class has no such property. The old probe fell back to the
+    application's mailbox and returned it for ANY account, before the
+    name table ever ran. The tests above could not see it: they stub
+    Mail as `{}`, so the probe always came back empty."""
+
+    def _resolve(self, names, want, app_children=()):
+        """getMailbox against a Mail shaped the way the dictionary says.
+
+        `app_children` are the children of each application-level
+        special mailbox, as (name, owning account id).
+        """
+        js = f"""
+const MailCore = {_mail_core_literal()}
+const appChildren = {json.dumps(list(app_children))}.map(
+    ([n, owner]) => ({{
+        name: () => "app:" + n,
+        account: () => ({{ id: () => owner }}),
+    }})
+);
+const topLevel = (n) => ({{
+    name: () => "app:" + n,
+    account: () => null,  // the unified mailbox belongs to no account
+    mailboxes: () => appChildren,
+}});
+var Mail = {{
+    sentMailbox: () => topLevel("Sent"),
+    draftsMailbox: () => topLevel("Drafts"),
+    trashMailbox: () => topLevel("Trash"),
+    junkMailbox: () => topLevel("Junk"),
+}};
+const names = {json.dumps(names)};
+const mailboxes = {{}};
+Object.defineProperty(mailboxes, "name", {{ value: () => names }});
+mailboxes.byName = (n) => {{
+    if (names.includes(n)) return {{ name: () => "account:" + n }};
+    throw new Error("-1728");
+}};
+const account = {{ id: () => "acct-1", mailboxes }};
+try {{
+    console.log(MailCore.getMailbox(account, {json.dumps(want)}).name());
+}} catch (e) {{
+    console.log("MISSING: " + e.message);
+}}
+"""
+        out = subprocess.run(
+            [_node_bin(), "-e", js], capture_output=True, text=True
+        )
+        assert out.returncode == 0, out.stderr
+        return out.stdout.strip()
+
+    @pytest.mark.parametrize(
+        "names,want,expected",
+        [
+            (["INBOX", "[Gmail]/Sent Mail"], "Sent", "[Gmail]/Sent Mail"),
+            (["INBOX", "Sent Messages"], "Sent", "Sent Messages"),
+            (["Posteingang", "Gesendet", "Papierkorb"], "Trash", "Papierkorb"),
+            (["Inbox", "Deleted Items", "Junk Email"], "Junk", "Junk Email"),
+        ],
+    )
+    def test_the_application_mailbox_never_answers_for_an_account(
+        self, names, want, expected
+    ):
+        assert self._resolve(names, want) == f"account:{expected}"
+
+    def test_mails_own_choice_wins_when_it_provably_is_this_account(self):
+        """A child of the unified mailbox that belongs to this account is
+        Mail's own answer — language- and provider-independent."""
+        got = self._resolve(
+            ["INBOX", "Outgoing copies"],
+            "Sent",
+            app_children=[("Other", "acct-2"), ("Outgoing copies", "acct-1")],
+        )
+        assert got == "app:Outgoing copies"
+
+    def test_another_accounts_mailbox_is_not_taken(self):
+        got = self._resolve(
+            ["INBOX", "Gesendet"],
+            "Sent",
+            app_children=[("Sent", "acct-2")],
+        )
+        assert got == "account:Gesendet"
+
+    @pytest.mark.parametrize(
+        "name,role",
+        [
+            ("Out", None),  # Mail.sdef: "The top level Out mailbox"
+            ("发件箱", None),  # zh-CN outbox, listed next to 已发送
+            ("已发送", "sent"),
+            ("In", "inbox"),  # Mail.sdef: "The top level In mailbox"
+        ],
+    )
+    def test_the_outbox_is_not_the_sent_mailbox(self, name, role):
+        js = (
+            f"const MailCore = {_mail_core_literal()}\n"
+            f"console.log(JSON.stringify(MailCore.mailboxRole({name!r})));"
+        )
+        out = subprocess.run(
+            [_node_bin(), "-e", js], capture_output=True, text=True
+        )
+        assert out.returncode == 0, out.stderr
+        assert json.loads(out.stdout) == role
+
+
+class TestPythonRoleTableMirrorsTheJxaOne:
+    """The Envelope Index fast path resolves roles in Python, the JXA
+    paths in mail_core.js. Two tables that drift answer the same request
+    differently depending on which path served it."""
+
+    CORPUS = (
+        "INBOX",
+        "Inbox",
+        "Posteingang",
+        "[Gmail]/Sent Mail",
+        "INBOX.Sent",
+        "INBOX/Trash",
+        "Projects/INBOX",
+        "Projekte/Rechnungen",
+        "  Sent Messages ",
+        "Gelen Kutusu",
+        "İstenmeyen",
+        "收件箱",
+        "已发送",
+        "Out",
+        "",
+        "[Gmail]",
+        "Mr. Smith",
+        "Sent Items.",
+    )
+
+    def _eval(self, expr):
+        js = (
+            f"const MailCore = {_mail_core_literal()}\n"
+            f"console.log(JSON.stringify({expr}));"
+        )
+        out = subprocess.run(
+            [_node_bin(), "-e", js], capture_output=True, text=True
+        )
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    def test_the_tables_are_identical(self):
+        from apple_mail_mcp.mailbox_roles import MAILBOX_ROLES
+
+        js_table = self._eval("MailCore.MAILBOX_ROLES")
+        assert js_table == {k: list(v) for k, v in MAILBOX_ROLES.items()}
+
+    def test_the_helpers_agree(self):
+        from apple_mail_mcp.mailbox_roles import (
+            is_top_level_mailbox,
+            mailbox_role,
+            normalize_mailbox_name,
+        )
+
+        corpus = json.dumps(list(self.CORPUS), ensure_ascii=False)
+        js = self._eval(
+            f"{corpus}.map(n => [MailCore.normalizeMailboxName(n), "
+            "MailCore.isTopLevelMailbox(n), MailCore.mailboxRole(n)])"
+        )
+        py = [
+            [
+                normalize_mailbox_name(n),
+                is_top_level_mailbox(n),
+                mailbox_role(n),
+            ]
+            for n in self.CORPUS
+        ]
+        assert py == js
 
 
 class TestFlagColourIsReadable:

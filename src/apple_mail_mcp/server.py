@@ -1893,6 +1893,7 @@ async def get_emails(
     # columns on the Envelope Index, so every filter is served
     # without falling back to JXA for "live" state. Falls through
     # to Strategy 1 only on path / schema errors.
+    mailbox_miss = False
     try:
         from .index.disk import find_mail_directory
         from .index.envelope_direct import (
@@ -2045,9 +2046,25 @@ async def get_emails(
         sqlite3.OperationalError,
         MailboxNotFoundError,
     ) as exc:
+        if isinstance(exc, MailboxNotFoundError):
+            mailbox_miss = True
         logger.debug(
             "Envelope Index fast path unavailable (%s); falling back to JXA",
             exc,
+        )
+
+    needs_index = (
+        before_ts is not None or after_ts is not None or offset or all_accounts
+    )
+    if mailbox_miss and needs_index:
+        # The index WAS readable — it has no such mailbox, by name or by
+        # role. The messages below blamed an unreadable index and sent
+        # the caller to get_index_status() for a problem it did not have.
+        where = "any account" if all_accounts else f"account {target_account!r}"
+        raise ValueError(
+            f"No mailbox matching {target_mailbox!r} in {where} (by name "
+            "or by role). Call list_mailboxes() to see the names that "
+            "exist."
         )
 
     if before_ts is not None or after_ts is not None or offset:

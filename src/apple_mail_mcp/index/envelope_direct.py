@@ -30,6 +30,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import unquote
 
+from ..mailbox_roles import is_top_level_mailbox, mailbox_role
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,16 +178,26 @@ def _resolve_mailbox_rowids(
     account_uuid: str | None,
     mailbox_name: str,
 ) -> list[int]:
-    """Find ROWIDs of mailboxes whose decoded name matches.
+    """Find ROWIDs of the mailboxes a name denotes, per account.
 
-    Mailbox URLs store percent-encoded paths, so matching a raw
-    name against the URL misses any mailbox whose name contains a
-    space or bracket. Decode each URL and match the full path or
-    its final segment: Gmail mailboxes live under a `[Gmail]/`
-    prefix but are displayed and addressed by their bare name
-    (`Sent Mail`, not `[Gmail]/Sent Mail`). Matching is
-    case-insensitive because the configured default mailbox is
-    "Inbox" while IMAP stores "INBOX".
+    Mailbox URLs store percent-encoded paths, so each URL is decoded
+    first. Matching is case-insensitive because the configured
+    default mailbox is "Inbox" while IMAP stores "INBOX". Each account
+    is resolved on its own, most reliable first:
+
+    1. The full decoded path.
+    2. For a top-level name that denotes a well-known role ("INBOX",
+       "Sent", "Trash", ...): the account's TOP-LEVEL mailbox that
+       plays that role, whatever it is called — "Posteingang",
+       "[Gmail]/Sent Mail", "Sent Messages", "INBOX.Trash". A role
+       request is never answered by the user's own "Projects/INBOX".
+    3. Otherwise the final path segment, so "Rechnungen" still finds
+       "Projekte/Rechnungen".
+
+    Per account, not across them: under "every account" one account
+    whose sent mailbox is literally "Sent" used to satisfy the match,
+    and every account that names it differently was left out without
+    a word.
     """
     if account_uuid:
         cur = conn.execute(
@@ -196,13 +208,32 @@ def _resolve_mailbox_rowids(
         cur = conn.execute(
             "SELECT ROWID, url FROM mailboxes WHERE url IS NOT NULL"
         )
-    want = mailbox_name.casefold()
-    rowids: list[int] = []
+    by_account: dict[str, list[tuple[int, str]]] = {}
     for rowid, url in cur:
-        _, path = _parse_mailbox_url(url)
-        decoded = path.casefold()
-        if decoded == want or decoded.rsplit("/", 1)[-1] == want:
-            rowids.append(rowid)
+        acct, path = _parse_mailbox_url(url)
+        by_account.setdefault(acct, []).append((rowid, path))
+
+    want = mailbox_name.casefold()
+    role = (
+        mailbox_role(mailbox_name)
+        if is_top_level_mailbox(mailbox_name)
+        else None
+    )
+    rowids: list[int] = []
+    for boxes in by_account.values():
+        exact = [r for r, p in boxes if p.casefold() == want]
+        if exact:
+            rowids.extend(exact)
+        elif role:
+            rowids.extend(
+                r
+                for r, p in boxes
+                if is_top_level_mailbox(p) and mailbox_role(p) == role
+            )
+        else:
+            rowids.extend(
+                r for r, p in boxes if p.casefold().rsplit("/", 1)[-1] == want
+            )
     return rowids
 
 

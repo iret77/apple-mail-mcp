@@ -470,3 +470,102 @@ class TestAnAllowListBoundsTheAccounts:
             limit=10,
         )
         assert {r.message_id for r in rows} == {1, 2, 3}
+
+
+# ─── Well-known mailboxes resolve by role, per account ───────
+
+
+@pytest.fixture
+def intl_envelope(tmp_path: Path) -> Path:
+    """Five accounts, five ways to name the same mailboxes.
+
+    One message per mailbox; its message_id equals the mailbox ROWID so
+    a result names the mailboxes it came from.
+    """
+    db = tmp_path / "Envelope Index"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
+        CREATE TABLE addresses (
+            ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT
+        );
+        CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);
+        CREATE TABLE messages (
+            ROWID INTEGER PRIMARY KEY,
+            message_id INTEGER,
+            sender INTEGER,
+            subject INTEGER,
+            date_received INTEGER,
+            mailbox INTEGER,
+            read INTEGER DEFAULT 0,
+            flagged INTEGER DEFAULT 0,
+            deleted INTEGER DEFAULT 0
+        );
+        INSERT INTO subjects VALUES (1, 's');
+        INSERT INTO addresses VALUES (1, 'a@example.com', '');
+        INSERT INTO mailboxes VALUES
+          (1, 'imap://PLAIN/INBOX'),
+          (2, 'imap://PLAIN/Sent'),
+          (3, 'imap://PLAIN/Projekte/Rechnungen'),
+          (4, 'imap://GMAIL/INBOX'),
+          (5, 'imap://GMAIL/%5BGmail%5D/Sent%20Mail'),
+          (6, 'imap://ICLOUD/INBOX'),
+          (7, 'imap://ICLOUD/Sent%20Messages'),
+          (8, 'ews://DE/Posteingang'),
+          (9, 'ews://DE/Gesendet'),
+          (10, 'ews://DE/Projekte/INBOX'),
+          (11, 'imap://DOVECOT/INBOX'),
+          (12, 'imap://DOVECOT/INBOX.Sent');
+        """
+    )
+    for box in range(1, 13):
+        conn.execute(
+            "INSERT INTO messages VALUES (?, ?, 1, 1, ?, ?, 0, 0, 0)",
+            (box, box, 800000000 + box, box),
+        )
+    conn.commit()
+    conn.close()
+    return db
+
+
+class TestMailboxRolesPerAccount:
+    """The Envelope Index path matched names only. A role request
+    ("Sent", "INBOX") found an account's mailbox only if it happened to
+    carry that literal name — and under "every account" one account that
+    did satisfied the whole match, so the others dropped out without an
+    error and without the JXA fallback."""
+
+    def _boxes(self, path, account, mailbox):
+        rows = fetch_recent_messages(
+            path,
+            account_uuid=account,
+            mailbox_name=mailbox,
+            filter_kind="all",
+            limit=50,
+        )
+        return {r.message_id for r in rows}
+
+    def test_sent_across_every_account(self, intl_envelope):
+        assert self._boxes(intl_envelope, None, "Sent") == {2, 5, 7, 9, 12}
+
+    def test_a_localized_inbox_answers_the_default(self, intl_envelope):
+        assert self._boxes(intl_envelope, "DE", "INBOX") == {8}
+
+    def test_a_nested_user_folder_never_answers_a_role(self, intl_envelope):
+        """`Projekte/INBOX` is somebody's own folder; its last segment
+        matched the inbox request and mixed it into the listing."""
+        assert 10 not in self._boxes(intl_envelope, None, "INBOX")
+        assert self._boxes(intl_envelope, None, "INBOX") == {1, 4, 6, 8, 11}
+
+    def test_the_exact_name_still_wins(self, intl_envelope):
+        assert self._boxes(intl_envelope, "DE", "Projekte/INBOX") == {10}
+
+    def test_a_plain_folder_name_still_matches_its_last_segment(
+        self, intl_envelope
+    ):
+        assert self._boxes(intl_envelope, None, "Rechnungen") == {3}
+
+    def test_an_account_without_the_role_is_still_a_miss(self, intl_envelope):
+        with pytest.raises(MailboxNotFoundError):
+            self._boxes(intl_envelope, "PLAIN", "Junk")
