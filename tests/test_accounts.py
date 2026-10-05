@@ -95,6 +95,9 @@ class TestUuidToName:
         assert loaded_map.uuid_to_name(unknown) == unknown
 
 
+REMOVED = "BBBB2222-0000-4000-8000-00000000DEAD"
+
+
 class TestIsUnknown:
     """`is_unknown` may only say "Mail has no such account" when it knows
     Mail's account list. A cold map knows nothing: to it every UUID is
@@ -104,19 +107,27 @@ class TestIsUnknown:
         assert loaded_map.is_unknown(SAMPLE_ACCOUNTS[0]["id"]) is False
 
     def test_an_account_mail_does_not_list_is_unknown(self, loaded_map):
-        assert loaded_map.is_unknown("BBBB2222-removed-account") is True
+        assert loaded_map.is_unknown(REMOVED) is True
 
     def test_a_cold_map_never_calls_anything_unknown(self):
-        assert AccountMap().is_unknown("BBBB2222-removed-account") is False
+        assert AccountMap().is_unknown(REMOVED) is False
 
     def test_an_empty_listing_is_not_evidence(self):
         m = AccountMap()
         m.load_from_jxa([])
-        assert m.is_unknown("BBBB2222-removed-account") is False
+        assert m.is_unknown(REMOVED) is False
 
     def test_a_stale_map_is_not_evidence(self, loaded_map):
         loaded_map._loaded_at -= _CACHE_TTL + 1
-        assert loaded_map.is_unknown("BBBB2222-removed-account") is False
+        assert loaded_map.is_unknown(REMOVED) is False
+
+    @pytest.mark.parametrize("key", ["Mailboxes", "Unknown", ""])
+    def test_a_folder_that_is_no_account_is_not_a_removed_one(
+        self, loaded_map, key
+    ):
+        """V<N>/Mailboxes holds the local On My Mac folders; the indexer
+        records them under that name. They were never an account."""
+        assert loaded_map.is_unknown(key) is False
 
 
 class TestCacheStaleness:
