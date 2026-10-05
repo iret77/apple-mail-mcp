@@ -65,7 +65,18 @@ from .executor import (
     execute_with_core_async,
 )
 
-mcp = FastMCP("Apple Mail")
+# How to *use* the server (sent once in the MCP handshake), as opposed to
+# the per-tool contract in each docstring.
+_INSTRUCTIONS = """\
+When email tooling behaves unexpectedly — search returns nothing, a write
+reports ids as not_found, or the user asks whether indexing works or how far
+along it is — call get_index_status before guessing. When its result contains
+`problem` or `next_steps`, explain what is wrong in the user's own language and
+walk them through `next_steps` in order rather than pasting the JSON: most
+users have never opened a terminal, and the steps are written for them.
+"""
+
+mcp = FastMCP("Apple Mail", instructions=_INSTRUCTIONS)
 
 logger = logging.getLogger(__name__)
 
@@ -1728,10 +1739,6 @@ async def list_accounts() -> list[Account]:
 
     Returns:
         List of account dictionaries with 'name' and 'id' fields.
-
-    Example:
-        >>> list_accounts()
-        [{"name": "Work", "id": "abc123"}, {"name": "Personal", "id": "def456"}]
     """
     # Strategy 0: serve from the AccountMap cache when it's warm.
     # The cache is hydrated by any prior list_accounts() call (5-min
@@ -1759,19 +1766,11 @@ async def list_mailboxes(account: str | None = None) -> list[Mailbox]:
     List all mailboxes for an email account.
 
     Args:
-        account: Account name, or "all" to list across EVERY visible
-                 account in one call — which is what you want for a
-                 survey or a triage pass; without it you would need one
-                 call per account and would have to know their names
-                 first. Uses APPLE_MAIL_DEFAULT_ACCOUNT env var or the
-                 first account if not specified.
+        account: Account name. Uses APPLE_MAIL_DEFAULT_ACCOUNT env var or
+                 the first account if not specified.
 
     Returns:
         List of mailbox dictionaries with 'name' and 'unreadCount' fields.
-
-    Example:
-        >>> list_mailboxes("Work")
-        [{"name": "INBOX", "unreadCount": 5}, ...]
     """
     if _hidden_account(account):
         # Hidden account: do not list its mailboxes, do not fall to JXA.
@@ -1801,12 +1800,15 @@ async def get_emails(
     """
     Get emails from a specific mailbox with optional filtering.
 
-    Note: This tool lists emails from a single mailbox. To search
-    across all mailboxes, use the search() tool instead.
+    Note: This tool lists emails by mailbox, newest first. To find
+    emails by keyword, use the search() tool instead.
 
     Args:
-        account: Account name. Uses APPLE_MAIL_DEFAULT_ACCOUNT env var or
-                 first account if not specified.
+        account: Account name, or "all" for every visible account in one
+                 call (the Inbox default is then dropped unless `mailbox`
+                 is given, and each result carries its `account`). Uses
+                 APPLE_MAIL_DEFAULT_ACCOUNT env var or first account if
+                 not specified.
         mailbox: Mailbox name. Uses APPLE_MAIL_DEFAULT_MAILBOX env var or
                  "Inbox" if not specified.
         filter: Filter type:
@@ -1816,11 +1818,16 @@ async def get_emails(
             - "today": Emails received today
             - "last_7_days": Emails received in the last 7 days
             - "this_week": Alias for last_7_days
-        limit: Maximum number of emails to return (default: 50)
+        limit: Maximum number of emails to return (default 50, clamped
+            to 1-200)
         before: ISO date/datetime — only messages received strictly
             before it. This is how you walk a mailbox backwards: pass
             the oldest `date_received` you have seen to get the next
             page. Stable while new mail arrives, unlike `offset`.
+        before_id: Tie-breaker for `before` when several messages share
+            the same `date_received`: pass the `id` of the oldest row you
+            have seen together with its `date_received` as `before`.
+            Rejected without `before`.
         after: ISO date/datetime — only messages received after it.
         offset: Skip this many of the newest matches. Simpler than
             `before`, but a message arriving mid-walk shifts every
@@ -1828,11 +1835,6 @@ async def get_emails(
 
     Returns:
         List of email dictionaries sorted by date (newest first).
-
-    Examples:
-        >>> get_emails()  # All emails from default mailbox
-        >>> get_emails(filter="unread", limit=10)  # Unread emails
-        >>> get_emails("Work", "INBOX", filter="today")  # Today's work emails
     """
     limit, offset = _validate_pagination(limit, offset)
     before_ts = _parse_date_bound(before, "before")
@@ -2250,12 +2252,6 @@ async def get_email(
         UI. Inline images, S/MIME signatures, and attachments in
         sent/bounce-back emails may not appear. Use get_email_attachment
         with a known filename for reliable extraction from disk.
-
-    Example:
-        >>> get_email("<a1b2@example.com>")  # stable, preferred
-        >>> get_email(12345)  # numeric id also works
-        {"id": 12345, "subject": "Meeting notes",
-         "content": "Hi team,\\n\\nHere are the notes...", ...}
     """
     refs = _normalize_message_ids(message_id)
     if not isinstance(message_id, (list, tuple)) and len(refs) == 1:
@@ -3038,10 +3034,6 @@ async def get_email_links(
 
     Returns:
         Dict with 'links' list, each having 'url' and 'text'.
-
-    Example:
-        >>> get_email_links(12345)
-        {"links": [{"url": "https://...", "text": "Click"}]}
     """
     # Same door as the batch tools: a stringified number is an id, and
     # HTML-escaped brackets are still brackets.
@@ -3081,10 +3073,6 @@ async def get_email_attachment(
     Returns:
         Dict with filename, mime_type, size, and file_path
         pointing to the saved file.
-
-    Example:
-        >>> get_email_attachment(12345, "invoice.pdf")
-        {"filename": "invoice.pdf", "file_path": "/...", ...}
     """
     # Clean up old cached attachments (best-effort)
     try:
@@ -3164,7 +3152,7 @@ async def search(
             - "sender": Sender name/email only
             - "body": Body text only
             - "attachments": Attachment filenames
-        limit: Maximum results (default: 20)
+        limit: Maximum results (default 20, clamped to 1-200)
         offset: Skip first N results for pagination (default: 0)
         exclude_mailboxes: Mailboxes to exclude (default: ["Drafts"])
         before: Exclude emails on/after this date (YYYY-MM-DD).
@@ -3452,14 +3440,10 @@ async def set_flag(
         - unchanged: already in the requested state, so no write was
           sent (still a success — treat as done)
         - not_found: could not be located (unknown, or deleted)
+        - failed: Mail refused or was unreachable, so the question
+          stays open (`error` says what Mail answered)
         - skipped_hidden: resolved into an excluded account
         - hint: guidance, present only when something is actionable
-
-    Examples:
-        >>> set_flag("<a1b2@example.com>", color="red")
-        >>> set_flag(["<a@x.com>", "<b@x.com>"], color="orange")
-        >>> set_flag("<a1b2@example.com>", color="none")  # unflag
-        >>> set_flag(12345, color="red")  # numeric id, if that's all
     """
     _ensure_writable()
 
@@ -3515,13 +3499,10 @@ async def set_read_status(
         - unchanged: already in the requested state, so no write was
           sent (still a success — treat as done)
         - not_found: could not be located (unknown, or deleted)
+        - failed: Mail refused or was unreachable, so the question
+          stays open (`error` says what Mail answered)
         - skipped_hidden: resolved into an excluded account
         - hint: guidance, present only when something is actionable
-
-    Examples:
-        >>> set_read_status("<a1b2@example.com>")  # mark read
-        >>> set_read_status(["<a@x.com>", "<b@x.com>"], read=False)
-        >>> set_read_status(12345)  # numeric id, if that's all there is
     """
     _ensure_writable()
 
@@ -3538,11 +3519,10 @@ async def refresh_index(full: bool = False) -> dict:
     """
     Update or completely rebuild THIS server's mail search index.
 
-    Use this for any request to refresh, update, re-index, rebuild or
-    recreate the mail index or mail search — including "rebuild the mail
-    index from scratch" and its equivalents in other languages (e.g.
-    German "bau den Mail-Index neu auf"). Pass full=True whenever the
-    user says rebuild, from scratch, completely or similar.
+    Handles requests to refresh, update, re-index, rebuild or recreate
+    the mail index or mail search. full=True rebuilds from scratch — use
+    it when the user explicitly asks for a from-scratch rebuild or the
+    index is suspected corrupt; otherwise the incremental sync is enough.
 
     This is the FTS5 index this server maintains at
     ~/.apple-mail-mcp/index.db. It is NOT Apple Mail's own envelope
@@ -3561,8 +3541,7 @@ async def refresh_index(full: bool = False) -> dict:
         full: False (default) syncs changes since the last run — fast,
             returns when done. True discards the index and rebuilds from
             scratch; that takes minutes, so it runs in the background and
-            returns immediately. Only use it when the index is suspected
-            to be corrupt.
+            returns immediately.
 
     Returns:
         Dict with `status` ("completed", "started", "already_running",
@@ -3705,15 +3684,10 @@ async def get_index_status() -> dict:
     Diagnose the mail index: readiness, build progress, and setup
     problems — with step-by-step instructions to fix them.
 
-    Call this whenever email tooling behaves unexpectedly, without
-    waiting to be asked: search returns nothing, a write reports ids as
-    not_found, or the user asks "is it working / how far along is it /
-    why can't you find my mail". Reads state only; changes nothing.
-
-    When the result contains `problem` or `next_steps`, do not just dump
-    the JSON: tell the user what is wrong in their own language and walk
-    them through the steps. Most users have never opened a terminal —
-    `next_steps` is ordered and written for them, so follow it as given.
+    Useful when search returns nothing, a write reports ids as
+    not_found, or the user asks whether indexing works or how far along
+    it is. Reads state only; changes nothing. `next_steps`, when present,
+    is ordered and written for a non-technical user.
 
     Returns:
         Dict with, among others:

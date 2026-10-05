@@ -182,3 +182,6 @@ This is **87x faster** because Apple Events uses a single array-return call inst
 | DoS via Large Files | 25 MB file size limit | `disk.py` |
 | Path Traversal | Path validation in watcher | `watcher.py` |
 | Data Exposure | DB created with `0600` permissions | `schema.py` |
+| Excluded-Account Exposure | `exclude_accounts` is a server-wide boundary: hidden accounts are never indexed, filtered from search, and never reached by a list/get/write path or an implicit JXA default | `server.py`, `index/search.py` |
+| Unauthorized Writes | Read-only mode refuses every mutating tool; a test enforces the guard on every write-implying tool name | `server.py` |
+| Silent Write Failure | `not_found` only means Mail was reachable and the message was not there; anything else lands in `failed` with Mail's `error` | `server.py`, `builders.py` |

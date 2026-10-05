@@ -5016,7 +5016,6 @@ class TestTheDocumentedToolCountMatchesReality:
 
     FILES = (
         "README.md",
-        "CLAUDE.md",
         "CONTRIBUTING.md",
         "docs/index.md",
         "docs/tools.md",
@@ -5061,6 +5060,84 @@ class TestTheDocumentedToolCountMatchesReality:
 
         assert claims, "no tool count found — has the wording changed?"
         assert not wrong, f"{actual} tools are registered, but: {wrong}"
+
+
+class TestToolDescriptionsMatchTheCode:
+    """A description is the only manual the model gets. A prompt audit
+    found `before_id` working but undocumented on get_emails, and
+    `account="all"` advertised on list_mailboxes — the one listing tool
+    that cannot take it (it looks up an account literally named
+    "all")."""
+
+    @pytest.mark.asyncio
+    async def test_every_parameter_is_documented(self):
+        from apple_mail_mcp.server import mcp
+
+        missing = [
+            f"{tool.name}.{param}"
+            for tool in await mcp.list_tools()
+            for param in tool.parameters.get("properties", {})
+            if f"{param}:" not in (tool.description or "")
+        ]
+        assert not missing, missing
+
+    @pytest.mark.asyncio
+    async def test_list_mailboxes_does_not_offer_all_accounts(self):
+        from apple_mail_mcp.server import mcp
+
+        desc = (await mcp.get_tool("list_mailboxes")).description
+        assert '"all"' not in desc
+
+    @pytest.mark.asyncio
+    async def test_get_emails_documents_the_cross_account_listing(self):
+        from apple_mail_mcp.server import mcp
+
+        desc = (await mcp.get_tool("get_emails")).description
+        assert '"all"' in desc
+
+    def test_index_status_guidance_travels_in_the_handshake(self):
+        """How to react to a broken setup is behaviour, not part of one
+        tool's contract — it belongs in the server instructions."""
+        from apple_mail_mcp.server import mcp
+
+        assert "get_index_status" in mcp.instructions
+        assert "next_steps" in mcp.instructions
+
+
+class TestTheDeprecatedAliasIsNotATool:
+    """get_attachment only duplicated get_email_attachment and
+    get_email_links on every client's tool list, and is gone. Neither the
+    server nor the bundle may offer it again."""
+
+    @pytest.mark.asyncio
+    async def test_get_attachment_is_not_registered(self):
+        from apple_mail_mcp.server import mcp
+
+        names = {t.name for t in await mcp.list_tools()}
+        assert "get_attachment" not in names
+        assert {"get_email_attachment", "get_email_links"} <= names
+
+    # fork-only:start — the .mcpb bundle only exists in this fork
+    @pytest.mark.asyncio
+    async def test_the_bundle_lists_exactly_the_registered_tools(self):
+        """The manifest and the launcher's setup fallback each carry the
+        tool list by hand; a tool removed from the server must not live
+        on in either."""
+        import re
+
+        from apple_mail_mcp.server import mcp
+
+        registered = {t.name for t in await mcp.list_tools()}
+        root = Path(__file__).resolve().parents[1]
+        manifest = json.loads((root / "mcpb/manifest.json").read_text())
+        assert {t["name"] for t in manifest["tools"]} == registered
+
+        launcher = (root / "mcpb/server/index.js").read_text()
+        block = re.search(r"const TOOL_NAMES = \[(.*?)\];", launcher, re.S)
+        assert block, "TOOL_NAMES not found in the launcher"
+        assert set(re.findall(r'"(\w+)"', block.group(1))) == registered
+
+    # fork-only:end
 
 
 class TestTheLogFileModeIsEnforcedNotJustRequested:
@@ -5267,7 +5344,7 @@ class TestTheScanReportsWhereItFoundTheMessage:
     moved. That is the one case where the caller cannot derive the
     location, and it was the only return path that dropped it: the JXA
     script had the mailbox in hand and returned neither it nor the
-    account. CLAUDE.md promises `get_email` reports the current
+    account. The README promises `get_email` reports the current
     location. Reported from the field."""
 
     def test_the_generated_script_returns_the_location(self):
