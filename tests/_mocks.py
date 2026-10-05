@@ -27,4 +27,5 @@ def mock_acct_map(uuid_to_name="Work", excluded_uuids=None):
     m.names_to_uuids.return_value = set(excluded_uuids or [])
     m.name_to_uuid.return_value = None
     m.uuid_to_name.return_value = uuid_to_name
+    m.is_unknown.return_value = False
     return m

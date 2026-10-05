@@ -33,6 +33,7 @@ def _acct_map(uuid_to_name="Work", excluded_uuids=None):
     m.names_to_uuids.return_value = set(excluded_uuids or [])
     m.name_to_uuid.return_value = None
     m.uuid_to_name.return_value = uuid_to_name
+    m.is_unknown.return_value = False
     m.get_cached_accounts.return_value = [
         {"id": "uuid-work", "name": uuid_to_name}
     ]
@@ -487,6 +488,7 @@ class TestGetEmail:
         mock_acct_map = MagicMock()
         mock_acct_map.ensure_loaded = AsyncMock()
         mock_acct_map.uuid_to_name.return_value = "Work"
+        mock_acct_map.is_unknown.return_value = False
 
         with (
             patch(
@@ -596,6 +598,7 @@ class TestSearch:
         mock_acct_map.ensure_loaded = AsyncMock()
         mock_acct_map.name_to_uuid.return_value = None
         mock_acct_map.uuid_to_name.return_value = "Work"
+        mock_acct_map.is_unknown.return_value = False
 
         with (
             patch("apple_mail_mcp.server._get_index_manager") as mock_get,
@@ -1054,6 +1057,7 @@ class TestSearchAttachments:
         mock_acct_map = MagicMock()
         mock_acct_map.ensure_loaded = AsyncMock()
         mock_acct_map.uuid_to_name.return_value = "Work"
+        mock_acct_map.is_unknown.return_value = False
 
         with (
             patch("apple_mail_mcp.server._get_index_manager") as mock_get,
@@ -1621,6 +1625,7 @@ class TestSearchEmptyResultHint:
         mock_acct_map = MagicMock()
         mock_acct_map.ensure_loaded = AsyncMock()
         mock_acct_map.uuid_to_name.return_value = "Work"
+        mock_acct_map.is_unknown.return_value = False
 
         with (
             patch("apple_mail_mcp.server._get_index_manager") as mock_get,
@@ -5593,3 +5598,92 @@ class TestAMailboxMissIsNotAnUnreadableIndex:
             )
         assert "account 'Work'" in str(err.value)
         assert "not readable" not in str(err.value)
+
+
+class TestARemovedAccountIsNotPassedOffAsAName:
+    """Both search paths handed out a removed account's bare UUID as
+    `account`, a field that holds names everywhere else and a value no
+    tool accepts (#25). The row stays — the message is real — but the
+    field must say there is no such account, and only a map that has
+    actually loaded Mail's account list may say so."""
+
+    WORK, REMOVED = "UUID-WORK", "BBBB2222-removed-account"
+
+    def _map(self, loaded: bool):
+        from apple_mail_mcp.index.accounts import AccountMap
+
+        m = AccountMap()
+        if loaded:
+            m.load_from_jxa([{"name": "Work", "id": self.WORK}])
+        else:
+            m.ensure_loaded = AsyncMock()  # stays cold, no JXA
+        return m
+
+    def _manager(self):
+        from types import SimpleNamespace
+
+        def hit(i, acct):
+            return SimpleNamespace(
+                id=i,
+                subject=f"s{i}",
+                sender="a@b",
+                date_received="2026-08-01T10:00:00",
+                score=1.0,
+                content_snippet="...",
+                account=acct,
+                mailbox="INBOX",
+                rfc822_message_id=f"<m{i}@x>",
+            )
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.search.return_value = [hit(1, self.WORK), hit(2, self.REMOVED)]
+        mgr.search_attachments.return_value = [
+            {
+                "message_id": i,
+                "account": acct,
+                "mailbox": "INBOX",
+                "subject": f"s{i}",
+                "sender": "a@b",
+                "date_received": "2026-08-01T10:00:00",
+                "rfc822_message_id": f"<m{i}@x>",
+                "filename": "Rechnung.pdf",
+            }
+            for i, acct in ((1, self.WORK), (2, self.REMOVED))
+        ]
+        return mgr
+
+    async def _search(self, scope, loaded):
+        from apple_mail_mcp.server import search
+
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=self._manager(),
+            ),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=self._map(loaded),
+            ),
+        ):
+            return await search("Rechnung", scope=scope)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scope", ["all", "attachments"])
+    async def test_the_row_stays_and_says_there_is_no_account(self, scope):
+        rows = await self._search(scope, loaded=True)
+        assert [r["id"] for r in rows] == [1, 2], "a real hit was dropped"
+        assert rows[0]["account"] == "Work"
+        assert "account_missing" not in rows[0]
+        assert rows[1]["account"] is None
+        assert rows[1]["account_missing"] == self.REMOVED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scope", ["all", "attachments"])
+    async def test_a_cold_map_marks_nothing(self, scope):
+        """Without Mail's list, nobody knows which accounts exist —
+        marking every row as "no such account" would be the 0.20.1
+        defect again."""
+        rows = await self._search(scope, loaded=False)
+        assert all("account_missing" not in r for r in rows)
+        assert all(r["account"] is not None for r in rows)

@@ -244,7 +244,10 @@ class SearchResult(TypedDict, total=False):
     score: float
     matched_in: str
     content_snippet: str
-    account: str
+    # None when the message lies in an account Mail no longer has; the
+    # raw account id is then in `account_missing` (see _account_field).
+    account: str | None
+    account_missing: str
     mailbox: str
 
 
@@ -319,6 +322,21 @@ def _get_account_map():
     from .index.accounts import AccountMap
 
     return AccountMap.get_instance()
+
+
+def _account_field(acct_map, uuid: str) -> dict:
+    """The `account` part of a search row, from the index's UUID.
+
+    An account Mail no longer has — removed, its folder still on disk —
+    has no name, and the map's fallback handed out the bare UUID as
+    `account`: a field that holds names everywhere else, and a value no
+    tool accepts (#25). The row stays, the message is real; the field
+    says plainly that there is no such account. Only a provably loaded
+    map may say so — a cold one would mark every row.
+    """
+    if acct_map.is_unknown(uuid):
+        return {"account": None, "account_missing": uuid}
+    return {"account": acct_map.uuid_to_name(uuid)}
 
 
 def _resolve_account(account: str | None) -> str | None:
@@ -3187,6 +3205,11 @@ async def search(
         numeric `id`, which is a per-mailbox ROWID and stops resolving
         as soon as any device files the message elsewhere.
 
+        `account` is None for a message in an account Mail no longer
+        has (typically removed while its folder is still on disk); the
+        raw account id is then in `account_missing`. It is not a name
+        and no tool accepts it as one.
+
         When nothing matches, returns a dict instead:
         {"result": [], "hint": "..."} — the hint suggests how to
         adjust the query (fewer keywords, different scope).
@@ -3256,7 +3279,7 @@ async def search(
                     "score": 1.0,
                     "message_id": row["rfc822_message_id"],
                     "matched_in": f"attachment: {row['filename']}",
-                    "account": acct_map.uuid_to_name(row["account"]),
+                    **_account_field(acct_map, row["account"]),
                     "mailbox": row["mailbox"],
                 }
                 for row in rows
@@ -3331,7 +3354,7 @@ async def search(
                             else _detect_matched_columns(query, r)
                         ),
                         "content_snippet": r.content_snippet,
-                        "account": acct_map.uuid_to_name(r.account),
+                        **_account_field(acct_map, r.account),
                         "mailbox": r.mailbox,
                     }
                     for r in results
