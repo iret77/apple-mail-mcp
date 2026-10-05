@@ -177,7 +177,7 @@ Search emails with automatic FTS5 optimization. Uses the FTS5 index for fast sea
 | `body` | Body content only | FTS5 (if indexed) |
 | `attachments` | Attachment filenames | SQL (requires index) |
 
-**Returns:** List of results sorted by relevance (FTS5) or date (JXA fallback), each with: `id`, `subject`, `sender`, `date_received`, `score`, `matched_in`, and optionally `content_snippet`, `account`, `mailbox`.
+**Returns:** List of results sorted by relevance (FTS5) or date (JXA fallback), each with: `id`, `subject`, `sender`, `date_received`, `score`, `matched_in`, and optionally `content_snippet`, `account`, `mailbox`. For a message in an account Mail no longer has (typically removed while its folder is still on disk), `account` is `null` and `account_missing` carries the raw account id — the hit stays in the result, but that id is not a name any tool accepts.
 
 ```python
 search("invoice")

@@ -50,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed`. Ein Test verlangt, dass jeder Parameter jedes Tools in
   seiner Beschreibung vorkommt.
 - `docs/configuration.md` nennt `max_email_mb` und `auto_build`.
+- **`search()` gab die UUID eines entfernten Kontos als Kontonamen
+  aus** (#25). Liegt das Kontoverzeichnis noch auf der Platte, hat
+  Mail das Konto aber nicht mehr, stand dessen rohe UUID im Feld
+  `account` — einem Feld, das sonst Namen führt und dessen Wert kein
+  Tool annimmt. Der Treffer bleibt im Ergebnis, `account` ist jetzt
+  `null`, und `account_missing` nennt die Kennung. Markiert wird nur,
+  wenn Mails Kontenliste nachweislich geladen ist: bei kaltem Cache
+  wäre sonst jede Zeile „kein Konto“ gewesen.
 
 ## [0.20.5] - 2026-08-12
 

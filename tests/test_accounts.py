@@ -95,6 +95,30 @@ class TestUuidToName:
         assert loaded_map.uuid_to_name(unknown) == unknown
 
 
+class TestIsUnknown:
+    """`is_unknown` may only say "Mail has no such account" when it knows
+    Mail's account list. A cold map knows nothing: to it every UUID is
+    unknown, and reporting that as absence is the 0.20.1 defect (#25)."""
+
+    def test_an_account_mail_lists_is_known(self, loaded_map):
+        assert loaded_map.is_unknown(SAMPLE_ACCOUNTS[0]["id"]) is False
+
+    def test_an_account_mail_does_not_list_is_unknown(self, loaded_map):
+        assert loaded_map.is_unknown("BBBB2222-removed-account") is True
+
+    def test_a_cold_map_never_calls_anything_unknown(self):
+        assert AccountMap().is_unknown("BBBB2222-removed-account") is False
+
+    def test_an_empty_listing_is_not_evidence(self):
+        m = AccountMap()
+        m.load_from_jxa([])
+        assert m.is_unknown("BBBB2222-removed-account") is False
+
+    def test_a_stale_map_is_not_evidence(self, loaded_map):
+        loaded_map._loaded_at -= _CACHE_TTL + 1
+        assert loaded_map.is_unknown("BBBB2222-removed-account") is False
+
+
 class TestCacheStaleness:
     """Tests for TTL-based cache invalidation."""
 

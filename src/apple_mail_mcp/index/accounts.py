@@ -121,6 +121,20 @@ class AccountMap:
         with self._lock:
             return self._uuid_to_name.get(uuid, uuid)
 
+    def is_unknown(self, uuid: str) -> bool:
+        """True only when Mail's account list is PROVABLY loaded and
+        `uuid` is not on it — an account Mail no longer has.
+
+        A cold, stale or empty map knows nothing, so it answers False:
+        to it every UUID is unknown, and calling that "no such account"
+        is the defect 0.20.1 fixed for get_emails (a cold cache taken
+        for an answer).
+        """
+        with self._lock:
+            if not self._uuid_to_name or self._is_stale():
+                return False
+            return uuid not in self._uuid_to_name
+
     def load_from_jxa(self, accounts: list[dict]) -> None:
         """Populate the map from listAccounts() output.
 
