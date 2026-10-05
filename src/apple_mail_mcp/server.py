@@ -3593,9 +3593,12 @@ async def refresh_index(full: bool = False) -> dict:
             to be corrupt.
 
     Returns:
-        Dict with `status` ("completed", "started", "already_running" or
-        "failed"), a `message` to relay, and `changes` (added + deleted +
-        moved) for a completed sync.
+        Dict with `status` ("completed", "started", "already_running",
+        "unconfirmed" or "failed"), a `message` to relay, and `changes`
+        (added + deleted + moved) for a completed sync. "unconfirmed"
+        means a rebuild was launched but had not begun reading mail yet —
+        not a success: check get_index_status in a minute (rising progress
+        means it is running, an unchanged index means it is stuck).
     """
     manager = _get_index_manager()
 
