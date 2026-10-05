@@ -13,7 +13,7 @@
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![CI](https://github.com/imdinu/apple-mail-mcp/actions/workflows/lint.yml/badge.svg)](https://github.com/imdinu/apple-mail-mcp/actions/workflows/lint.yml)
 
-The only Apple Mail MCP server with **full-coverage body search** — reliable on large mailboxes where AppleScript-based servers timeout. 12 tools for reading, searching, and extracting email content.
+The only Apple Mail MCP server with **full-coverage body search** — reliable on large mailboxes where AppleScript-based servers timeout. 11 tools for reading, searching, and extracting email content.
 
 **[Read the docs](https://imdinu.github.io/apple-mail-mcp/)** for the full guide.
 
@@ -153,7 +153,6 @@ for the full schema and precedence rules.
 | `search(query, scope?, before?, after?, highlight?)` | Search — all, subject, sender, body, attachments |
 | `get_email_links(message_id)` | Extract links from an email |
 | `get_email_attachment(message_id, filename)` | Extract attachment content |
-| `get_attachment(message_id, filename)` | *Deprecated* — use `get_email_attachment()` |
 | `set_flag(refs, color?)` | **Write** — flag/unflag one email or a batch (max 500), optionally by color (red, orange, yellow, green, blue, purple, gray) |
 | `set_read_status(refs, read?)` | **Write** — mark one email or a batch read (seen) or unread (unseen) |
 | `get_index_status()` | Index health and setup diagnostics — build state, progress, and whether Full Disk Access is missing |

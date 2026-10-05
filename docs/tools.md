@@ -1,6 +1,6 @@
 # Tools
 
-Apple Mail MCP provides **12 MCP tools** — a consolidated API designed for AI assistants.
+Apple Mail MCP provides **11 MCP tools** — a consolidated API designed for AI assistants.
 
 ## Overview
 
@@ -13,7 +13,6 @@ Apple Mail MCP provides **12 MCP tools** — a consolidated API designed for AI 
 | `search()` | Search emails | `query`, `account?`, `mailbox?`, `scope?`, `limit?`, `exclude_mailboxes?`, `before?`, `after?`, `highlight?` |
 | `get_email_links()` | Extract links from an email | `message_id`, `account?`, `mailbox?` |
 | `get_email_attachment()` | Extract attachment content | `message_id`, `filename`, `account?`, `mailbox?` |
-| `get_attachment()` | *Deprecated* — use `get_email_attachment()` | `message_id`, `filename`, `account?`, `mailbox?` |
 | `set_flag()` | **Write** — flag/unflag one email or a batch (max 500), optionally by color | `message_ids`, `color?`, `account?`, `mailbox?` |
 | `set_read_status()` | **Write** — mark one email or a batch read (seen) or unread (unseen) | `message_ids`, `read?`, `account?`, `mailbox?` |
 | `get_index_status()` | Index health and setup diagnostics — build state, progress, and whether Full Disk Access is missing | — |
@@ -252,15 +251,6 @@ get_email_attachment(12345, "invoice.pdf")
 
 !!! note
     Requires the FTS5 search index. If upgrading from v0.1.x, run `apple-mail-mcp rebuild` to populate attachment metadata.
-
----
-
-## `get_attachment()` *(Deprecated)*
-
-!!! warning
-    `get_attachment()` is deprecated since v0.2.0. Use `get_email_attachment()` instead. The old name still works but may be removed in a future release.
-
-Identical to `get_email_attachment()`. See above for parameters and return value.
 
 ---
 
