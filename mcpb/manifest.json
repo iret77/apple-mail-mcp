@@ -56,10 +56,6 @@
       "description": "Extract a file attachment from an email to disk."
     },
     {
-      "name": "get_attachment",
-      "description": "Deprecated alias — use get_email_attachment or get_email_links."
-    },
-    {
       "name": "set_flag",
       "description": "Write — flag or unflag one email or a batch, optionally by color (red, orange, yellow, green, blue, purple, gray). Takes stable Message-ID headers, so it keeps working after the mail is moved from a phone."
     },

@@ -6,7 +6,7 @@ Apple Mail MCP Server
 2. FTS5 search — full-text body search in ~2ms with BM25 ranking
 3. JXA fallback — batch property fetching for multi-email listing
 
-TOOLS (12 total):
+TOOLS (11 total):
 - list_accounts() - List email accounts
 - list_mailboxes(account?) - List mailboxes
 - get_emails(..., filter?) - Unified email listing with filters
@@ -14,7 +14,6 @@ TOOLS (12 total):
 - search(query, ...) - Unified search with FTS5 support
 - get_email_links(id) - Extract hyperlinks from an email
 - get_email_attachment(id, filename) - Extract a file attachment
-- get_attachment(id, filename?) - Deprecated alias
 - set_flag(ids, color?) - Flag/unflag emails, optionally by color (write)
 - set_read_status(ids, read?) - Mark emails read/unread (write)
 - get_index_status() - Index health + setup diagnostics
@@ -1719,7 +1718,7 @@ async def _retry_by_stable_id(
     return results, still_missing, sorted(recovered), unsearched
 
 
-# ========== MCP Tools (10 total) ==========
+# ========== MCP Tools (11 total) ==========
 
 
 @mcp.tool
@@ -2249,7 +2248,7 @@ async def get_email(
         The attachments list comes from JXA's mailAttachments(),
         which only reports file attachments visible in Mail.app's
         UI. Inline images, S/MIME signatures, and attachments in
-        sent/bounce-back emails may not appear. Use get_attachment
+        sent/bounce-back emails may not appear. Use get_email_attachment
         with a known filename for reliable extraction from disk.
 
     Example:
@@ -2828,7 +2827,7 @@ class LinkResult(TypedDict):
 
 
 class AttachmentContent(TypedDict, total=False):
-    """Content returned by get_attachment."""
+    """Content returned by get_email_attachment."""
 
     filename: str
     mime_type: str
@@ -3126,33 +3125,6 @@ async def get_email_attachment(
         "size": len(raw_bytes),
         "file_path": str(file_path),
     }
-
-
-@mcp.tool
-async def get_attachment(
-    message_id: int | str,
-    filename: str | None = None,
-    account: str | None = None,
-    mailbox: str | None = None,
-) -> AttachmentContent:
-    """
-    DEPRECATED: Use get_email_attachment() or get_email_links().
-
-    Extract resources from an email: attachments or links.
-    Delegates to get_email_links (filename omitted) or
-    get_email_attachment (filename provided).
-
-    Args:
-        message_id: The email's numeric id, or its RFC822 Message-ID
-            header (preferred — it survives the mail being moved)
-        filename: Attachment filename to extract. If omitted,
-            returns links instead.
-        account: Account name (optional)
-        mailbox: Mailbox name (optional)
-    """
-    if filename is None:
-        return await get_email_links(message_id, account, mailbox)
-    return await get_email_attachment(message_id, filename, account, mailbox)
 
 
 @mcp.tool

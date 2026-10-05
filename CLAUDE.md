@@ -10,7 +10,7 @@ The only Apple Mail MCP server with full-coverage FTS5 body search. Reliable on 
 src/apple_mail_mcp/
 ├── __init__.py         # CLI entry point, exports main()
 ├── cli.py              # CLI commands (index, status, rebuild, serve)
-├── server.py           # FastMCP server with 12 MCP tools
+├── server.py           # FastMCP server with 11 MCP tools
 ├── config.py           # Environment variable configuration
 ├── builders.py         # QueryBuilder, AccountsQueryBuilder
 ├── executor.py         # run_jxa(), execute_with_core(), execute_query()
@@ -27,7 +27,7 @@ src/apple_mail_mcp/
     └── mail_core.js    # Shared JXA utilities (MailCore object)
 ```
 
-## MCP Tools (12 total)
+## MCP Tools (11 total)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -38,7 +38,6 @@ src/apple_mail_mcp/
 | `search(query, ...)` | Unified search | scope, before, after, offset, highlight |
 | `get_email_links(ref)` | Extract links from an email | message_id (id or header) |
 | `get_email_attachment(ref, filename)` | Extract attachment content | message_id (id or header), filename |
-| `get_attachment(ref, filename)` | *Deprecated* — use `get_email_attachment()` | message_id, filename |
 | `set_flag(ids, color?)` | *Write* — flag/unflag single or batch, optional color | message_ids, color, account?, mailbox? |
 | `set_read_status(ids, read?)` | *Write* — mark read (seen) / unread (unseen) | message_ids, read, account?, mailbox? |
 | `get_index_status()` | Index health + setup diagnostics (state, progress, Full Disk Access) | - |
@@ -90,8 +89,8 @@ as well. The RFC822 `Message-ID` header survives that. Therefore:
   lookup, the JXA paths from `messageId` in `PROPERTY_SETS["standard"]`).
   Their docstrings tell the model to prefer it.
 - **Every tool that takes a message accepts both** — `get_email`,
-  `get_email_links`, `get_email_attachment`, `get_attachment`,
-  `set_flag`, `set_read_status`. `_normalize_message_ids()` validates
+  `get_email_links`, `get_email_attachment`, `set_flag`,
+  `set_read_status`. `_normalize_message_ids()` validates
   ints and header strings alike.
 - **A header is never translated back into a ROWID and then trusted.**
   That is the whole point: an index row can be stale, and its ROWID may
@@ -292,7 +291,7 @@ Startup Sync Flow:
 ### Layer Separation
 
 1. **cli.py** - CLI entry point, commands for indexing
-2. **server.py** - 12 MCP tools, uses builders and index
+2. **server.py** - 11 MCP tools, uses builders and index
 3. **builders.py** - Constructs JXA scripts from Python, type-safe
 4. **executor.py** - Runs scripts via osascript, handles JSON parsing
 5. **index/** - FTS5 search index with disk-based sync

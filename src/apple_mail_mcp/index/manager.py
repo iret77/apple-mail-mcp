@@ -1524,7 +1524,7 @@ class IndexManager:
     ) -> Path | None:
         """Look up an email's .emlx file path from the index.
 
-        Used by get_attachment to locate the file on disk.
+        Used by get_email_attachment to locate the file on disk.
 
         Args:
             message_id: Mail.app message ID

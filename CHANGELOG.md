@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+- **`get_attachment()` entfernt.** Seit v0.2.0 als veraltet markiert und
+  für v0.3.0 zur Entfernung angekündigt, war es noch immer registriert:
+  ein Werkzeug mehr in der Liste, das nichts konnte, was
+  `get_email_attachment()` und `get_email_links()` nicht auch können.
+  Die Beschreibung von `get_email` schickte die KI für Anhänge sogar
+  ausgerechnet dorthin; sie verweist jetzt auf `get_email_attachment()`.
+  Wer den alten Namen direkt aufruft, bekommt einen Fehler — Anhänge
+  gehen über `get_email_attachment()`, Links über `get_email_links()`.
+  Damit sind es 11 Werkzeuge.
+
+### Changed
+- **`refresh_index` nennt den Status `unconfirmed`.** Das Werkzeug gibt
+  ihn zurück, wenn ein Neuaufbau gestartet, aber noch nicht angelaufen
+  ist; die Beschreibung, die die KI liest, kannte nur vier Status. Sie
+  sagt jetzt, dass das kein Erfolg ist und wie man nachprüft.
+- **Der Test zur Werkzeugzahl zählt selbst.** Er verglich die Dokumente
+  nur mit einer alten, fest eingetragenen Zahl (8) und hätte jede andere
+  falsche Zahl durchgelassen — so stand im Code-Kommentar von
+  `server.py` seit Längerem „10 total“. Jetzt zählt er die registrierten
+  Werkzeuge und prüft jede Zahlenangabe in den Dokumenten dagegen.
+
 ## [0.20.5] - 2026-08-12
 
 Aus dem Health-Check gegen 0.20.4. Die drei Regressionen von zuvor
