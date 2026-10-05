@@ -6,7 +6,7 @@ Apple Mail MCP Server
 2. FTS5 search — full-text body search in ~2ms with BM25 ranking
 3. JXA fallback — batch property fetching for multi-email listing
 
-TOOLS (11 registered, plus 1 deprecated Python-only alias):
+TOOLS (11 total):
 - list_accounts() - List email accounts
 - list_mailboxes(account?) - List mailboxes
 - get_emails(..., filter?) - Unified email listing with filters
@@ -14,7 +14,6 @@ TOOLS (11 registered, plus 1 deprecated Python-only alias):
 - search(query, ...) - Unified search with FTS5 support
 - get_email_links(id) - Extract hyperlinks from an email
 - get_email_attachment(id, filename) - Extract a file attachment
-- get_attachment(id, filename?) - Deprecated alias, Python only (no MCP tool)
 - set_flag(ids, color?) - Flag/unflag emails, optionally by color (write)
 - set_read_status(ids, read?) - Mark emails read/unread (write)
 - get_index_status() - Index health + setup diagnostics
@@ -3116,35 +3115,6 @@ async def get_email_attachment(
     }
 
 
-# Deprecated alias, deliberately NOT registered as an MCP tool any more: it
-# only duplicated get_email_links / get_email_attachment on every client's
-# tool list. Kept as a plain function for existing Python callers.
-async def get_attachment(
-    message_id: int | str,
-    filename: str | None = None,
-    account: str | None = None,
-    mailbox: str | None = None,
-) -> AttachmentContent:
-    """
-    DEPRECATED: Use get_email_attachment() or get_email_links().
-
-    Extract resources from an email: attachments or links.
-    Delegates to get_email_links (filename omitted) or
-    get_email_attachment (filename provided).
-
-    Args:
-        message_id: The email's numeric id, or its RFC822 Message-ID
-            header (preferred — it survives the mail being moved)
-        filename: Attachment filename to extract. If omitted,
-            returns links instead.
-        account: Account name (optional)
-        mailbox: Mailbox name (optional)
-    """
-    if filename is None:
-        return await get_email_links(message_id, account, mailbox)
-    return await get_email_attachment(message_id, filename, account, mailbox)
-
-
 @mcp.tool
 async def search(
     query: str,
@@ -3574,9 +3544,12 @@ async def refresh_index(full: bool = False) -> dict:
             returns immediately.
 
     Returns:
-        Dict with `status` ("completed", "started", "already_running" or
-        "failed"), a `message` to relay, and `changes` (added + deleted +
-        moved) for a completed sync.
+        Dict with `status` ("completed", "started", "already_running",
+        "unconfirmed" or "failed"), a `message` to relay, and `changes`
+        (added + deleted + moved) for a completed sync. "unconfirmed"
+        means a rebuild was launched but had not begun reading mail yet —
+        not a success: check get_index_status in a minute (rising progress
+        means it is running, an unchanged index means it is stuck).
     """
     manager = _get_index_manager()
 

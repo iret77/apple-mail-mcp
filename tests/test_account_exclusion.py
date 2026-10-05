@@ -304,16 +304,6 @@ class TestServerGates:
                 message_id=123, filename="x.pdf", account="PHI"
             )
 
-    @pytest.mark.asyncio
-    async def test_deprecated_get_attachment_hidden_raises(self, monkeypatch):
-        monkeypatch.setenv("APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS", "PHI")
-        from apple_mail_mcp.server import get_attachment
-
-        with pytest.raises(ValueError, match="not found"):
-            await get_attachment(
-                message_id=123, filename="x.pdf", account="PHI"
-            )
-
     # When EVERY account is excluded, the None fall-through must not
     # reach JXA (Mail.accounts()[0] would be a hidden account).
     @pytest.mark.asyncio

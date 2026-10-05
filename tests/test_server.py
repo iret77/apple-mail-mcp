@@ -16,6 +16,7 @@ from tests._mocks import mock_index as _mock_index
 
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -928,12 +929,12 @@ class TestSearchExcludeMailboxes:
             assert call_kwargs["exclude_mailboxes"] == ["Drafts"]
 
 
-class TestGetAttachment:
-    """Tests for A4: get_attachment tool."""
+class TestGetEmailAttachment:
+    """Tests for A4: get_email_attachment tool."""
 
     @pytest.mark.asyncio
-    async def test_get_attachment_returns_file_path(self, tmp_path):
-        """get_attachment saves to file and returns path."""
+    async def test_get_email_attachment_returns_file_path(self, tmp_path):
+        """get_email_attachment saves to file and returns path."""
         from pathlib import Path
 
         mock_manager = MagicMock()
@@ -957,9 +958,9 @@ class TestGetAttachment:
             mock_get.return_value = mock_manager
             mock_thread.return_value = fake_result
 
-            from apple_mail_mcp.server import get_attachment
+            from apple_mail_mcp.server import get_email_attachment
 
-            result = await get_attachment(42, "invoice.pdf")
+            result = await get_email_attachment(42, "invoice.pdf")
 
             assert result["filename"] == "invoice.pdf"
             assert result["mime_type"] == "application/pdf"
@@ -968,8 +969,8 @@ class TestGetAttachment:
             assert "content_base64" not in result
 
     @pytest.mark.asyncio
-    async def test_get_attachment_raises_for_missing(self):
-        """get_attachment raises ValueError for missing attachment."""
+    async def test_get_email_attachment_raises_for_missing(self):
+        """get_email_attachment raises ValueError for missing attachment."""
         from pathlib import Path
 
         mock_manager = MagicMock()
@@ -986,10 +987,10 @@ class TestGetAttachment:
             mock_get.return_value = mock_manager
             mock_thread.return_value = None
 
-            from apple_mail_mcp.server import get_attachment
+            from apple_mail_mcp.server import get_email_attachment
 
             with pytest.raises(ValueError, match="not found"):
-                await get_attachment(42, "missing.pdf")
+                await get_email_attachment(42, "missing.pdf")
 
     @pytest.mark.asyncio
     async def test_cached_attachment_file_is_owner_only(self, tmp_path):
@@ -1021,9 +1022,9 @@ class TestGetAttachment:
             mock_get.return_value = mock_manager
             mock_thread.return_value = (b"secret bytes", "application/pdf")
 
-            from apple_mail_mcp.server import get_attachment
+            from apple_mail_mcp.server import get_email_attachment
 
-            result = await get_attachment(42, "private.pdf")
+            result = await get_email_attachment(42, "private.pdf")
             file_path = Path(result["file_path"])
             mode = stat_mod.S_IMODE(file_path.stat().st_mode)
             assert mode == 0o600, f"Expected 0o600 permissions, got {oct(mode)}"
@@ -1447,7 +1448,7 @@ class TestInputValidation:
 
 
 class TestAttachmentSaveToFile:
-    """get_attachment should save to disk and return file_path."""
+    """get_email_attachment should save to disk and return file_path."""
 
     @pytest.mark.asyncio
     async def test_get_attachment_saves_to_file(self, tmp_path: Path):
@@ -1473,9 +1474,9 @@ class TestAttachmentSaveToFile:
             mock_get.return_value = mock_manager
             mock_thread.return_value = fake_result
 
-            from apple_mail_mcp.server import get_attachment
+            from apple_mail_mcp.server import get_email_attachment
 
-            result = await get_attachment(42, "invoice.pdf")
+            result = await get_email_attachment(42, "invoice.pdf")
 
             assert result["filename"] == "invoice.pdf"
             assert result["mime_type"] == "application/pdf"
@@ -1511,9 +1512,9 @@ class TestAttachmentSaveToFile:
             mock_get.return_value = mock_manager
             mock_thread.return_value = fake_result
 
-            from apple_mail_mcp.server import get_attachment
+            from apple_mail_mcp.server import get_email_attachment
 
-            result = await get_attachment(42, "../../evil.txt")
+            result = await get_email_attachment(42, "../../evil.txt")
 
             # Should strip to just "evil.txt"
             assert result["filename"] == "evil.txt"
@@ -1637,8 +1638,8 @@ class TestSearchEmptyResultHint:
             assert result[0]["id"] == 1
 
 
-class TestGetAttachmentLinksMode:
-    """get_attachment with filename=None returns links."""
+class TestGetEmailLinksResult:
+    """get_email_links returns the links, never a saved file."""
 
     @pytest.mark.asyncio
     async def test_returns_links_when_no_filename(self, tmp_path: Path):
@@ -1663,9 +1664,9 @@ class TestGetAttachmentLinksMode:
             mock_get.return_value = mock_manager
             mock_thread.return_value = fake_links
 
-            from apple_mail_mcp.server import get_attachment
+            from apple_mail_mcp.server import get_email_links
 
-            result = await get_attachment(42)
+            result = await get_email_links(42)
 
             assert "links" in result
             assert len(result["links"]) == 2
@@ -5006,33 +5007,59 @@ class TestStrategy0OverlaysFlagsEndToEnd:
 
 
 class TestTheDocumentedToolCountMatchesReality:
-    """Six shipped files state the number. A PR that adds a tool and
-    updates one of them leaves five lying to the reader."""
+    """Several shipped files state the number. A PR that adds or removes
+    a tool and updates one of them leaves the rest lying to the reader.
 
-    @pytest.mark.asyncio
-    async def test_every_stated_count_is_the_registered_count(self):
-        import re
+    The expected number is counted from the @mcp.tool functions, not
+    written down here: a hard-coded old count only catches the one
+    mistake someone already made."""
 
-        from apple_mail_mcp.server import mcp
+    FILES = (
+        "README.md",
+        "CONTRIBUTING.md",
+        "docs/index.md",
+        "docs/tools.md",
+        "docs/architecture.md",
+        "docs/getting-started.md",
+        "src/apple_mail_mcp/server.py",
+    )
+    # "12 MCP tools", "all 12 tools", "12 tools for", "Tools (12 total)"
+    CLAIM = re.compile(
+        r"\b(\d+) (?:MCP )?tools\b|\btools \((\d+) total\)", re.IGNORECASE
+    )
 
-        actual = len(await mcp.list_tools())
-        root = Path(__file__).resolve().parents[1]
-        stale = []
-        for name in (
-            "README.md",
-            "CONTRIBUTING.md",
-            "docs/index.md",
-            "docs/tools.md",
-            "docs/architecture.md",
-            "docs/getting-started.md",
-        ):
-            # Read, never skip: a renamed file must fail here, not pass
-            # by checking nothing.
+    @staticmethod
+    def _registered_tool_count() -> int:
+        import ast
+
+        import apple_mail_mcp.server as server_module
+
+        tree = ast.parse(Path(server_module.__file__).read_text())
+        return sum(
+            1
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(
+                ast.unparse(d).split("(")[0] == "mcp.tool"
+                for d in node.decorator_list
+            )
+        )
+
+    def test_every_stated_count_matches_the_registered_tools(self):
+        actual = self._registered_tool_count()
+        root = Path(__file__).resolve().parent.parent
+
+        claims, wrong = 0, []
+        for name in self.FILES:
             text = (root / name).read_text()
-            for m in re.finditer(r"\b(\d+) (?:MCP )?tools\b", text):
-                if int(m.group(1)) != actual:
-                    stale.append(f"{name}: {m.group(0)!r}, have {actual}")
-        assert not stale, stale
+            for m in self.CLAIM.finditer(text):
+                claims += 1
+                stated = int(m.group(1) or m.group(2))
+                if stated != actual:
+                    wrong.append(f"{name}: {m.group(0)!r}")
+
+        assert claims, "no tool count found — has the wording changed?"
+        assert not wrong, f"{actual} tools are registered, but: {wrong}"
 
 
 class TestToolDescriptionsMatchTheCode:
@@ -5079,8 +5106,8 @@ class TestToolDescriptionsMatchTheCode:
 
 class TestTheDeprecatedAliasIsNotATool:
     """get_attachment only duplicated get_email_attachment and
-    get_email_links on every client's tool list. It stays importable for
-    Python callers; it is no longer offered to the model."""
+    get_email_links on every client's tool list, and is gone. Neither the
+    server nor the bundle may offer it again."""
 
     @pytest.mark.asyncio
     async def test_get_attachment_is_not_registered(self):

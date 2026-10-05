@@ -7,14 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Aufräumen der Tool-Beschreibungen nach einem Prompt-Audit (#26).
+### Removed
+- **`get_attachment()` entfernt.** Seit v0.2.0 als veraltet markiert und
+  für v0.3.0 zur Entfernung angekündigt, war es noch immer registriert:
+  ein Werkzeug mehr in der Liste, das nichts konnte, was
+  `get_email_attachment()` und `get_email_links()` nicht auch können.
+  Die Beschreibung von `get_email` schickte die KI für Anhänge sogar
+  ausgerechnet dorthin; sie verweist jetzt auf `get_email_attachment()`.
+  Wer den alten Namen direkt aufruft, bekommt einen Fehler — Anhänge
+  gehen über `get_email_attachment()`, Links über `get_email_links()`.
+  Damit sind es 11 Werkzeuge.
 
 ### Changed
-- **`get_attachment` ist kein MCP-Tool mehr.** Der veraltete Alias
-  doppelte `get_email_attachment` und `get_email_links` in jeder
-  Tool-Liste. Als Python-Funktion bleibt er erhalten; Manifest,
-  Launcher und Doku nennen ihn nicht mehr. Der Server meldet jetzt 11
-  Tools.
+- **`refresh_index` nennt den Status `unconfirmed`.** Das Werkzeug gibt
+  ihn zurück, wenn ein Neuaufbau gestartet, aber noch nicht angelaufen
+  ist; die Beschreibung, die die KI liest, kannte nur vier Status. Sie
+  sagt jetzt, dass das kein Erfolg ist und wie man nachprüft.
+- **Der Test zur Werkzeugzahl zählt selbst.** Er verglich die Dokumente
+  nur mit einer alten, fest eingetragenen Zahl (8) und hätte jede andere
+  falsche Zahl durchgelassen — so stand im Code-Kommentar von
+  `server.py` seit Längerem „10 total“. Jetzt zählt er die registrierten
+  Werkzeuge und prüft jede Zahlenangabe in den Dokumenten dagegen.
 - **Verhaltenshinweise stehen in den Server-Instructions.** Wie bei
   einem kaputten Setup vorzugehen ist (erst `get_index_status`, dann
   `next_steps` in der Sprache des Nutzers durchgehen), steht nicht mehr

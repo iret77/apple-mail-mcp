@@ -440,8 +440,8 @@ def _run_migrations(
             "\n⚠ Upgraded to schema v4 (attachment support).\n"
             "  Run 'apple-mail-mcp rebuild' to populate attachment\n"
             "  metadata for existing emails. Without this, attachment\n"
-            "  search and get_email_attachment will only work for newly\n"
-            "  indexed emails.\n",
+            "  search and get_email_attachment will only work for\n"
+            "  newly indexed emails.\n",
             file=sys.stderr,
         )
 
