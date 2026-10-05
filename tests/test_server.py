@@ -5009,27 +5009,108 @@ class TestTheDocumentedToolCountMatchesReality:
     """Six shipped files state the number. A PR that adds a tool and
     updates one of them leaves five lying to the reader."""
 
-    def test_no_document_still_claims_the_old_count(self):
-        from pathlib import Path
+    @pytest.mark.asyncio
+    async def test_every_stated_count_is_the_registered_count(self):
+        import re
 
+        from apple_mail_mcp.server import mcp
+
+        actual = len(await mcp.list_tools())
+        root = Path(__file__).resolve().parents[1]
         stale = []
         for name in (
             "README.md",
-            "CLAUDE.md",
             "CONTRIBUTING.md",
             "docs/index.md",
             "docs/tools.md",
             "docs/architecture.md",
             "docs/getting-started.md",
         ):
-            p = Path(name)
-            if not p.exists():
-                continue
-            text = p.read_text()
-            for claim in ("8 MCP tools", "all 8 tools", "8 tools for"):
-                if claim in text:
-                    stale.append(f"{name}: {claim}")
+            # Read, never skip: a renamed file must fail here, not pass
+            # by checking nothing.
+            text = (root / name).read_text()
+            for m in re.finditer(r"\b(\d+) (?:MCP )?tools\b", text):
+                if int(m.group(1)) != actual:
+                    stale.append(f"{name}: {m.group(0)!r}, have {actual}")
         assert not stale, stale
+
+
+class TestToolDescriptionsMatchTheCode:
+    """A description is the only manual the model gets. A prompt audit
+    found `before_id` working but undocumented on get_emails, and
+    `account="all"` advertised on list_mailboxes — the one listing tool
+    that cannot take it (it looks up an account literally named
+    "all")."""
+
+    @pytest.mark.asyncio
+    async def test_every_parameter_is_documented(self):
+        from apple_mail_mcp.server import mcp
+
+        missing = [
+            f"{tool.name}.{param}"
+            for tool in await mcp.list_tools()
+            for param in tool.parameters.get("properties", {})
+            if f"{param}:" not in (tool.description or "")
+        ]
+        assert not missing, missing
+
+    @pytest.mark.asyncio
+    async def test_list_mailboxes_does_not_offer_all_accounts(self):
+        from apple_mail_mcp.server import mcp
+
+        desc = (await mcp.get_tool("list_mailboxes")).description
+        assert '"all"' not in desc
+
+    @pytest.mark.asyncio
+    async def test_get_emails_documents_the_cross_account_listing(self):
+        from apple_mail_mcp.server import mcp
+
+        desc = (await mcp.get_tool("get_emails")).description
+        assert '"all"' in desc
+
+    def test_index_status_guidance_travels_in_the_handshake(self):
+        """How to react to a broken setup is behaviour, not part of one
+        tool's contract — it belongs in the server instructions."""
+        from apple_mail_mcp.server import mcp
+
+        assert "get_index_status" in mcp.instructions
+        assert "next_steps" in mcp.instructions
+
+
+class TestTheDeprecatedAliasIsNotATool:
+    """get_attachment only duplicated get_email_attachment and
+    get_email_links on every client's tool list. It stays importable for
+    Python callers; it is no longer offered to the model."""
+
+    @pytest.mark.asyncio
+    async def test_get_attachment_is_not_registered(self):
+        from apple_mail_mcp.server import mcp
+
+        names = {t.name for t in await mcp.list_tools()}
+        assert "get_attachment" not in names
+        assert {"get_email_attachment", "get_email_links"} <= names
+
+    # fork-only:start — the .mcpb bundle only exists in this fork
+    @pytest.mark.asyncio
+    async def test_the_bundle_lists_exactly_the_registered_tools(self):
+        """The manifest and the launcher's setup fallback each carry the
+        tool list by hand; a tool removed from the server must not live
+        on in either."""
+        import re
+
+        from apple_mail_mcp.server import mcp
+
+        registered = {t.name for t in await mcp.list_tools()}
+        root = Path(__file__).resolve().parents[1]
+        manifest = json.loads((root / "mcpb/manifest.json").read_text())
+        assert {t["name"] for t in manifest["tools"]} == registered
+
+        launcher = (root / "mcpb/server/index.js").read_text()
+        block = re.search(r"const TOOL_NAMES = \[(.*?)\];", launcher, re.S)
+        assert block, "TOOL_NAMES not found in the launcher"
+        assert set(re.findall(r'"(\w+)"', block.group(1))) == registered
+
+    # fork-only:end
 
 
 class TestTheLogFileModeIsEnforcedNotJustRequested:
@@ -5236,7 +5317,7 @@ class TestTheScanReportsWhereItFoundTheMessage:
     moved. That is the one case where the caller cannot derive the
     location, and it was the only return path that dropped it: the JXA
     script had the mailbox in hand and returned neither it nor the
-    account. CLAUDE.md promises `get_email` reports the current
+    account. The README promises `get_email` reports the current
     location. Reported from the field."""
 
     def test_the_generated_script_returns_the_location(self):

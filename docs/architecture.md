@@ -8,7 +8,7 @@ Apple Mail MCP uses a **3-layer hybrid access pattern** — disk-first reads for
 src/apple_mail_mcp/
 ├── __init__.py         # CLI entry point, exports main()
 ├── cli.py              # CLI commands (index, status, rebuild, serve)
-├── server.py           # FastMCP server with 12 MCP tools + 1 resource
+├── server.py           # FastMCP server with 11 MCP tools + 1 resource
 ├── config.py           # Layered config: CLI > env > config.toml > defaults
 ├── builders.py         # QueryBuilder, AccountsQueryBuilder
 ├── executor.py         # run_jxa(), execute_with_core(), execute_query()
@@ -38,7 +38,7 @@ src/apple_mail_mcp/
 
 ### 1. MCP Tools (`server.py`)
 
-The 12 MCP tools are the public API. Each tool resolves defaults, picks the right access method, and returns typed results.
+The 11 MCP tools are the public API. Each tool resolves defaults, picks the right access method, and returns typed results.
 
 ### 2. MCP Resources (`server.py`)
 
@@ -182,3 +182,6 @@ This is **87x faster** because Apple Events uses a single array-return call inst
 | DoS via Large Files | 25 MB file size limit | `disk.py` |
 | Path Traversal | Path validation in watcher | `watcher.py` |
 | Data Exposure | DB created with `0600` permissions | `schema.py` |
+| Excluded-Account Exposure | `exclude_accounts` is a server-wide boundary: hidden accounts are never indexed, filtered from search, and never reached by a list/get/write path or an implicit JXA default | `server.py`, `index/search.py` |
+| Unauthorized Writes | Read-only mode refuses every mutating tool; a test enforces the guard on every write-implying tool name | `server.py` |
+| Silent Write Failure | `not_found` only means Mail was reachable and the message was not there; anything else lands in `failed` with Mail's `error` | `server.py`, `builders.py` |

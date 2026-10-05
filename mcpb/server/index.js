@@ -232,7 +232,6 @@ const TOOL_NAMES = [
   "search",
   "get_email_links",
   "get_email_attachment",
-  "get_attachment",
   "set_flag",
   "set_read_status",
   "get_index_status",

@@ -46,3 +46,7 @@ mcp-publisher
 benchmarks/results/*.json
 benchmarks/results/*.html
 /benchmark_*.png
+
+# Agent rule files are not versioned in this repo
+AGENTS.md
+CLAUDE.md

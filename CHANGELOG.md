@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Aufräumen der Tool-Beschreibungen nach einem Prompt-Audit (#26).
+
+### Changed
+- **`get_attachment` ist kein MCP-Tool mehr.** Der veraltete Alias
+  doppelte `get_email_attachment` und `get_email_links` in jeder
+  Tool-Liste. Als Python-Funktion bleibt er erhalten; Manifest,
+  Launcher und Doku nennen ihn nicht mehr. Der Server meldet jetzt 11
+  Tools.
+- **Verhaltenshinweise stehen in den Server-Instructions.** Wie bei
+  einem kaputten Setup vorzugehen ist (erst `get_index_status`, dann
+  `next_steps` in der Sprache des Nutzers durchgehen), steht nicht mehr
+  in der Beschreibung eines einzelnen Tools, sondern wird einmal im
+  MCP-Handshake übertragen.
+- **`refresh_index` widerspricht sich nicht mehr.** `full=True` gilt
+  für einen ausdrücklich gewünschten Neuaufbau oder einen vermutlich
+  defekten Index; sonst reicht der inkrementelle Sync.
+- `>>>`-Aufrufbeispiele aus sieben Tool-Beschreibungen entfernt; nur
+  `search()` behält sie, weil nur dort die Query-Syntax gezeigt wird.
+
+### Fixed
+- **`list_mailboxes` bot `account="all"` an, konnte es aber nicht.**
+  Die Doku zum kontenübergreifenden Listing war beim Einbau auf dem
+  falschen Tool gelandet; `list_mailboxes("all")` suchte ein Konto
+  namens "all". Sie steht jetzt bei `get_emails`, wo sie hingehört.
+- **Undokumentierte Parameter und Grenzen.** `get_emails` beschreibt
+  `before_id` und `account="all"`, `get_emails` und `search` nennen
+  die Obergrenze 200 für `limit`, die Schreib-Tools den Bucket
+  `failed`. Ein Test verlangt, dass jeder Parameter jedes Tools in
+  seiner Beschreibung vorkommt.
+- `docs/configuration.md` nennt `max_email_mb` und `auto_build`.
+
 ## [0.20.5] - 2026-08-12
 
 Aus dem Health-Check gegen 0.20.4. Die drei Regressionen von zuvor
