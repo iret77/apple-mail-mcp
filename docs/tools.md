@@ -14,6 +14,10 @@ Apple Mail MCP provides **12 MCP tools** — a consolidated API designed for AI 
 | `get_email_links()` | Extract links from an email | `message_id`, `account?`, `mailbox?` |
 | `get_email_attachment()` | Extract attachment content | `message_id`, `filename`, `account?`, `mailbox?` |
 | `get_attachment()` | *Deprecated* — use `get_email_attachment()` | `message_id`, `filename`, `account?`, `mailbox?` |
+| `set_flag()` | **Write** — flag/unflag one email or a batch (max 500), optionally by color | `message_ids`, `color?`, `account?`, `mailbox?` |
+| `set_read_status()` | **Write** — mark one email or a batch read (seen) or unread (unseen) | `message_ids`, `read?`, `account?`, `mailbox?` |
+| `get_index_status()` | Index health and setup diagnostics — build state, progress, and whether Full Disk Access is missing | — |
+| `refresh_index()` | Update the index on demand — the index otherwise syncs only at server start | `full?` |
 
 ---
 
@@ -257,6 +261,173 @@ get_email_attachment(12345, "invoice.pdf")
     `get_attachment()` is deprecated since v0.2.0. Use `get_email_attachment()` instead. The old name still works but may be removed in a future release.
 
 Identical to `get_email_attachment()`. See above for parameters and return value.
+
+---
+
+## `set_flag()`
+
+Flag or unflag one or more emails, optionally with a color.
+
+!!! warning "Write operation"
+    Refused when the server runs read-only (`APPLE_MAIL_READ_ONLY=true`, `[server] read_only = true`, or `apple-mail-mcp serve -r`): the call raises `PermissionError` and nothing is written.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `message_ids` | `ref` or `list[ref]` | *required* | One reference or a list of them (max 500 per call). A reference is the RFC 822 `message_id` header (preferred, e.g. `"<a1b2@example.com>"`) or the numeric `id` |
+| `color` | `string?` | `default` | What to set (see below) |
+| `account` | `string?` | `None` | Optional hint. Speeds id resolution; required (with `mailbox`) to place numeric ids when no search index is built |
+| `mailbox` | `string?` | `None` | Optional hint (see `account`) |
+
+**Colors:**
+
+| Color | Effect |
+|-------|--------|
+| `default` | Flag without forcing a color (default) |
+| `none` | Remove the flag |
+| `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `gray` | Flag with that color |
+
+These are Apple Mail's seven colors and nothing more. The server attaches **no** meaning to any of them — what a color stands for is the user's own convention.
+
+**Returns:** A dict of per-reference outcome buckets. A batch never fails as a whole: every reference lands in exactly one bucket, echoed exactly as it was passed (an int id as an int, a Message-ID header as that header).
+
+| Field | Present | Description |
+|-------|---------|-------------|
+| `updated` | always | References actually changed |
+| `unchanged` | always | Already in the requested state, so no write was sent — still a success |
+| `not_found` | always | Mail was reachable and the message was not there |
+| `skipped_hidden` | always | Resolved into an excluded account (`APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS`); never sent to Mail |
+| `failed` | when non-empty | Mail refused the write or was unreachable — **not** a verdict that the message is gone |
+| `error` | with `failed` | What Apple Mail actually said |
+| `diagnostics` | when something did not land | What the write actually did: `accounts_searched`, `mailboxes_preferred`, `located_by_index`, `references_as_received`, `mailboxes_not_searched` |
+| `hint` | when actionable | Guidance, e.g. that a numeric id had moved and was re-found by its Message-ID |
+
+```python
+set_flag("<a1b2@example.com>", color="red")
+# → {"updated": ["<a1b2@example.com>"], "unchanged": [],
+#    "not_found": [], "skipped_hidden": []}
+
+set_flag(["<a@x.com>", "<b@x.com>"], color="orange")
+# Batch — each reference lands in exactly one bucket
+
+set_flag("<a1b2@example.com>", color="none")
+# Unflag
+
+set_flag(12345, color="red")
+# Numeric id, if that's all there is
+```
+
+!!! tip "Prefer the Message-ID"
+    A numeric `id` is a per-mailbox ROWID: exact while the message stays put, dead as soon as any device files it elsewhere. The `message_id` header survives the move and is searched in every visible account, starting with the one the index points at. A numeric id that no longer resolves is re-found by its Message-ID while the index still knows it, and the move is reported in `hint`.
+
+!!! note
+    A `not_found` with a non-zero `diagnostics.mailboxes_not_searched` means the search did not cover every mailbox, so the message's absence is not established.
+
+---
+
+## `set_read_status()`
+
+Mark one or more emails read (seen) or unread (unseen).
+
+!!! warning "Write operation"
+    Refused when the server runs read-only (`APPLE_MAIL_READ_ONLY=true`, `[server] read_only = true`, or `apple-mail-mcp serve -r`): the call raises `PermissionError` and nothing is written.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `message_ids` | `ref` or `list[ref]` | *required* | One reference or a list of them (max 500 per call). A reference is the RFC 822 `message_id` header (preferred, e.g. `"<a1b2@example.com>"`) or the numeric `id` |
+| `read` | `bool?` | `True` | `True` marks read (seen); `False` marks unread (unseen) |
+| `account` | `string?` | `None` | Optional hint. Speeds id resolution; required (with `mailbox`) to place numeric ids when no search index is built |
+| `mailbox` | `string?` | `None` | Optional hint (see `account`) |
+
+**Returns:** The same per-reference buckets as `set_flag()`: `updated`, `unchanged`, `not_found`, `skipped_hidden`, plus `failed` (with `error`), `diagnostics` and `hint` when they apply.
+
+```python
+set_read_status("<a1b2@example.com>")
+# Mark read
+
+set_read_status(["<a@x.com>", "<b@x.com>"], read=False)
+# Mark a batch unread
+
+set_read_status(12345)
+# Numeric id, if that's all there is
+```
+
+---
+
+## `get_index_status()`
+
+Diagnose the search index: readiness, build progress, and setup problems — with step-by-step instructions to fix them. Reads state only and changes nothing, so it also works in read-only mode.
+
+Worth calling whenever email tooling behaves unexpectedly: search returns nothing, a write reports `not_found`, or the user asks whether it is working or how far along a build is.
+
+**Parameters:** None
+
+**Returns:** Dictionary with, among others:
+
+| Field | Description |
+|-------|-------------|
+| `state` | `building`, `ready`, `empty` or `absent` |
+| `user_message` | One plain sentence to relay to the user |
+| `next_steps` | Ordered, non-technical instructions to fix a problem. Present only when there is something to do |
+| `problem` / `note` | What is wrong, or why the setup is fine anyway. Present when relevant |
+| `indexed_emails`, `disk_emails`, `progress_percent` | Build progress — counts rise continuously while a build runs |
+| `mail_dir_accessible` | `false` means macOS Full Disk Access is missing for the app running the server — the most common cause of an empty index |
+| `index_command` | The exact command for this install, if one is needed |
+| `index_mode`, `server_version`, `read_only`, `write_tools_enabled` | Setup |
+| `recent_events` | What the server actually did, newest first (build/sync started, finished, failed) |
+| `log_file` | Where the server log is |
+| `last_error`, `failed_parse_jobs`, `last_sync`, `staleness_hours`, `db_size_mb`, `excluded_accounts` | Health details |
+| `without_stable_id` | Rows indexed before schema v6, with no stored Message-ID — `refresh_index(full=True)` backfills them |
+| `skipped_too_large` | Messages over the size limit and therefore not searchable. Present only when non-zero |
+
+```python
+get_index_status()
+# → {"state": "ready", "indexed_emails": 73104, "mail_dir_accessible": true,
+#    "user_message": "The mail index is ready.", "staleness_hours": 2.4, ...}
+```
+
+!!! tip
+    When the result carries `problem` or `next_steps`, relay `user_message` and walk the user through `next_steps` in order rather than showing the raw JSON. For a client-polled snapshot that needs no tool call, see the `index://status` resource below.
+
+---
+
+## `refresh_index()`
+
+Update or completely rebuild the server's FTS5 search index on demand. The index otherwise syncs only at server start, so a long-running client drifts out of date.
+
+This is the index at `~/.apple-mail-mcp/index.db` — not Apple Mail's own envelope index, and unrelated to Mail.app's *Mailbox > Rebuild*. It touches only the local index, never the mail itself, so it is allowed in read-only mode.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `full` | `bool?` | `False` | `False` syncs changes since the last run — fast, returns when done. `True` discards the index and rebuilds from scratch in the background, returning immediately |
+
+**Returns:** Dictionary with `status`, a `message` to relay, and `changes` (added + deleted + moved) for a completed sync. A failure adds `error`, plus `next_steps` when the sync could not read the mail directory.
+
+| Status | Meaning |
+|--------|---------|
+| `completed` | Sync finished; `changes` says how much moved |
+| `started` | A background build began — follow it with `get_index_status()` |
+| `already_running` | A build or sync is already in progress |
+| `unconfirmed` | A rebuild was launched but had not begun reading mail in time — check `get_index_status()` in a minute |
+| `failed` | Nothing was updated; `error` says why |
+
+```python
+refresh_index()
+# → {"status": "completed", "changes": 12,
+#    "message": "Index updated: 12 change(s)."}
+
+refresh_index(full=True)
+# → {"status": "started",
+#    "message": "Building the index in the background. ..."}
+```
+
+!!! note
+    When no usable index exists yet, `refresh_index()` starts a background build even with `full=False` — a first build of a large mailbox is too slow to wait for.
 
 ---
 
