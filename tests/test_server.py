@@ -5544,3 +5544,52 @@ class TestEverySingleReferenceToolTakesTheSameForms:
                 f"normalizing it — a stringified id or escaped brackets "
                 f"will not be found"
             )
+
+
+class TestAMailboxMissIsNotAnUnreadableIndex:
+    """When the Envelope Index was readable but has no such mailbox, the
+    error blamed an unreadable index and sent the caller to
+    get_index_status() for a problem it did not have."""
+
+    def _patches(self, amap):
+        from apple_mail_mcp.index.envelope_direct import MailboxNotFoundError
+
+        return (
+            patch("apple_mail_mcp.server._get_account_map", return_value=amap),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                side_effect=MailboxNotFoundError("no mailbox named 'X'"),
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=MagicMock(exists=lambda: True),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/tmp/mail"),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_across_every_account(self):
+        from apple_mail_mcp.server import get_emails
+
+        p1, p2, p3, p4 = self._patches(_acct_map())
+        with p1, p2, p3, p4, pytest.raises(ValueError) as err:
+            await get_emails(account="all", mailbox="Gesendet")
+        assert "'Gesendet' in any account" in str(err.value)
+        assert "not readable" not in str(err.value)
+
+    @pytest.mark.asyncio
+    async def test_one_account_with_a_date_window(self):
+        from apple_mail_mcp.server import get_emails
+
+        amap = _acct_map()
+        amap.name_to_uuid.return_value = "uuid-work"
+        p1, p2, p3, p4 = self._patches(amap)
+        with p1, p2, p3, p4, pytest.raises(ValueError) as err:
+            await get_emails(
+                account="Work", mailbox="Gesendet", before="2026-01-01"
+            )
+        assert "account 'Work'" in str(err.value)
+        assert "not readable" not in str(err.value)

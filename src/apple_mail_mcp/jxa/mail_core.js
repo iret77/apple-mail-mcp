@@ -93,8 +93,11 @@ const MailCore = {
             "Innboks",                             // no
             "Gelen Kutusu",                        // tr
         ],
+        // Not "Out" or "发件箱": both name the OUTBOX (Mail.sdef: "The
+        // top level Out mailbox"; Apple's zh-CN help lists 发件箱 next
+        // to 已发送), which holds mail that has NOT been sent yet.
         sent: [
-            "Sent", "Sent Messages", "Sent Items", "Sent Mail", "Out",
+            "Sent", "Sent Messages", "Sent Items", "Sent Mail",
             "Gesendet",
             "Envoyés", "Messages envoyés",
             "Enviado", "Enviadas",
@@ -104,7 +107,7 @@ const MailCore = {
             "Wysłane",
             "Отправленные",
             "送信済み",
-            "已发出邮件", "发件箱", "已傳送",
+            "已发出邮件", "已发送", "已傳送",
             "보낸 편지함", "보낸",
             "Lähetetyt", "Sendt", "Gönderilen",
         ],
@@ -218,9 +221,14 @@ const MailCore = {
     /**
      * Ask Mail itself which mailbox fills a role for this account.
      *
-     * Language- and provider-independent when it works. The property
-     * is not guaranteed to exist on every macOS version, so this is a
-     * probe: it either returns a mailbox or null, and never throws.
+     * Mail.sdef defines `sent mailbox` & co. on the APPLICATION only
+     * ("The top level Sent mailbox" — the unified one in the sidebar);
+     * the account class has no such property. Returning that mailbox
+     * answered a one-account question with the application's, and did
+     * so before the name table ever ran. So only a mailbox that
+     * provably belongs to `account` may answer: the top-level one
+     * itself, or one of its children. Anything else is null and the
+     * name table decides. A probe: it never throws.
      */
     specialMailbox(account, role) {
         const props = {
@@ -231,12 +239,37 @@ const MailCore = {
         };
         const prop = props[role];
         if (!prop) return null;
-        for (const owner of [account, Mail]) {
+        let wantId;
+        try {
+            wantId = account.id();
+        } catch (e) {
+            return null;  // cannot prove ownership — do not guess
+        }
+        const ownedHere = (mb) => {
             try {
-                const mb = owner[prop]();
-                if (mb && mb.name()) return mb;
+                const acct = mb.account();
+                return !!acct && acct.id() === wantId;
             } catch (e) {
-                // property absent or not applicable — try the next
+                return false;  // no account, or not readable
+            }
+        };
+        for (const owner of [account, Mail]) {
+            let top;
+            try {
+                top = owner[prop]();
+            } catch (e) {
+                continue;  // property absent or not applicable
+            }
+            if (!top) continue;
+            if (ownedHere(top)) return top;
+            let children = [];
+            try {
+                children = top.mailboxes();
+            } catch (e) {
+                children = [];
+            }
+            for (const child of children) {
+                if (ownedHere(child)) return child;
             }
         }
         return null;
