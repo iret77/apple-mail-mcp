@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 
@@ -22,6 +23,15 @@ logger = logging.getLogger(__name__)
 
 # Cache TTL in seconds (5 minutes)
 _CACHE_TTL = 300
+
+# Mail names every account directory under ~/Library/Mail/V<N>/ after
+# the account's UUID. Anything else at that level is not an account:
+# "Mailboxes" holds the local "On My Mac" folders, and the indexer falls
+# back to "Unknown" for a path it cannot place.
+_ACCOUNT_DIR = re.compile(
+    r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$",
+    re.IGNORECASE,
+)
 
 
 class AccountMap:
@@ -128,8 +138,12 @@ class AccountMap:
         A cold, stale or empty map knows nothing, so it answers False:
         to it every UUID is unknown, and calling that "no such account"
         is the defect 0.20.1 fixed for get_emails (a cold cache taken
-        for an answer).
+        for an answer). A key that is not shaped like an account UUID
+        ("Mailboxes" for the local On My Mac folders) was never an
+        account, so it was not removed either: False.
         """
+        if not _ACCOUNT_DIR.match(uuid or ""):
+            return False
         with self._lock:
             if not self._uuid_to_name or self._is_stale():
                 return False

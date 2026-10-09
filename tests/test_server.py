@@ -5607,7 +5607,8 @@ class TestARemovedAccountIsNotPassedOffAsAName:
     field must say there is no such account, and only a map that has
     actually loaded Mail's account list may say so."""
 
-    WORK, REMOVED = "UUID-WORK", "BBBB2222-removed-account"
+    WORK = "24E569DF-5E45-4B6A-8E3C-1A2B3C4D5E6F"
+    REMOVED = "BBBB2222-0000-4000-8000-00000000DEAD"
 
     def _map(self, loaded: bool):
         from apple_mail_mcp.index.accounts import AccountMap
@@ -5677,6 +5678,43 @@ class TestARemovedAccountIsNotPassedOffAsAName:
         assert "account_missing" not in rows[0]
         assert rows[1]["account"] is None
         assert rows[1]["account_missing"] == self.REMOVED
+
+    @pytest.mark.asyncio
+    async def test_local_on_my_mac_folders_are_not_a_removed_account(
+        self,
+    ):
+        """The indexer files local folders under "Mailboxes" (the
+        V<N>/Mailboxes directory). Marking them as a removed account
+        told the user their local mail lived in a deleted account."""
+        from types import SimpleNamespace
+
+        from apple_mail_mcp.server import search
+
+        mgr = MagicMock()
+        mgr.has_index.return_value = True
+        mgr.search.return_value = [
+            SimpleNamespace(
+                id=7,
+                subject="s",
+                sender="a@b",
+                date_received="2026-08-01T10:00:00",
+                score=1.0,
+                content_snippet="...",
+                account="Mailboxes",
+                mailbox="Belege",
+                rfc822_message_id="<m7@x>",
+            )
+        ]
+        with (
+            patch("apple_mail_mcp.server._get_index_manager", return_value=mgr),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=self._map(True),
+            ),
+        ):
+            rows = await search("Rechnung")
+        assert rows[0]["account"] == "Mailboxes"
+        assert "account_missing" not in rows[0]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("scope", ["all", "attachments"])

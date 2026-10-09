@@ -8,11 +8,12 @@
  * or platform wheels — and uv fetches the correct macOS wheels on first
  * run.
  *
- * The server source is pulled from the public fork by git ref. Because
- * that ref is a moving branch, the shim also self-updates: at most once
- * per UPDATE_INTERVAL_H it re-resolves the ref in a short, best-effort
- * pre-step before starting the server. A failed or slow update never
- * blocks startup — the previously cached build is used instead.
+ * The server source is pulled from the public fork by git ref — by
+ * default a pinned `server-v…` tag (DEFAULT_REF), so a new server arrives
+ * with a new bundle. The shim still re-resolves its ref at most once per
+ * UPDATE_INTERVAL_H in a short, best-effort pre-step, which matters when
+ * the user points Source at a moving branch. A failed or slow update
+ * never blocks startup — the previously cached build is used instead.
  *
  * ONBOARDING — the shim never dies silently. The bundle promises
  * "double-click, it works", but the Python server needs `uv`. So:
@@ -47,12 +48,12 @@ import { homedir } from "node:os";
 // any push — testers would report against a build nobody could name.
 // A new server reaches them only through a new bundle.
 const DEFAULT_REF =
-  "git+https://github.com/iret77/apple-mail-mcp@server-v0.20.6";
+  "git+https://github.com/iret77/apple-mail-mcp@server-v0.21.0";
 const UPDATE_INTERVAL_H = 24;
 // Bump on every bundle release. The stamp records it, so installing a
 // new bundle always re-resolves the server once — otherwise a same-day
 // bundle update would run against a cached, older server build.
-const LAUNCHER_REVISION = "0.20.6";
+const LAUNCHER_REVISION = "0.21.0";
 // A cold `uvx --refresh` clones the repo and builds a wheel; 45s was
 // not enough on a first run, and the timeout then marked the update as
 // done anyway (see refreshCache) — leaving the old server in place for

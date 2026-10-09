@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.21.0] - 2026-10-09
 
 ### Removed
 - **`get_attachment()` entfernt.** Seit v0.2.0 als veraltet markiert und
@@ -58,6 +58,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `null`, und `account_missing` nennt die Kennung. Markiert wird nur,
   wenn Mails Kontenliste nachweislich geladen ist: bei kaltem Cache
   wäre sonst jede Zeile „kein Konto“ gewesen.
+- **Standardpostfächer werden pro Konto aufgelöst, nicht app-weit**
+  (#29). Mail kennt `sentMailbox` & Co. laut Scripting-Dictionary nur
+  auf Anwendungsebene; die Auflösung gab dieses Sammelpostfach zurück,
+  sobald der Name nicht exakt passte (`Gesendet`, `[Gmail]/Sent Mail`,
+  `Sent Messages`), noch bevor die lokalisierte Namenstabelle lief.
+  Jetzt antwortet nur ein Postfach, das nachweislich zum Konto gehört.
+- **`get_emails(account="all", mailbox="Sent")` ließ Konten still weg**
+  (#29). Der schnelle Pfad über Apples Envelope Index verglich nur
+  Namen; Konten, deren Gesendet-Ordner anders heißt, fehlten ohne
+  Fehler. Er löst Rollen jetzt pro Konto auf, und eine Anfrage nach
+  `INBOX` trifft keinen eigenen Unterordner `Projects/INBOX` mehr.
+- **Namenstabelle der Postfächer:** `Out` und `发件箱` bezeichnen den
+  Postausgang und gelten nicht mehr als Gesendet; `已发送` ist ergänzt.
+- **Ein fehlendes Postfach ist kein unlesbarer Index.** Fand der
+  Envelope Index ein Postfach nicht, meldete `get_emails` mit
+  `before`/`after`/`offset` oder `account="all"`, der Index sei nicht
+  lesbar. Jetzt nennt der Fehler das fehlende Postfach.
+- **Bundle-README und Einstellungstexte** beschreiben den gepinnten
+  Server-Build, die automatische uv-Installation und alle Ergebnis-
+  Buckets der Schreib-Tools statt eines veralteten Branch-Stands.
+
+## [0.20.6] - 2026-08-16
+
+Reiner Launcher-/Bundle-Fix; der Server-Code ist identisch mit 0.20.5.
+
+### Fixed
+- **Das `.mcpb` holt sich uv selbst, statt still zu sterben.** Fehlte
+  `uvx`, brach der Launcher ab, und Claude Desktop zeigte nur „Server
+  disconnected“. Jetzt installiert er uv nach `~/.apple-mail-mcp/bin`
+  (kein sudo, kein `PATH`-Eingriff, mit Timeout). Klappt das nicht
+  (offline, verwalteter Mac, abgeschaltet), verbindet sich ein
+  minimaler Ersatz-Server und beantwortet jeden Aufruf mit der
+  konkreten Anleitung. Neuer Schalter: *Install uv automatically*.
+- **`index.js` ist auf jedem unterstützten Node ein ES-Modul**
+  (`server/package.json`). Älteres Desktop-Node brach sonst sofort mit
+  „Cannot use import statement outside a module“ ab.
 
 ## [0.20.5] - 2026-08-12
 
