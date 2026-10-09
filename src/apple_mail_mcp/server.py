@@ -478,7 +478,7 @@ async def _overlay_live_flags(result: dict, message_id: int) -> None:
 # version alone cannot answer "which build is answering me". Upstream
 # ships through PyPI, where the package version does answer it.
 # Bumped on every shipped change.
-SERVER_REVISION = "2026-07-28.19"
+SERVER_REVISION = "2026-10-09.1"
 # fork-only:end
 
 
